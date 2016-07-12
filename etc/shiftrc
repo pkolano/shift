@@ -1,0 +1,357 @@
+#
+# Skeleton configuration file for Shift manager.
+#
+# This file should be located in /etc/shiftrc for multi-user installs
+# and in ~/.shiftrc for single-user installs.
+#
+# Items that are commented out show the default value.
+#
+# A value of nodefault indicates no default value for that item.
+#
+# Items that are not commented out indicate values that must be
+# explicitly configured.  The values given for these items are
+# examples only.
+#
+
+#########################
+#### manager options ####
+#########################
+
+# directory where transfer metadata will be stored
+#   (use %u as substitution for user name)
+#   (parent dir must be world writable with sticky bit for multi-user installs)
+#   (multi-user example: user_dir /var/lib/shift/%u)
+user_dir /home/%u/.shift
+
+# time (seconds) to store transfer metadata after last activity
+#data_expire 604800
+
+# location of file system information database
+#   (must be world readable for multi-user installs)
+#   (example: db_file /var/lib/shift/db)
+#db_file nodefault
+
+# log debugging information for user X in user_dir/X.debug
+#   (may be specified multiple times for different users)
+#   (example: debug_alice 1)
+#debug_X 1
+
+# domain to which user accounts belong for email notifications
+#   (assumes user X can receive email at X@email_domain)
+#   (assumes localhost:25 SMTP server running on manager host)
+#   (example: email_domain example.com)
+#email_domain nodefault
+
+# command to invoke to make host selection decisions
+#   (must be world readable/executable for multi-user installs)
+#   (example: select_hook /usr/local/bin/shift-select.hook)
+#select_hook nodefault
+
+# host to which transfer metadata should be synchronized
+#   (assumes hostbased authentication available to host)
+#   (example: sync_host mgr2.example.com)
+#sync_host nodefault
+
+
+###########################
+#### transport options ####
+###########################
+
+# supported local transports by decreasing performance/preference
+#   (example: default_local mcp,rsync,shift)
+#default_local fish,shift
+
+# supported remote transports by decreasing performance/preference
+#   (example: default_remote fish-tcp,bbftp,rsync,fish,shift)
+#default_remote shift
+
+# supported local transports by decreasing small file performance/preference
+#   (example: local_small mcp,rsync,shift)
+#local_small fish,shift
+
+# minimum size allowed for --split and --split-tar options
+#   (use suffix {k,m,g,t} for {KB,MB,GB,TB})
+#   (it is not recommended to set this below 1GB)
+#min_split 1g
+
+# command-line options that will be used by bbcp on client hosts
+#   (example: opts_bbcp -s 4 -w 4194304)
+#opts_bbcp nodefault
+
+# behavior commands that will be used by bbftp on client hosts
+#   (see the "behavior commands" section of bbftp man page for details)
+#   (options must be separated by "\n" as shown in example below)
+#   (example: opts_bbftp setnbstream 4\nsetrecvwinsize 4096\nsetsendwinsize 4096)
+#opts_bbftp nodefault
+
+# command-line options that will be used by globus-url-copy on client hosts
+#   (example: opts_gridftp -p 4 -tcp-bs 4194304)
+#opts_gridftp nodefault
+
+# command-line options that will be used by mcp on client hosts
+#   (if mcp >= 1.822.1, a --preallocate setting is recommended for DMF on CXFS)
+#opts_mcp --double-buffer
+
+# command-line options that will be used by msum on client hosts
+#opts_msum --double-buffer
+
+# command-line options that will be used by ssh on client hosts
+#   (example: opts_ssh -c arcfour256 -m umac-64@openssh.com)
+#opts_ssh nodefault
+
+# command-line options that will be used by ssh on client hosts with --secure
+#   (example: opts_ssh_secure -c aes256-ctr -m hmac-sha2-512)
+#opts_ssh_secure nodefault
+
+# supported remote transports by decreasing small file performance/preference
+#   (example: remote_small fish-tcp,rsync,fish,shift,bbftp)
+#remote_small shift
+
+# average size under which a lan batch will be optimized for small files
+#   (use suffix {k,m,g,t} for {KB,MB,GB,TB})
+#small_size_lan 256m
+
+# average size under which a local batch will be optimized for small files
+#   (use suffix {k,m,g,t} for {KB,MB,GB,TB})
+#small_size_local 1g
+
+# average size under which a wan batch will be optimized for small files
+#   (use suffix {k,m,g,t} for {KB,MB,GB,TB})
+#small_size_wan 64m
+
+
+################################
+#### general tuning options ####
+################################
+
+# size of buffer to use in transports
+#   (use suffix {k,m,g,t} for {KB,MB,GB,TB})
+#default_buffer 4m
+
+# maximum number of files to transfer in each batch
+#   (use suffix {k,m,b/g,t} for 10E{3,6,9,12})
+#default_files 1k
+
+# minimum number of files to process in each initialization batch
+#   (note use of dash instead of underscore)
+#   (use suffix {k,m,b/g,t} for 10E{3,6,9,12})
+#default_find-files 2k
+
+# source sparsity percentage at which to preallocate destination file
+#   (sparsity defined as 1 - (512 * allocated_blocks / size))
+#   (note that transports using temporary files are not supported)
+#   (example: default_preallocate 10)
+#default_preallocate 0
+
+# number of times to retry failed operations
+#   (must be at least 1 for --sync to function)
+#default_retry 2
+
+# approximate maximum amount of data to transfer in each batch
+#   (use suffix {k,m,g,t} for {KB,MB,GB,TB})
+#default_size 4g
+
+# approximate maximum size of created tar files
+#   (note use of dash instead of underscore)
+#   (use suffix {k,m,g,t} for {KB,MB,GB,TB})
+#default_split-tar 500g
+
+# amount of data per lustre stripe
+#   (set to 0 to use default striping)
+#   (note that transports using temporary files are not supported)
+#   (use suffix {k,m,g,t} for {KB,MB,GB,TB})
+#default_stripe 1g
+
+# number of stripes that local lustre file systems use by default
+#   (if file systems use different values, use max default across them)
+#lustre_default_stripe 1
+
+# number of status entries at which some older done transfers may be omitted
+#status_lines 20
+
+
+################################
+#### network tuning options ####
+################################
+
+# WAN bandwidth assumed for non-organization/non-xge hosts
+#   (use suffix {k,m,g,t} for {Kb,Mb,Gb,Tb})
+#bandwidth_ind 100m
+
+# WAN bandwidth assumed when end of host FQDN matches org_domains setting
+#   (use suffix {k,m,g,t} for {Kb,Mb,Gb,Tb})
+#bandwidth_org 1g
+
+# WAN bandwidth assumed when 10GE adapter found on host via lspci
+#   (use suffix {k,m,g,t} for {Kb,Mb,Gb,Tb})
+#bandwidth_xge 10g
+
+# minimum number of streams to use in remote LAN transfers
+#min_streams_lan 1
+
+# minimum number of streams to use in remote WAN transfers
+#min_streams_wan 4
+
+# minimum window size to use over LAN with TCP-based transports
+#   (use suffix {k,m,g,t} for {KB,MB,GB,TB})
+#min_window_lan 1m
+
+# minimum window size to use over WAN with TCP-based transports
+#   (use suffix {k,m,g,t} for {KB,MB,GB,TB})
+#min_window_wan 4m
+
+# maximum number of streams to use in remote LAN transfers
+#max_streams_lan 8
+
+# maximum number of streams to use in remote WAN transfers
+#max_streams_wan 16
+
+# latency (seconds) assumed to remote LAN hosts when measurement fails
+#latency_lan 0.001
+
+# latency (seconds) assumed to remote WAN hosts when measurement fails
+#latency_wan 0.05
+
+# regular expression for determining if host may have higher bandwidth
+#org_domains com|edu|gov|mil|net|org
+
+
+#################################
+#### parallelization options ####
+#################################
+
+# number of clients to spawn on each host
+#default_clients 1
+
+# maximum number of source hosts to involve in a transfer
+#default_hosts 1
+
+# amount of data at which single files will be parallelized
+#   (use suffix {k,m,g,t} for {KB,MB,GB,TB})
+#default_split 0
+
+# number of threads to use in multi-threaded transports
+#default_threads 4
+
+
+###################################
+#### client throttling options ####
+###################################
+
+# local avg. cpu usage (%) at which to throttle transfer
+#   (example: default_cpu 75)
+#default_cpu nodefault
+
+# target disk usage (%) at which to suspend/resume transfer
+#   (example: default_disk 95:85)
+#default_disk nodefault:nodefault
+
+# local avg. i/o usage (MB/s) at which to throttle transfer
+#   (example: default_io 1000)
+#default_io nodefault
+
+# local avg. i/o reads (MB/s) at which to throttle transfer
+#   (example: default_ior 1000)
+#default_ior nodefault
+
+# local avg. i/o writes (MB/s) at which to throttle transfer
+#   (example: default_iow 1000)
+#default_iow nodefault
+
+# local avg. network usage (MB/s) at which to throttle transfer
+#   (example: default_net 80)
+#default_net nodefault
+
+# local avg. network reads (MB/s) at which to throttle transfer
+#   (example: default_netr 80)
+#default_netr nodefault
+
+# local avg. network writes (MB/s) at which to throttle transfer
+#   (example: default_netw 80)
+#default_netw nodefault
+
+
+#################################
+#### user throttling options ####
+#################################
+
+# global avg. i/o usage (MB/s) at which to throttle user X's transfers
+#   (example: throttle_io_user_alice 1000)
+#throttle_io_user_X nodefault
+
+# global avg. i/o reads (MB/s) at which to throttle user X's transfers
+#   (example: throttle_ior_user_alice 1000)
+#throttle_ior_user_X nodefault
+
+# global avg. i/o writes (MB/s) at which to throttle user X's transfers
+#   (example: throttle_iow_user_alice 1000)
+#throttle_iow_user_X nodefault
+
+# global avg. network usage (MB/s) at which to throttle user X's transfers
+#   (example: throttle_net_user_alice 80)
+#throttle_net_user_X nodefault
+
+# global avg. network reads (MB/s) at which to throttle user X's transfers
+#   (example: throttle_netr_user_alice 80)
+#throttle_netr_user_X nodefault
+
+# global avg. network writes (MB/s) at which to throttle user X's transfers
+#   (example: throttle_netw_user_alice 80)
+#throttle_netw_user_X nodefault
+
+
+########################################
+#### file system throttling options ####
+########################################
+
+# disk usage (%) at which to suspend/resume transfers to file system X
+#   (the format for each file system X is SERVERS:REMOTE, where SERVERS
+#       and REMOTE are the values of "servers" and "remote", respectively,
+#       listed for X when running "shift-aux mount" on a host that mounts X)
+#   (example: throttle_disk_homenfs1.example.com:/home 95:85)
+#throttle_disk_X nodefault:nodefault
+
+# global avg. i/o usage (MB/s) at which to throttle transfers to file system X
+#   (format of X is identical to disk usage above)
+#   (example: throttle_io_fs_homenfs1.example.com:/home 1000)
+#throttle_io_fs_X nodefault
+
+# global avg. i/o reads (MB/s) at which to throttle transfers to file system X
+#   (format of X is identical to disk usage above)
+#   (example: throttle_ior_fs_homenfs1.example.com:/home 1000)
+#throttle_ior_fs_X nodefault
+
+# global avg. i/o writes (MB/s) at which to throttle transfers to file system X
+#   (format of X is identical to disk usage above)
+#   (example: throttle_iow_fs_homenfs1.example.com:/home 1000)
+#throttle_iow_fs_X nodefault
+
+
+#################################
+#### host throttling options ####
+#################################
+
+# global avg. i/o usage (MB/s) at which to throttle transfers on host X
+#   (example: throttle_io_host_host1.example.com 10000)
+#throttle_io_host_X nodefault
+
+# global avg. i/o reads (MB/s) at which to throttle transfers on host X
+#   (example: throttle_ior_host_host1.example.com 10000)
+#throttle_ior_host_X nodefault
+
+# global avg. i/o writes (MB/s) at which to throttle transfers on host X
+#   (example: throttle_iow_host_host1.example.com 10000)
+#throttle_iow_host_X nodefault
+
+# global avg. network usage (MB/s) at which to throttle transfers on host X
+#   (example: throttle_net_host_host1.example.com 10000)
+#throttle_net_host_X nodefault
+
+# global avg. network reads (MB/s) at which to throttle transfers on host X
+#   (example: throttle_netr_host_host1.example.com 10000)
+#throttle_netr_host_X nodefault
+
+# global avg. network writes (MB/s) at which to throttle transfers on host X
+#   (example: throttle_netw_host_host1.example.com 10000)
+#throttle_netw_host_X nodefault
+

@@ -1,0 +1,314 @@
+Shift Installation and Configuration
+====================================
+
+1. Deployments
+
+    Shift consists of three executable components:
+    
+        o shiftc    - the Shift client, which is invoked by users and other
+                      client instances and must exist on hosts that initiate
+                      transfers and hosts on which a transfer is to be
+                      parallelized (henceforth called "client hosts")
+
+        o shift-mgr - the Shift manager, which is invoked by client instances
+                      and must exist either on all client hosts or on a host
+                      accessible via ssh hostbased or pubkey authentication
+                      (henceforth called "manager hosts")
+
+        o shift-aux - the Shift auxiliary utility, which is invoked by client
+                      instances and is optional for basic functionality, but
+                      must be installed on any hosts accessed as the source or
+                      destination of a transfer initiated from a different host
+                      (henceforth called "remote hosts") for efficient remote
+                      file initialization, higher speed transfers via the
+                      built-in fish/fish-tcp protocols, remote acl/xattr
+                      preservation, remote lustre striping, and remote
+                      verification (if msum from mutil is not installed)
+
+    The main consideration for a Shift deployment is deciding which hosts will
+    be the manager hosts.  In the simplest case, all client hosts are manager
+    hosts.  If there is more than one client host, then the manager must be
+    configured to store its metadata on a shared file system that supports
+    locking.
+
+    In a more complex multi-user, multi-host environment without a shared file
+    system across all potential client hosts, one or more hosts must be
+    designated as manager hosts.  Since the manager is not an active server
+    and is simply a passive executable invoked by clients, the manager can be
+    located on any host with ssh access.  These hosts must support either
+    hostbased or pubkey authentication, however, since Shift is an automated
+    framework that performs actions without the user present.  The manager has
+    a synchronization mechanism allowing multiple hosts without a shared file
+    system to be used for redundancy.
+
+
+2. Prerequisites
+
+    2.1. Required
+
+        o perl >= 5.8.5 (>= 5.10.1 is required for multi-threading support)
+        o ssh (and sftp) access to manager/remote hosts via hostbased or
+              pubkey authentication
+
+    2.2. Optional
+
+        o mcp/msum >= 1.76.7 - high speed local copy/sum
+            (http://mutil.sf.net)
+        o bbcp - high speed remote copy
+            (http://www.slac.stanford.edu/~abh/bbcp) 
+        o bbftp - high speed remote copy
+            (http://doc.in2p3.fr/bbftp)
+        o gridftp - high speed remote copy
+            (http://toolkit.globus.org/toolkit/data/gridftp)
+        o rsync - bandwidth-efficient local/remote copy
+            (http://rsync.samba.org)
+        o mesh - lightweight single sign-on via ssh pubkeys
+            (http://mesh.sf.net)
+
+    2.3. Invoked (standard on most systems or when specific file systems in use)
+
+        o chown - change symlink ownership
+        o crontab - install cron jobs to recover from host/process failures
+        o df - get file system utilization
+        o dm{get,put} - recall and migrate DMF-managed files
+        o fallocate - preallocate files
+        o {get,set}facl - get and set file ACLs
+        o {get,set}fattr - get and set file extended attributes
+        o lfs - get and set Lustre striping
+        o lspci - find 10GE adapters
+        o mmlsmgr - get GPFS server information
+        o mount - get file system information
+        o ping - determine network latency
+        o ps - find clients and PBS processes, and determine client CPU load
+        o su - become non-root process to access manager during root transfers
+        o sysctl - determine number of cpus on BSD
+        o touch - change symlink modification time
+        o unbuffer - interleave stdout/stderr when using gridftp
+
+
+3. Installation
+
+    Note that the following shows the exact files needed on each type of host.
+    Since the number of files is small, however, there is minimal penalty to
+    simply installing them all on every host.
+
+    3.1. Single-user installation
+
+        Note that the user's home directory is used as the default install
+        prefix in all examples, but can be changed to any other desired location
+        as long as the corresponding bin directory is in the user's path.
+
+        3.1.1. Client hosts
+
+            install -m 700 perl/shiftc ~/bin/shiftc
+            install -m 600 doc/shiftc.1 ~/man/man1/shiftc.1
+
+        3.1.2. Manager hosts
+
+            install -m 700 perl/shift-mgr ~/bin/shift-mgr
+            install -m 600 etc/shiftrc ~/.shiftrc
+
+        3.1.3. Remote hosts (optional but recommended when possible)
+
+            install -m 700 perl/shift-aux ~/bin/shift-aux
+
+    3.2. Multi-user installation
+
+        Note that /usr/local is used as the default install prefix in all
+        examples, but can be changed to any other desired location as long
+        as the corresponding bin directory is in the default system path.
+
+        3.2.1. Client hosts
+
+            install -m 755 perl/shiftc /usr/local/bin/shiftc
+            install -m 644 doc/shiftc.1 /usr/local/man/man1/shiftc.1
+
+        3.2.2. Manager hosts
+
+            install -m 755 perl/shift-mgr /usr/local/bin/shift-mgr
+            install -m 644 etc/shiftrc /etc/shiftrc
+
+        3.2.3. Remote hosts (optional but recommended when possible)
+
+            install -m 755 perl/shift-aux /usr/local/bin/shift-aux
+
+
+4. Configuration
+
+    4.1. Client hosts
+
+        4.1.1. ~/.ssh/id_rsa (or similar)
+
+            If hostbased authentication is not supported by client hosts,
+            manager hosts, and/or remote hosts, pubkey authentication must be
+            used.  Clients must have access to private keys to access these
+            systems, which may either be referenced explicitly via the
+            --mgr-identity and --identity options for manager and remote
+            hosts, respectively, or be added to an ssh agent on the client(s).
+            Note that the private keys used for these options must not be
+            protected by a passphrase.  The use of an ssh agent to access
+            manager or remote hosts may be preferable from a security standpoint
+            but comes with a drop in reliability as any failure of the agent or
+            agent host leaves any associated transfers with no way to recover.
+
+        4.1.2. ~/.ssh/authorized_keys
+
+            If hostbased authentication is not supported to other client hosts
+            for parallelization, pubkey authentication must be used.  In this
+            case, the public key(s) corresponding to the private key(s) used by
+            clients (those named ~/.ssh/id* loaded into an ssh agent) must be
+            added to the invoking user's authorized_keys file on other client
+            hosts.
+
+        4.1.3. ~/bin/shiftc (single-user) or /usr/local/bin/shiftc (multi-user)
+
+            If the manager hosts differ from the client hosts, the manager
+            host(s) can be hardcoded within the shiftc program in the
+            "site-specific options" section.  This allows the client to be used
+            without specifying the --mgr option every time.  For example, the
+            line:
+
+                $opts{"mgr"} = "mgr.example.com";
+
+            would be equivalent to specifying the option "--mgr=mgr.example.com".
+            In general, any shiftc command-line option --X can be hardcoded using:
+
+                $opts{"X"} = "hardcoded_value";
+
+            Those familiar with perl can add more complex logic (e.g. choosing
+            which manager host out of a set of hosts will be used for each
+            invocation).
+
+    4.2. Manager hosts
+
+        4.2.1. ~/.shiftrc (single-user) or /etc/shiftrc (multi-user)
+
+            All items in the default config file should be reviewed.
+            The only required setting is:
+
+                user_dir
+
+            If there are multiple manager hosts, the configured directory must
+            either be a file system shared across all manager hosts that
+            supports file locking or the setting:
+
+                sync_host
+
+            must be configured to sync the transfer metadata across two
+            manager hosts.  Note that the existing synchronization
+            mechanism has been found to be a bottleneck when there are
+            many clients in a single transfer or many simultaneous
+            transfers by a single user.  This will be fixed in a future
+            version.
+
+            The transport options should definitely be reviewed to
+            enable any higher performance transports that may be
+            available.  Higher performance remote transports based on
+            TCP connections (fish-tcp) and SSH connections (fish) are
+            built-in, but require that the shift-aux executable exist
+            on remote hosts.  Note that transports can be enabled on a
+            case-by-case basic using the client --local and --remote
+            options.
+
+            To allow Shift to make parallelization decisions and enable
+            functionality specific to certain remote file systems (e.g. Lustre
+            striping), it is desirable to configure:
+
+                db_file
+
+            with a database of host and file system information from within
+            the local environment.  A template for producing this database is
+            provided in the file "etc/shift-mounts.pl".  After the items
+            indicated in the script are configured, it can be run
+            once/periodically to initialize/update the file system database.
+
+            To optimize access to remote hosts on the LAN, the setting:
+
+                select_hook
+
+            may be configured to specify how remote hosts should be selected
+            when more than one is available.  This may include deciding which
+            hosts are up, which are least loaded, which have the best
+            connectivity to the given client host, etc.  A skeleton for a
+            suitable selection hook is provided in the file
+            "etc/shift-select.hook", but must be fleshed out based on
+            site-specific knowledge and/or calls to the local load balancing
+            infrastructure.  If not configured, hosts will be chosen randomly
+            after a successful sshd ping test.
+
+        4.2.2. ~/.ssh/authorized_keys
+
+            If hostbased authentication is not supported to manager hosts,
+            pubkey authentication must be used.  In this case, the public key(s)
+            corresponding to the private key(s) used by clients (either loaded
+            into an ssh agent or specified via --mgr-identity) must be added to
+            the appropriate user's authorized_keys file on manager hosts.
+            This user will either be the invoking user or the one specified by
+            --mgr-user.
+
+
+    4.3. Remote hosts
+
+        4.3.1. ~/.ssh/authorized_keys
+
+            If hostbased authentication is not supported to remote hosts, pubkey
+            authentication must be used.  In this case, the public key(s)
+            corresponding to the private key(s) used by clients (either loaded
+            into an ssh agent or specified via --identity) must be added to the
+            appropriate user's authorized_keys file on remote hosts.  This user
+            will either be the invoking user or the one specified by --user.
+
+
+5. Usage
+
+    5.1. shiftc
+
+        Client usage is detailed in the man page "doc/shiftc.1", which can be
+        viewed with:
+        
+            nroff -man doc/shiftc.1 |less -r
+            
+        if not already in a manpath directory.  Basic usage is drop-in
+        compatible with cp/scp with special consideration for the authentication
+        options --mgr, --mgr-identity, --mgr-user, --identity, and --user.
+        Note that the scp "user@host" syntax is not currently supported (the
+        "user@" portion will be dropped) so --user must be specified instead
+        when the remote user differs from the local user.
+
+    5.2. shift-mgr
+
+        Normal users need not invoke shift-mgr directly as all relevant manager
+        functionality is accessed indirectly through the client.  Additional
+        capabilities are available for administrators, however, to aid in
+        collecting usage stats and debugging information.  Below is a sampling
+        of some of the most useful administrative shift-mgr commands.
+
+        To see the status of a particular user X's transfers, run:
+
+            shift-mgr --user=X --status
+
+        To see the history of a particular user X's transfers, run:
+
+            shift-mgr --user=X --history
+
+        To see the status of running transfers across all users, run:
+
+            shift-mgr --status --state=run
+
+        To see detailed stats across the transfers of all users including a
+        sampling of error messages, run:
+
+            shift-mgr --stats
+
+        This can be added to a cron job (normally at the interval of the
+        "data_expire" setting in shiftrc) with a redirection to a file to
+        periodically save usage stats.
+
+        To see the metadata associated with a given user X's transfer T, run:
+
+            shift-mgr --user=X --id=T --meta
+
+        The metadata is log structured, so it is also possible to view the
+        metadata at any number of steps S back in time using:
+
+            shift-mgr --user=X --id=T --meta=S

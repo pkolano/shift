@@ -1,0 +1,950 @@
+.TH "shiftc" "1" "02 Dec 2015" "" ""
+./"################################################################
+.SH "NAME"
+./"################################################################
+\fBshiftc\fP \(em a high performance reliable file transfer tool
+./"################################################################
+.SH "SYNOPSIS"
+./"################################################################
+.nf 
+\fBshiftc\fP [OPTION]... SOURCE DEST
+\fBshiftc\fP [OPTION]... SOURCE... DIRECTORY
+\fBshiftc\fP [OPTION]...
+.fi
+.PP 
+Reliably transfer SOURCE to DEST, multiple SOURCE(s) to DIRECTORY, or
+arbitrary SOURCE to DEST and/or SOURCE(s) to DIRECTORY combinations
+read from stdin.  By default, symbolic links to files on the command
+line are followed, but symbolic links to directories are not (identical
+to the default behavior of cp).
+.PP 
+Local paths are specified normally.  A path PATH on a remote host HOST
+is specified using scp-style "HOST:PATH".  Note that transfers between
+two remote hosts are not supported.
+./"################################################################
+.SH "DESCRIPTION"
+./"################################################################
+.PP 
+shiftc is the client for Shift, which is a framework for
+\fBS\fPelf-\fBH\fPealing \fBI\fPndependent \fBF\fPile \fBT\fPransfers.  Shift
+includes the following features, among others:
+.IP -
+support for local, LAN, and WAN transfers
+.IP -
+drop-in replacement for both cp and scp (basic options only)
+.IP -
+tracking of individual file operations with on-demand status
+.IP -
+transfer stop and restart
+.IP -
+email notification of completion, errors, and warnings
+.IP -
+local and remote tar creation/extraction
+.IP -
+rsync-like synchronization based on modification times and checksums
+.IP -
+integrity verification of transfers with partial retransfer/resum to
+rectify corruption
+.IP -
+throttling based on local and remote resource utilization
+.IP -
+automatic retrieval and release of files residing on DMF-managed file
+systems
+.IP -
+automatic striping of files transferred to Lustre file systems
+.IP -
+fully self-contained besides perl core and ssh
+.IP -
+automatic detection and selection of higher performance transports and
+hash utilities when available including bbcp, bbftp, gridftp, mcp,
+msum, and rsync
+.IP -
+automatic many-to-many parallelization of single and multi-file
+transfers with file system equivalence detection and rewriting
+.PP
+To support these features, shiftc communicates with a manager component
+that is responsible for tracking transfers and directing the client to
+process batches of file operations and return the results.
+./"################################################################
+.SH "OPTIONS SUMMARY"
+./"################################################################
+The following options are available in shiftc.  Defaults are shown in
+brackets.  Some options have short and long variants separated by
+commas.  The \(cq\&=\(cq\& for options that take a parameter is
+optional; whitespace may be used instead.  Detailed descriptions are
+given in following sections.
+.PP 
+.nf 
+\fBInitialization options (defaults in brackets):\fP
+\-\-clients=NUM        use at most NUM clients per host [1]
+\-\-create\-tar         create tar file of SOURCE(s) at DEST
+\-L, \-\-dereference    always follow symbolic links
+\-d, \-\-directory      create any missing parent directories
+\-\-exclude=REGEX      exclude files matching REGEX
+\-\-extract\-tar        extract tar file(s) at SOURCE to DEST
+\-h, \-\-help           help
+\-\-host\-file=FILE     parallelize transfer on hosts in FILE (one per line)
+\-\-host\-list=LIST     parallelize transfer on hosts in LIST
+\-\-hosts=NUM          parallelize transfer on at most NUM client hosts [1]
+\-\-identity=FILE      access remote systems with ssh identity in FILE
+\-I, \-\-ignore\-times   do not skip files that match size and time
+\-\-include=REGEX      include only files matching REGEX
+\-\-index\-tar          create table of contents during tar creation
+\-\-newer=DATE         include only files with mtime newer than DATE
+\-P, \-\-no\-dereference never follow symbolic links
+\-T, \-\-no\-target\-directory treat target as a normal file
+\-\-older=DATE         include only files with mtime older than DATE
+\-\-ports=NUM1:NUM2    use ports NUM1\-NUM2 for remote TCP\-based transports
+\-R, \-r, \-\-recursive  copy directories recursively
+\-\-secure             encrypt data stream(s) and use secure ciphers/macs
+\-\-sync               synchronize files at destination
+\-\-user=USER          access remote systems as USER
+\-\-wait               block until transfer completes
+                       (exit 0 = success, 1 = failure)
+.PP
+\fBFeature\-disablement options:\fP
+\-\-no\-check           do not check file existence/size (benchmarking only)
+\-\-no\-cron            do not recover from host/process failures via cron
+\-\-no\-mail            do not send status emails
+\-\-no\-offline         do not migrate DMF\-managed files after transfer
+\-\-no\-preserve        do not preserve times, mode, owner, acls, or xattrs
+\-\-no\-verify          do not verify/rectify integrity of destination files
+.PP
+\fBMonitoring/management options:\fP
+\-\-history            show list of transfer commands and origin host/dir
+\-\-id=NUM             use transfer identifier NUM for other commands
+\-\-mgr=HOST           set host of shift manager to HOST
+\-\-mgr\-identity=FILE  access manager host with ssh identity in FILE
+\-\-mgr\-user=USER      access manager host as USER
+\-\-restart            restart transfer with given \-\-id
+\-\-search=REGEX       show only status/history matching REGEX
+\-\-state=STATE        show status of only those operations in STATE
+                       (STATE one of {done,error,none,queue,run,warn})
+\-\-stats              show stats across all transfers
+\-\-status[={csv,pad}] show brief status of all transfers
+\-\-stop               stop transfer with given \-\-id
+                       or detailed status of transfer with given \-\-id
+.PP
+\fBTuning options (defaults in brackets):\fP
+\-\-bandwidth=BITS     tune TCP\-based transports based on BITS per second
+                       (use suffix {k,m,g,t} for {Kb,Mb,Gb,Tb})
+\-\-buffer=SIZE        use SIZE bytes for buffer in transports
+                       (use suffix {k,m,g,t} for {KiB,MiB,GiB,TiB}) [4m]
+\-\-files=COUNT        process transfer in batches of COUNT files
+                       (use suffix {k,m,b/g,t} for 1E{3,6,9,12}) [1k]
+\-\-local=LIST         set local transport mechanism to one of LIST
+                       (LIST subset of {bbcp,bbftp,fish,fish-tcp,gridftp,
+                                        mcp,rsync,shift})
+\-\-preallocate=NUM    preallocate files when sparsity under NUM percent
+\-\-remote=LIST        set remote transport mechanism to one of LIST
+                       (LIST subset of {bbcp,bbftp,fish,fish-tcp,gridftp,
+                                        rsync,shift})
+\-\-retry=NUM          retry failed operations up to NUM times [2]
+\-\-size=SIZE          process transfer in batches of SIZE bytes
+                       (use suffix {k,m,g,t} for {KB,MB,GB,TB}) [4g]
+\-\-split=SIZE         parallelize single files using chunks of SIZE bytes
+                       (use suffix {k,m,g,t} for {KiB,MiB,GiB,TiB}) [0]
+\-\-split\-tar=SIZE     create tar files of around SIZE bytes
+                       (use suffix {k,m,g,t} for {KB,MB,GB,TB}) [500g]
+\-\-streams=NUM        use NUM streams in remote transports [4]
+\-\-stripe=SIZE|NUM    use 1 stripe per SIZE bytes or NUM stripes
+                       (use suffix {k,m,g,t} for {KB,MB,GB,TB}) [1g]
+\-\-threads=NUM        use NUM threads in local transports [4]
+\-\-verify\-fast        verify faster but less safely by reusing src buffer
+\-\-window=SIZE        use SIZE bytes for window in TCP\-based transports
+                       (use suffix {k,m,g,t} for {KB,MB,GB,TB}) [4m]
+.PP
+\fBThrottling options:\fP
+\-\-cpu=NUM            throttle local cpu usage at NUM %
+\-\-disk=NUM1:NUM2     suspend/resume transfer when target NUM1%/NUM2% full
+\-\-io=NUM             throttle local i/o usage at NUM MB/s
+\-\-ior=NUM            throttle local i/o reads at NUM MB/s
+\-\-iow=NUM            throttle local i/o writes at NUM MB/s
+\-\-net=NUM            throttle local network usage at NUM MB/s
+\-\-netr=NUM           throttle local network reads at NUM MB/s
+\-\-netw=NUM           throttle local network writes at NUM MB/s
+.fi 
+./"################################################################
+.SH "TRANSFER INITIALIZATION"
+./"################################################################
+Transfers are initialized using syntax identical to cp/scp for
+local/remote transfers, respectively.  The most commonly used options
+during initialization are listed below.
+.IP "\fB\-\-clients=NUM\fP"
+Parallelize the transfer by using additional clients on each host.  If
+the number given is one, no additional clients will be used.  A number
+greater than one will fork additional processes on each host to more
+fully utilize system resources and increase transfer performance.
+.IP "\fB\-\-create\-tar\fP"
+Create a tar file of all sources at the destination, which must be a
+non-existing file name.  This option implies \fB\-\-recursive\fP and
+\fB\-\-no\-offline\fP.  By default, multiple tar files are created at
+500 GB boundaries.  The split size may be changed or splitting disabled
+using the \fB\-\-split\-tar\fP option.  The \fB\-\-index\-tar\fP option
+may be used to produce a table of contents file for each tar file
+created.  Note that this option cannot be used with \fB\-\-sync\fP.
+.IP "\fB\-L, \-\-dereference\fP"
+Always follow symbolic links to both files and directories.  Note that
+this can result in file and directory duplication at the destination as
+all symbolic links will become real files and directories.
+.IP "\fB\-d, \-\-directory\fP"
+Create any missing parent directories.  This option allows files to be
+transferred to a directory hierarchy that may not already exist, similar
+to the \fB\-d\fP option of the "install" command.
+.IP "\fB\-\-exclude=REGEX\fP"
+Do not transfer source files matching the given regular expression.
+Note that regular expressions must be given in Perl syntax (see
+perlre(1) for details) and should be quoted on the command line when
+including characters normally expanded by the shell (e.g. "*").  Shell
+wildcard behavior can be approximated by using ".*" in place of "*".
+.IP "\fB\-\-extract\-tar\fP"
+Extract all source tar files to the destination, which must be an
+existing directory or non-existing directory name.  This option implies
+\fB\-\-no\-offline\fP.  Note that only tar archives in the POSIX ustar
+format are supported, but GNU extensions for large uids, gids, file
+sizes, and file names are handled appropriately.  Also note that this
+option cannot be used with \fB\-\-sync\fP.
+.IP "\fB\-\-host\-file=FILE\fP"
+Parallelize the transfer by using additional clients on the hosts
+specified in the given file (one host name per line).  This option
+implies a \fB\-\-hosts\fP value equal to the number of hosts in the file
+plus any additional hosts from the \fB\-\-host\-list\fP option.  Less
+hosts may be used by explicitly specifying a \fB\-\-hosts\fP value.
+Note that the actual number of client hosts used will depend upon number
+of hosts that have equivalent access to the source and/or destination
+file systems.  Within PBS job scripts, this option can be set to the
+$PBS_NODEFILE variable to use all nodes of the job.
+.IP "\fB\-\-host\-list=LIST\fP"
+Parallelize the transfer by using additional clients on the hosts
+specified in the given comma-separated list.  This option implies a
+\fB\-\-hosts\fP value equal to the number of hosts on the list plus any
+additional hosts from the \fB\-\-host\-file\fP option.  Less hosts may
+be used by explicitly specifying a \fB\-\-hosts\fP value.  Note that the
+actual number of client hosts used will depend upon number of hosts that
+have equivalent access to the source and/or destination file systems.
+.IP "\fB\-\-hosts=NUM\fP"
+Parallelize the transfer by using additional clients on at most the
+given number of hosts.  If the number given is one, no additional
+client hosts will be used.  A number greater than one enables automatic
+transfer parallelization where additional clients may be invoked on
+additional hosts to increase transfer performance.  Note that the actual
+number of client hosts used will depend upon the number of hosts for
+which Shift has file system information and the number of hosts that
+have equivalent access to the source and/or destination file systems.
+Client hosts will be accessed as the current user with hostbased
+authentication or an existing ssh agent that contains an ssh identity
+from a file matching ~/.ssh/id*.
+.IP "\fB\-\-identity=FILE\fP"
+Authenticate to remote systems using the given ssh identity file.
+The corresponding public key must reside in the appropriate user's
+~/.ssh/authorized_keys file on the remote host.  Note that only
+identity files without passphrases are supported.  If a passphrase is
+required, an ssh agent may be used instead, but with a loss of
+reliability.  This option is not needed if the remote host accepts
+hostbased authentication from client hosts.  
+.IP "\fB\-I, \-\-ignore\-times\fP"
+By default, the \fB\-\-sync\fP option skips the processing of files
+that have the same size and modification time at the source and
+destination.  This option specifies that files should always be
+processed by checksum regardless of size and modification time.
+.IP "\fB\-\-include=REGEX\fP"
+Only transfer source files matching the given regular expression.
+Note that regular expressions must be given in Perl syntax (see
+perlre(1) for details) and should be quoted on the command line when
+including characters normally expanded by the shell (e.g. "*").  Shell
+wildcard behavior can be approximated by using ".*" in place of "*".
+.IP "\fB\-\-index\-tar\fP"
+Create a table of contents file for each tar file created with
+\fB\-\-create\-tar\fP.  The table of contents will show each file in the
+tar file along with permissions, user/group ownership, and size.  For a
+tar file "file.tar", the table of contents will be named "file.tar.toc".
+Unless the \fB\-\-no\-verify\fP option is used, a checksum file will
+also be created named "file.tar.sum", which is suitable as input for
+"msum --check-tree -c".  Note that when \fB\-\-split\-tar\fP is used,
+multiple table of contents and checksum files may be created.  For each
+split tar file "file.tar-i.tar", the table of contents will be named
+"file.tar-i.tar.toc" and the checksum file will be named
+"file.tar-i.tar.sum".
+.IP "\fB\-\-newer=DATE\fP"
+Only transfer source files whose modification time is newer (inclusive)
+than the given date.  Any date string supported by the Perl
+Date::Parse module can be specified.  Note that this option can be
+combined with \fB\-\-older\fP to specify exact date ranges.
+.IP "\fB\-P, \-\-no\-dereference\fP"
+Never follow symbolic links to file or directories.  Note that this
+can result in broken links at the destination as files and directories
+referenced by symbolic links that were not explicitly transferred or
+implicitly transferred using \fB\-\-recursive\fP may not exist on the
+target.
+.IP "\fB\-T, \-\-no\-target\-directory\fP"
+Do not treat the destination specially when it is a directory or a
+symbolic link to a directory.  This option can be used with recursive
+transfers to copy a directory's contents into an existing directory 
+instead of into a new subdirectory beneath it as is done by default.
+.IP "\fB\-\-older=DATE\fP"
+Only transfer source files whose modification time is older than the
+given date.  Any date string supported by the Perl Date::Parse module
+can be specified.  Note that this option can be combined with
+\fB\-\-newer\fP to specify exact date ranges.
+.IP "\fB\-\-ports=NUM1:NUM2\fP"
+Use ports from the range NUM1-NUM2 for the data streams of TCP-based
+transports (currently, bbcp, bbftp, fish-tcp, and gridftp).  All
+connections originate from the client host so the given port range must
+be allowed on the network path to the remote host and by the remote host
+itself.
+.IP "\fB\-R, \-r, \-\-recursive\fP"
+Transfer directories recursively.  This option implies
+\fB\-\-no\-dereference\fP.Note that any symbolic links pointing
+to directories given on the command line will be followed during
+recursive transfers (identical to the default behavior of cp).
+.IP "\fB\-\-secure\fP"
+Encrypt data during remote transfers and use secure ciphers and MACs
+with SSH-based tranports.  Note that this option will, in most cases,
+decrease performance as it eliminates some higher performance transports
+and increases CPU utilization during SSH connections.
+.IP "\fB\-\-sync\fP"
+Synchronize files between the source and destination, similar to the
+rsync command.  By default, files that have the same size and
+modification time at the source and destination will not be transferred.
+If the size or modification time of a file differs between the two, the
+contents of the file will be compared via checksum and any portions that
+differ will be transferred to the destination.  To skip the size and
+modification time checks and always begin with the checksum stage, use
+\fB\-I\fP or \fB\-\-ignore\-times\fP.  If \fB\-\-no\-verify\fP is
+specified, integrity verification is not performed, which will increase
+performance when there are many files at the source that are not at
+the destination but will decrease performance when there are large files
+that have only small changes between the source and destination.
+Setting \fB\-\-retry\fP to zero with this option can be used to show
+which files differ without making any changes.  Note that when syncing
+directories, the destination should be specified as the parent of the
+location where the source directory should be transferred to.  Also note
+that this option cannot be used with \fB\-\-create\-tar\fP or
+\fB\-\-extract\-tar\fB.
+.IP "\fB\-\-user=USER\fP"
+Set the user that will be used to access remote systems.
+.IP "\fB\-\-wait\fP"
+Block until the transfer completes and print a summary of the transfer.
+This option implies \fB\-\-no\-mail\fP.  An exit value of 0 indicates
+that the transfer has successfully completed while an exit value of 1
+indicates that the transfer has failed or that the waiting process was
+terminated prematurely.
+./"################################################################
+.SH "FEATURE DISABLEMENT
+./"################################################################
+.IP "\fB\-\-no\-check\fP"
+Disable file existence and size checks at the end of the transfer.
+This option was included for benchmarking and completeness purposes
+and is not recommended for general use.
+.IP "\fB\-\-no\-cron\fP"
+Do not attempt to recover from host/process failures via cron.  Note
+that when such a failure occurs, the transfer will become stuck in the
+"run" state until stopped.
+.IP "\fB\-\-no\-mail\fP"
+Prevents sending of emails due to errors, warnings, or completion.
+This option may be desirable when performing a large number of scripted
+transfers.  Note that equivalent transfer status and history information
+can always be manually retrieved using \fB\-\-status\fP and
+\fB\-\-history\fP, respectively.
+.IP "\fB\-\-no\-offline\fP"
+By default, files transferred to/from DMF-managed file systems will be
+migrated to offline media as soon as the transfer completes.  This
+option specifies that files should not be migrated.  Note that DMF may
+still choose to migrate (and possibly release) files even when this
+option is enabled.
+.IP "\fB\-\-no\-preserve\fP"
+By default, times, permissions, ownership, ACLs, and extended attributes
+of transferred files and directories are preserved when possible.
+This option specifies that these items should not be preserved.  Note
+that permissions may be left in various states depending on the invoking
+user's umask and the transport utilized.  In particular, read access at
+the destination may be more permissive than read access at the source.
+.IP "\fB\-\-no\-verify\fP"
+By default, files are checksummed at the source and destination to
+verify that they have not been corrupted and if corruption is detected,
+the corrupted portion of the destination file is automatically corrected
+using a partial transfer from the original source.  This functionality
+decreases the performance of transfers in proportion to the file size.
+If assurance of integrity is not required, the \fB\-\-no\-verify\fP
+option may be used to disable verification.
+./"################################################################
+.SH "TRANSFER MONITORING AND MANAGEMENT
+./"################################################################
+Once one or more transfers have been initialized, the user may view
+transfer history, stop/restart transfers, and/or check transfer status
+with the following options.
+.IP "\fB\-\-history\fP"
+Show a brief history of all transfers including the transfer identifier,
+the origin host/directory and the original command.
+.IP "\fB\-\-id=NUM\fP"
+Specify the transfer identifier to be used with management and status
+commands.
+.IP "\fB\-\-mgr=HOST\fP"
+Set the host that will be used to manage transfers.  By default, this
+host will be accessed as the current user with hostbased authentication
+or an existing ssh agent.  The user and/or identity used to access the
+manager host may be changed with the \fB\-\-mgr\-user\fP and
+\fB\-\-mgr\-identity\fP options, respectively.
+.IP "\fB\-\-mgr\-identity=FILE\fP"
+Authenticate to the manager host using the given ssh identity file.
+The corresponding public key must reside in the appropriate user's
+~/.ssh/authorized_keys file on the manager host.  Note that only
+identity files without passphrases are supported.  If a passphrase is
+required, an ssh agent may be used instead, but with a loss of
+reliability.  This option is not needed if the manager host accepts
+hostbased authentication from client hosts.  
+.IP "\fB\-\-mgr\-user=USER\fP"
+Set the user that will be used to access the manager host.  Note that if
+the transfer is initiated by root and \fB\-\-mgr\-identity\fP is not
+specified, manager communication will be performed as the given user
+so that user must be authorized to run processes locally.  In
+particular, care should be taken on PBS-controlled nodes, where the
+given user should either own the node or be on the user exception list.
+.IP "\fB\-\-restart\fP"
+Restart the transfer associated with the given \fB\-\-id\fP that was
+stopped due to unrecoverable errors or stopped explicitly via
+\fB\-\-stop\fP.  Note that transfers must be restarted on the original
+client host or one that has equivalent file system access.  A subset of
+the available command-line options may be respecified during a restart
+including \fB\-\-bandwidth\fP, \fB\-\-buffer\fP, \fB\-\-clients\fP,
+\fB\-\-cpu\fP, \fB\-\-disk\fP, \fB\-\-files\fP, \fB\-\-host-file\fP,
+\fB\-\-host-list\fP, \fB\-\-hosts\fP, \fB\-\-io\fP, \fB\-\-ior\fP,
+\fB\-\-iow\fP, \fB\-\-local\fP, \fB\-\-net\fP, \fB\-\-netr\fP,
+\fB\-\-netw\fP, \fB\-\-no\-cron\fP, \fB\-\-no\-mail\fP,
+\fB\-\-no\-offline\fP, \fB\-\-ports\fP, \fB\-\-preallocate\fP,
+\fB\-\-remote\fP, \fB\-\-retry\fP, \fB\-\-secure\fP, \fB\-\-size\fP,
+\fB\-\-streams\fP, \fB\-\-stripe\fP, \fB\-\-threads\fP, and \fB\-\-window\fP.
+.IP "\fB\-\-search=REGEX\fP"
+When \fB\-\-status\fP and \fB\-\-id\fP are specified, this option will
+show the full status of file operations in the associated transfer whose
+source or destination file name match the given regular expression.
+.IP
+When \fB\-\-history\fP is specified, this option will show a brief
+history of the transfers whose origin host or original command match the
+given regular expression.
+.IP
+Note that regular expressions must be given in Perl syntax (see
+perlre(1) for details).
+.IP "\fB\-\-state=STATE\fP"
+When \fB\-\-status\fP and \fB\-\-id\fP are specified, this option will
+show the full status of file operations in the associated transfer that
+have the given state.  When \fB\-\-id\fP is not specified, this option
+will show the brief status of transfers in the given state.  Valid
+states are done, error, none, queue, run, and warn.  A state of "none"
+will show a summary of the given transfer.
+.IP "\fB\-\-stats\fP"
+Show stats across all transfers including transfer counts, rates, tool
+usage, initialization options, error counts, and error messages.
+.IP "\fB\-\-status[={csv,pad}]\fP"
+Show a brief status of all transfers including the transfer identifier,
+the current state, the number of directories completed, the number of
+files transferred, the number of files checksummed, the number of
+attributes preserved, the amount of data transferred, the amount of data
+checksummed, the time the transfer started, the duration of the
+transfer, the estimated time remaining in the transfer, and the rate of
+the transfer.  When the number of transfers exceeds a set threshold (20
+by default), older successfully completed transfers beyond that limit
+will be omitted for readability.  These omitted transfers can be shown
+using \fB\-\-status\fP with \fB\-\-state=done\fP.  Status will be
+returned in CSV format when \fB\-\-status=csv\fP is specified.  Duration
+and estimated time will be zero-padded when \fB\-\-status=pad\fP is
+specified.
+.IP
+When \fB\-\-id\fP is specified, this option will show the full status of
+every file operation in the associated transfer.  For each operation,
+this includes the state, the type, the tool used for processing, the
+target path, associated information (error messages, checksums, byte
+ranges, and/or running host) when applicable, the size of the file,
+the time processing started, and the rate of the operation.  Note that
+not all of these items will be applicable at all times (e.g. rate will
+be empty if the state is error).  Also note that operations are
+processed in batches so the rate shown for a single operation will
+depend on the other operations processed in the same batch.
+.IP "\fB\-\-stop\fP"
+Stop the transfer associated with the given \fB\-\-id\fP.  Note that
+transfer operations currently in progress will run to completion but new
+operations will not be processed.  Stopped transfers may be restarted
+with \fB\-\-restart\fP.
+./"################################################################
+.SH "TRANSFER TUNING"
+./"################################################################
+Some advanced options are available to tune various aspects of shiftc
+behavior.  These options are not needed by most users.
+.IP "\fB\-\-bandwidth=BITS\fP"
+Choose the TCP window size and number of TCP streams of TCP-based
+transports (currently, bbcp, bbftp, fish-tcp, and gridftp) based on
+the given bits per second.  The suffixes k, m, g, and t may be used for
+Kb, Mb, Gb, and Tb, respectively.  The default bandwidth is estimated to
+be 10 Gb/s if a 10 GE adapter is found on the client host, 1 Gb/s if the
+client host can be resolved to an organization domain (by default, one
+of the six original generic top-level domains), and 100 Mb/s otherwise.
+.IP "\fB\-\-buffer=SIZE\fP"
+Use memory buffer(s) of the given size when configurable in the
+underlying tranport being utilized (currently, all but rsync).  The
+suffixes k, m, g, and t may be used for KiB, MiB, GiB, and TiB,
+respectively.  The default buffer size is 4 MiB.  Increasing the
+buffer size trades higher memory utilization for more efficient I/O.
+.IP "\fB\-\-files=COUNT\fP"
+Process transfers in batches of the given number of files.  The
+suffixes k, m, b or g, and t may be used for 1E3, 1E6, 1E9, and 1E12,
+respectively.  The default batch count is 1000 files.  Lowering the
+batch count will increase the number of checkpoints and the overhead of
+transfer management.  Raising the batch count will have the opposite
+effect.  A batch will be sent for processing when the number of files in
+the batch reaches the given value.  Note that batches of less than the
+given count can occur if the batch size specified by \fB\-\-size\fP is
+reached first.
+.IP "\fB\-\-local=LIST\fP"
+Specify one or more local transports to be used for the transfer in
+order of preference, separated by commas.  Valid transports for this
+option currently include bbcp, bbftp, cp, fish, fish-tcp, gridftp,
+mcp, and rsync.  Note that the given transport(s) will be given
+priority, but may not be used in some cases (e.g. rsync is not capable
+of transferring a specific portion of a file as needed by verification
+mode).  In such cases, the default transport based on File::Copy will be
+used.  The tool actually used for each file operation can be shown using
+\fB\-\-status\fP with \fB\-\-id\fP set to the given transfer identifier.
+.IP "\fB\-\-preallocate=NUM\fP"
+Preallocate files when their sparsity is under the given percent, where
+sparsity is defined as the number of bytes a file takes up on disk
+divided by its size.  Note that this option will only have an effect
+when the fallocate command is available, the destination file does not
+already exist, and the target file system properly supports fallocate's
+-n option.  Also note that this option will not function properly when
+either bbftp or rsync (to a DMF file system) is utilized as the
+transport due to their use of temporary files.
+.IP "\fB\-\-remote=LIST\fP"
+Specify one or more remote transports to be used for the transfer in
+order of preference, separated by commas.  Valid transports for this
+option currently include bbcp, bbftp, fish, fish-tcp, gridftp, rsync,
+and sftp.  Note that the given transport(s) will be given priority, but
+may not be used in some cases (e.g. bbftp is not capable of transferring
+files with spaces in their names and is also incompatible with
+\fB\-\-secure\fP).  In such cases, the default transport based on sftp
+will be used.  The tool actually used for each file operation can be
+shown using \fB\-\-status\fP with \fB\-\-id\fP set to the given transfer
+identifier.
+.IP "\fB\-\-retry=NUM\fP"
+Retry operations deemed recoverable up to the given number of attempts
+per file.  The default number of retries is 2.  A value of zero disables
+retries.  Note that disabling retries also disables the ability of
+\fB\-\-sync\fP to change file contents.  Also note that the given
+value is cumulative across all stages of a file's processing so
+different stages may not be retried the same number of times.
+.IP "\fB\-\-size=SIZE\fP"
+Process transfers in batches of approximately the given total file size.
+The suffixes k, m, g, and t may be used for KB, MB, GB, and TB,
+respectively.  The default batch size is 4 GB.  Lowering the batch size
+will increase the number of checkpoints and the overhead of transfer
+management.  Raising the batch size will have the opposite effect.  A
+batch will be sent for processing when the total size of all files in
+the batch reaches the given value.  Note that batches of less than the
+given size can occur if the batch count specified by \fB\-\-files\fP
+is reached first.
+.IP "\fB\-\-split=SIZE\fP"
+Parallelize the processing of single files using chunks of the given
+size.  The suffixes k, m, g, and t may be used for KB, MB, GB, and TB,
+respectively.  The default split size is zero, which disables single
+file parallelization.  A split size of less than 1 GB is not
+recommended.  Lowering the split size will increase parallelism but
+decrease the performance of each file chunk and increase the overhead of
+transfer management.  Raising the split size will have the opposite
+effect.  The ideal split size for a given file is the size of the file
+divided by the number of concurrent clients available.  Note that this
+option does not have an effect unless \fB\-\-hosts\fP is greater than
+one.  Also note that this option can, in some cases, decrease remote
+transfer performance as it eliminates some higher performance
+transports.
+.IP "\fB\-\-split\-tar=SIZE\fP"
+Create tar files of around the given size when used with
+\fB\-\-create\-tar\fP.  When multiple tar files are created for a
+destination tar file "file.tar", the resulting split tar files will be
+named "file.tar-i.tar" starting from "file.tar-1.tar".  The suffixes k,
+m, g, and t may be used for KB, MB, GB, and TB, respectively.  The
+default split tar size is 500 GB.  A value of zero disables splitting.
+A split tar size of greater than 2 TB is not recommended.  Note that
+resulting tar files may still be larger than specified when source files
+exist that are larger than the given size.
+.IP "\fB\-\-streams=NUM\fP"
+Use the given number of TCP streams in TCP-based transports (currently,
+bbcp, bbftp, fish-tcp, and gridftp).  The default is the number of
+streams necessary to fully utilize the specified/estimated bandwidth
+using the maximum TCP window size.  Note that it is usually preferable
+to specify \fB\-\-bandwidth\fP, which allows an appropriate number of
+streams to be set automatically.  Increasing the number of streams can
+increase performance when the maximum window size is set too low or
+there is cross-traffic on the network, but too high a value can decrease
+performance due to increased congestion and packet loss.
+.IP "\fB\-\-stripe=SIZE|NUM\fP"
+By default, a file transferred to a Lustre file system will be striped
+according to size (one stripe per GB) unless the source resides on
+Lustre and has non-default striping, in which case striping will be
+preserved.  Directory striping is preserved when applicable.  If a
+positive number is specified, the stripe count of all destination files
+and directories will be set to the given value.  If the given value is a
+size (specified with the suffixes k, m, g, and t for KB, MB, GB, and TB,
+respectively), files will be allocated one stripe per given size while
+directories will be striped according to the default policy.  A value of
+zero disables automatic striping and uses the default policy for all
+files and directories.
+.IP "\fB\-\-threads=NUM\fP"
+Use the given number of threads in multi-threaded transports and
+checksum utilities (currently, mcp and msum).  The default number of
+threads is 4.  Increasing the number of threads can increase
+transfer/checksum performance when a host has excess resource capacity,
+but can reduce performance when any associated resource has reached
+its maximum.
+.IP "\fB\-\-verify\-fast\fP"
+Checksum files at the source and destination to verify that they have
+not been corrupted.  If corruption is detected in a file, the corrupted
+portion will be automatically corrected using a partial transfer.  This
+option differs from the default verification in that the source buffer
+will be reused when possible for the source checksum calculations.  This
+potentially increases performance up to 33%, but is more subject to
+corruption as the source is only read once.
+.IP "\fB\-\-window=SIZE\fP"
+Use a TCP send/receive window of the given size in TCP-based transports
+(currently, bbcp, bbftp, fish-tcp, and gridftp).  The suffixes k, m,
+g, and t may be used for KB, MB, GB, and TB, respectively.  The default
+is the product of the specified/estimated bandwidth and the round-trip
+time between source and destination.  Note that it is usually preferable
+to specify \fB\-\-bandwidth\fP, which allows an appropriate window size
+to be set automatically.  Increasing the window size allows TCP to
+operate more efficiently over high bandwidth and/or high latency
+networks, but too high a value can overrun the receiver and cause packet
+loss.
+./"################################################################
+.SH "TRANSFER THROTTLING"
+./"################################################################
+.IP "\fB\-\-cpu=NUM\fP"
+Throttle the transfer when the local CPU usage reaches the specified
+percent of the total available.  This option is disabled by default but
+may be desirable to prevent transfers from consuming too much of the
+local CPU.  Once the given threshold is reached, a sleep period will
+be induced between each batch of files to achieve an average CPU
+utilization equal to the value specified.  Note that this functionality
+is currently only supported on Unix-like systems.
+.IP "\fB\-\-disk=NUM1:NUM2\fP"
+Suspend/resume the transfer when the target file system disk usage
+reaches the specified percent of the total available.  This option is
+disabled by default but may be desirable to prevent transfers from
+consuming too much local or remote disk space.  Once the first
+threshold is reached, the transfer will suspend until enough disk
+resources have been freed on the target to bring the disk utilization
+under the second threshold.  Note that this functionality is currently
+only supported on Unix-like systems.
+.IP "\fB\-\-io=NUM\fP"
+Throttle the transfer when the local I/O usage reaches the specified
+rate in MB/s.  This option is disabled by default but may be desirable
+to prevent transfers from consuming too much of the local I/O bandwidth.
+Once the given threshold is reached, a sleep period will be induced
+between each batch of files to achieve an average I/O rate equal to
+the value specified.
+.IP "\fB\-\-ior=NUM\fP"
+Throttle the transfer when the local I/O reads reach the specified
+rate in MB/s.  This option is similar to \fB\-\-io\fP but only applies
+to reads.
+.IP "\fB\-\-iow=NUM\fP"
+Throttle the transfer when the local I/O writes reach the specified
+rate in MB/s.  This option is similar to \fB\-\-io\fP but only applies
+to writes.
+.IP "\fB\-\-net=NUM\fP"
+Throttle the transfer when the local network usage reaches the specified
+rate in MB/s.  This option is disabled by default but may be desirable
+to prevent transfers from consuming too much of the local network
+bandwidth.  Once the given threshold is reached, a sleep period will be
+induced between each batch of files to achieve an average network rate
+equal to the value specified.
+.IP "\fB\-\-netr=NUM\fP"
+Throttle the transfer when the local network reads reach the specified
+rate in MB/s.  This option is similar to \fB\-\-net\fP but only applies
+to reads.
+.IP "\fB\-\-netw=NUM\fP"
+Throttle the transfer when the local network writes reach the specified
+rate in MB/s.  This option is similar to \fB\-\-net\fP but only applies
+to writes.
+./"################################################################
+.SH "EXAMPLES"
+./"################################################################
+Copy local file "file1" in the current directory to existing local
+directory "/dir1":
+.PP
+.RS
+.nf
+\fBshiftc file1 /dir1\fP
+
+Shift id is 1
+Detaching process (use --status option to monitor progress)
+.fi
+.RE
+.PP
+Copy local file "file1" in the current directory to the user's home
+directory on host "host2" while preserving file attributes:
+.PP
+.RS
+.nf
+\fBshiftc -p file1 host2:\fP
+
+Shift id is 2
+Detaching process (use --status option to monitor progress)
+.fi
+.RE
+.PP
+Recursively copy local directory "/dir1" to local directory "/dir2"
+and skip verifying that the contents have not been corrupted during the
+transfer:
+.PP
+.RS
+.nf
+\fBshiftc -r --no-verify /dir1 /dir2\fP
+
+Shift id is 3
+Detaching process (use --status option to monitor progress)
+.fi
+.RE
+.PP
+Recursively copy remote directory "/dir2" on host "host2" to the current
+directory using a secure transport:
+.PP
+.RS
+.nf
+\fBshiftc -r --secure host2:/dir2 .\fP
+
+Shift id is 4
+Detaching process (use --status option to monitor progress)
+.fi
+.RE
+.PP
+Recursively copy local directory "/bigdir1" to local directory
+"/bigdir2" using 4 client hosts to perform the transfer.
+.PP
+.RS
+.nf
+\fBshiftc -r --hosts=4 /bigdir1 /bigdir2\fP
+
+Shift id is 5
+Detaching process (use --status option to monitor progress)
+.fi
+.RE
+.PP
+Show the status of all transfers:
+.PP
+.RS
+.nf
+\fBshiftc --status\fP
+
+id | state | dirs | files |     file size |  date | length |    rate
+   |       | sums | attrs |      sum size |  time |        |
+---+-------+------+-------+---------------+-------+--------+---------
+ 1 | done  |  0/0 |   1/1 |     92KB/92KB | 10/03 |     2s |   46KB/s
+   |       |  0/0 |   0/0 |     0.0B/0.0B | 17:06 |        |
+ 2 | done  |  0/0 |   1/1 |     92KB/92KB | 10/03 |     8s | 11.5KB/s
+   |       |  0/0 |   1/1 |     0.0B/0.0B | 17:06 |        |
+ 3 | done  |  1/1 |   2/2 |     99KB/99KB | 10/03 |     1s |   99KB/s
+   |       |  4/4 |   0/0 |   198KB/198KB | 17:07 |        |
+ 4 | error |  1/1 |   1/2 |     92KB/99KB | 10/03 |     3s | 30.7KB/s
+   |       |  0/0 |   0/0 |     0.0B/0.0B | 17:08 |        |
+ 5 | done  |  1/1 | 64/64 | 65.5GB/65.5GB | 10/03 |    29s | 2.26GB/s
+   |       |  0/0 |   0/0 |     0.0B/0.0B | 17:09 |        |
+.fi
+.RE
+.PP
+Show the detailed status of all operations in transfer #2:
+.PP
+.RS
+.nf
+\fBshiftc --status --id=2\fP
+
+state | op     | target                  | size |  date | length |   rate
+      | tool   | info                    |      |  time |        |
+------+--------+-------------------------+------+-------+--------+-------
+done  | cp     | host2:/home/user1/file1 | 92KB | 10/03 |     5s | 18KB/s
+      | bbftp  | -                       |      | 17:06 |        |
+done  | chattr | host2:/home/user1/file1 |    - | 10/03 |     1s |      -
+      | sftp   | -                       |      | 17:06 |        |
+.fi
+.RE
+.PP
+Show the detailed status of all operations in transfer #4 that have an
+error state:
+.PP
+.RS
+.nf
+\fBshiftc --status --id=4 --state=error\fP
+
+state | op    | target            | size | date | length | rate
+      | tool  | info              |      | time |        |
+------+-------+-------------------+------+------+--------+-----
+error | cp    | /tmp/dir2/file2   |  7KB |    - |      - |    -
+      | rsync | rsync: send_files |      |      |        |
+      |       | failed to open    |      |      |        |
+      |       | "/dir2/file2":    |      |      |        |
+      |       | Permission denied |      |      |        |
+.fi
+.RE
+.PP
+Show the detailed status of all operations in transfer #3 that involve a
+file name containing "file2":
+.PP
+.RS
+.nf
+\fBshiftc --status --id=3 --search=file2\fP
+
+state | op    | target      | size |  date | length |  rate
+      | tool  | info        |      |  time |        |
+------+-------+-------------+------+-------+--------+------
+done  | cp    | /dir2/file2 |  7KB | 10/03 |     1s | 7KB/s
+      | mcp   | -           |      | 17:07 |        |
+done  | cksum | /dir2/file2 |  7KB | 10/03 |     1s | 7KB/s
+      | msum  | -           |      | 17:07 |        |
+.fi
+.RE
+.PP
+Show the history of all transfers:
+.PP
+.RS
+.nf
+\fBshiftc --history\fP
+
+id | origin        | command
+---+---------------+--------------------------------------
+ 1 | host1.domain  | shiftc file1 /dir1
+   | [/home/user1] |
+ 2 | host1.domain  | shiftc -p file1 host2:
+   | [/home/user1] |
+ 3 | host1.domain  | shiftc -r --no-verify /dir1 /dir2
+   | [/home/user1] |
+ 4 | host1.domain  | shiftc -r --secure host2:/dir2 .
+   | [/tmp]        |
+ 5 | host1.domain  | shiftc -r --hosts=4 /bigdir1 /bigdir2
+   | [/home/user1] |
+.fi
+.RE
+.PP
+Show the history of all transfers that involve a host or a command
+containing "host2":
+.PP
+.RS
+.nf
+\fBshiftc --history --search=host2\fP
+
+id | origin        | command
+---+---------------+----------------------------------
+ 2 | host1.domain  | shiftc -p file1 host2:
+   | [/home/user1] |
+ 4 | host1.domain  | shiftc -r --secure host2:/dir2 .
+   | [/tmp]        |
+.fi
+.RE
+.PP
+Create a tar file "bigdir1.tar" in the current directory that consists
+of the contents of "/bigdir1" with a corresponding table of contents
+stored in "bigdir1.tar.toc" in the current directory:
+.PP
+.RS
+.nf
+\fBshiftc --create-tar --index-tar /bigdir1 bigdir1.tar\fP
+
+Shift id is 6
+Detaching process (use --status option to monitor progress)
+.fi
+.RE
+.PP
+Create tar files prefixed with "bd1.tar" in the remote directory
+"/dir2" on host "host2" that consist of the contents of "/bigdir1",
+split at 16 GB boundaries:
+.PP
+.RS
+.nf
+\fBshiftc --create-tar --split-tar=16g /bigdir1 host2:/dir2/bd1.tar\fP
+
+Shift id is 7
+Detaching process (use --status option to monitor progress)
+.fi
+.RE
+.PP
+Extract the split tar files prefixed with "bd1.tar" in the remote
+directory "/dir2" on host "host2" to the current directory:
+.PP
+.RS
+.nf
+\fBshiftc --extract-tar host2:'/dir2/bd1.*tar' .\fP
+
+Shift id is 8
+Detaching process (use --status option to monitor progress)
+.fi
+.RE
+.PP
+Sychronize the local directory "/dir1" with the remote directory
+"/dir2/dir1" on host "host2" while waiting for completion:
+.PP
+.RS
+.nf
+\fBshiftc -r --sync --wait /dir1 host2:/dir2\fP
+
+Shift id is 9
+Detaching process (use --status option to monitor progress)
+Waiting for transfer to complete...
+
+id | state | dirs | files |     file size |  date | length | rate
+   |       | sums | attrs |      sum size |  time |        |
+---+-------+------+-------+---------------+-------+--------+-------
+ 9 | done  |  1/1 |   2/2 |     99KB/99KB | 10/03 |     5s | 18KB/s
+   |       |  4/4 |   3/3 |   198KB/198KB | 17:14 |        |
+.fi
+.RE
+.PP
+Recursively copy local directory "/bigdir1" to local directory
+"/bigdir2" but exclude files ending in ".log".
+.PP
+.RS
+.nf
+\fBshiftc -r --exclude='\\.log$' /bigdir1 /bigdir2\fP
+
+Shift id is 10
+Detaching process (use --status option to monitor progress)
+.fi
+.RE
+.PP
+Extract the files "1g.20" through "1g.29" from "bigdir.tar" to the
+current directory:
+.PP
+.RS
+.nf
+\fBshiftc --extract-tar --include='1g\\.2[0-9]' bigdir1.tar .\fP
+
+Shift id is 11
+Detaching process (use --status option to monitor progress)
+.fi
+.RE
+./"################################################################
+.SH "NOTES"
+Transfers of files from DMF-managed file systems can take significantly
+longer than other transfers as files may need to be retrieved from
+tertiary storage before they can be copied.
+./"################################################################
+./"################################################################
+.SH "EXIT STATUS"
+./"################################################################
+shiftc exits with 0 on success or >0 if an error occurs.
+./"################################################################
+.SH "FILES"
+./"################################################################
+/var/spool/cron/tabs/$USER
+.RS
+An entry is added into the user's crontab on each client host on which
+a given transfer is being processed unless \fB\-\-no\-cron\fP is
+specified.  This entry periodically invokes the client with specific
+arguments to check if the original client is still running.  If so, the
+manager is notified that the transfer is still in progress.  If not, the
+cron-invoked client will take over transfer processing.
+.RE
+./"################################################################
+.SH "AUTHOR"
+./"################################################################
+shiftc was written by Paul Kolano.
+./"################################################################
+.SH "SEE ALSO"
+./"################################################################
+bbcp(1), bbftp(1), cp(1), Date::Parse(3), globus-url-copy(1), mcp(1),
+msum(1), perlre(1), rsync(1), scp(1), sftp(1)

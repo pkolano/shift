@@ -1,0 +1,1626 @@
+#!/usr/bin/perl -T
+#
+# Copyright (C) 2012-2016 United States Government as represented by the
+# Administrator of the National Aeronautics and Space Administration
+# (NASA).  All Rights Reserved.
+#
+# This software is distributed under the NASA Open Source Agreement
+# (NOSA), version 1.3.  The NOSA has been approved by the Open Source
+# Initiative.  See http://www.opensource.org/licenses/nasa1.3.php
+# for the complete NOSA document.
+#
+# THE SUBJECT SOFTWARE IS PROVIDED "AS IS" WITHOUT ANY WARRANTY OF ANY
+# KIND, EITHER EXPRESSED, IMPLIED, OR STATUTORY, INCLUDING, BUT NOT
+# LIMITED TO, ANY WARRANTY THAT THE SUBJECT SOFTWARE WILL CONFORM TO
+# SPECIFICATIONS, ANY IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR
+# A PARTICULAR PURPOSE, OR FREEDOM FROM INFRINGEMENT, ANY WARRANTY THAT
+# THE SUBJECT SOFTWARE WILL BE ERROR FREE, OR ANY WARRANTY THAT
+# DOCUMENTATION, IF PROVIDED, WILL CONFORM TO THE SUBJECT SOFTWARE. THIS
+# AGREEMENT DOES NOT, IN ANY MANNER, CONSTITUTE AN ENDORSEMENT BY
+# GOVERNMENT AGENCY OR ANY PRIOR RECIPIENT OF ANY RESULTS, RESULTING
+# DESIGNS, HARDWARE, SOFTWARE PRODUCTS OR ANY OTHER APPLICATIONS RESULTING
+# FROM USE OF THE SUBJECT SOFTWARE.  FURTHER, GOVERNMENT AGENCY DISCLAIMS
+# ALL WARRANTIES AND LIABILITIES REGARDING THIRD-PARTY SOFTWARE, IF
+# PRESENT IN THE ORIGINAL SOFTWARE, AND DISTRIBUTES IT "AS IS".
+#
+# RECIPIENT AGREES TO WAIVE ANY AND ALL CLAIMS AGAINST THE UNITED STATES
+# GOVERNMENT, ITS CONTRACTORS AND SUBCONTRACTORS, AS WELL AS ANY PRIOR
+# RECIPIENT.  IF RECIPIENT'S USE OF THE SUBJECT SOFTWARE RESULTS IN ANY
+# LIABILITIES, DEMANDS, DAMAGES, EXPENSES OR LOSSES ARISING FROM SUCH USE,
+# INCLUDING ANY DAMAGES FROM PRODUCTS BASED ON, OR RESULTING FROM,
+# RECIPIENT'S USE OF THE SUBJECT SOFTWARE, RECIPIENT SHALL INDEMNIFY AND
+# HOLD HARMLESS THE UNITED STATES GOVERNMENT, ITS CONTRACTORS AND
+# SUBCONTRACTORS, AS WELL AS ANY PRIOR RECIPIENT, TO THE EXTENT PERMITTED
+# BY LAW.  RECIPIENT'S SOLE REMEDY FOR ANY SUCH MATTER SHALL BE THE
+# IMMEDIATE, UNILATERAL TERMINATION OF THIS AGREEMENT.
+#
+
+# This program outputs various information based on the given command.
+# The 'chattr' command sets acls, striping, and/or xattrs of each given file.
+# The 'find' command outputs the list of files and/or directories
+# beneath the given set of paths and corresponding stat information.
+# The 'fish' command initiates processing of FISH-like protocol commands.
+# The 'mount' command outputs the set of remotely mounted file systems.
+# The 'sum' command outputs whether or not the hashes computed for the
+# given list of files match the hashes given for each.
+
+require 5.007_003;
+use strict;
+use Cwd qw(abs_path);
+use Digest::MD5 qw(md5);
+use Fcntl qw(:DEFAULT :mode);
+use File::Basename;
+use File::Path;
+use File::Spec;
+use File::Temp qw(tempfile);
+use Getopt::Long qw(:config bundling no_ignore_case require_order);
+use IO::File;
+use IO::Handle;
+use IO::Socket::INET;
+# use embedded IPC::Open3 since versions prior to perl 5.14.0 are buggy
+require IPC::Open3;
+use List::Util qw(min);
+use POSIX;
+use Socket;
+use Symbol qw(gensym);
+use Sys::Hostname;
+use Text::ParseWords;
+
+our $VERSION = 0.90;
+
+# need threads and version of Thread::Queue from perl >= 5.10.1
+my $have_threads = eval 'require 5.010_001; use threads; use Thread::Queue; 1';
+
+# do not die when receiving sigpipe
+$SIG{PIPE} = 'IGNORE';
+# untaint path
+$ENV{PATH} = "/bin:/usr/bin:/usr/local/bin:/sbin:/usr/sbin:/usr/local/sbin";
+# untaint env
+delete $ENV{ENV};
+
+my %opts;
+my $cmd = shift @ARGV;
+
+# make sure user can read, write, execute/traverse files/dirs
+# make sure root transfers do not inadvertently expose files
+umask ($< == 0 ? 077 : 077 & umask);
+
+# parse options and perform corresponding command
+if (!$cmd) {
+    die "Invalid command\n";
+} elsif ($cmd eq 'chattr') {
+    die "Invalid options\n" if (scalar(@ARGV) > 0);
+    chattr();
+} elsif ($cmd eq 'find') {
+    die "Invalid options\n" if (!GetOptions(\%opts,
+        "create-tar", "dereference|L", "exclude=s@", "extract-tar",
+        "find-files=i", "ignore-times", "include=s@", "newer=i", "older=i",
+        "preserve", "sync",
+    ));
+    die "Invalid options\n" if (scalar(@ARGV) > 0);
+    find();
+} elsif ($cmd eq 'fish') {
+    %opts = (
+        'buffer-size' => 4,
+        'ports' => "50000:51000",
+        'streams' => 4,
+        'window' => 4194304,
+    );
+    die "Invalid options\n" if (!GetOptions(\%opts,
+        "buffer-size=i", "ports=s", "streams=i", "tcp", "verify", "window=i",
+    ));
+    die "Invalid options\n" if (scalar(@ARGV) > 0);
+    $opts{'buffer-size'} <<= 20;
+    fish();
+} elsif ($cmd eq 'mount') {
+    die "Invalid options\n" if (scalar(@ARGV) > 0);
+    mount();
+} elsif ($cmd eq 'sum') {
+    %opts = (
+        'buffer-size' => 4,
+        'split-size' => 1024,
+        'threads' => 4,
+    );
+    die "Invalid options\n" if (!GetOptions(\%opts,
+        "buffer-size=i", "c", "split-size=i", "threads=i",
+    ));
+    die "Invalid options\n" if (!$opts{c});
+    sum();
+}
+
+################
+#### chattr ####
+################
+# set given attr of files given on STDIN to given value(s) and output ok/error
+sub chattr {
+    # check for existence of commands
+    my %have;
+    foreach my $bin (qw(fallocate lfs setfacl setfattr)) {
+        foreach my $path (split(/:/, $ENV{PATH})) {
+            if (-x "$path/$bin") {
+                $have{$bin} = 1;
+                last;
+            }
+        }
+    }
+ 
+    while (my $line = <STDIN>) {
+        chomp $line;
+        my ($cmd, $file, $attrs) = split(/\s+/, $line, 3);
+        # short circuit if command not available
+        next if (!$have{$cmd});
+        # untaint arguments
+        $cmd = $1 if ($cmd =~ /(.*)/);
+        $file = $1 if ($file =~ /(.*)/s);
+        $attrs = $1 if ($attrs =~ /(.*)/);
+        my $ufile = unescape($file);
+        my $uattrs = unescape($attrs);
+
+        # make sure parent directory exists
+        my $dir = $ufile =~ s/\/$// ? $ufile : dirname($ufile);
+        eval {mkpath($dir)};
+
+        my ($cin, @copts, $in, $out);
+        if ($cmd eq 'fallocate') {
+            @copts = ("-n", "-l", $uattrs, $ufile);
+        } elsif ($cmd eq 'lfs') {
+            my ($count, $size) = split(/\s+/, $uattrs);
+            $count = 0 if (!$count);
+            $size = 0 if (!$size);
+            # stripes > 160 may fail due to max of lustre < 2.4
+            $count = 160 if ($count > 160);
+            @copts = ("setstripe", "-c", $count, "-s", $size, $ufile);
+        } elsif ($cmd eq 'setfacl') {
+            $uattrs =~ s/,/\n/g;
+            $cin = $uattrs;
+            @copts = ("-PM-", $ufile);
+        } elsif ($cmd eq 'setfattr') {
+            $uattrs =~ s/,/\n/g;
+            $cin = "# file: $ufile\n$uattrs";
+            @copts = ("-h", "--restore=-");
+        }
+        my $pid = IPC::Open3::open3($in, $out, $out, $cmd, @copts);
+        print $in $cin if ($cin);
+        close $in;
+        waitpid($pid, 0);
+        if ($?) {
+            my $text;
+            $text .= $_ while (<$out>);
+            $text =~ s/\n/ /g;
+            print "$file,", escape($text), "\n";
+        } else {
+            print "$file,ok\n";
+        }
+        close $out;
+    }
+}
+
+################
+#### escape ####
+################
+# return uri-escaped version of given string
+sub escape {
+    my $text = shift;
+    $text =~ s/([^A-Za-z0-9\-\._~\/])/sprintf("%%%02X", ord($1))/eg
+        if (defined $text);
+    return $text;
+}
+
+##############
+#### find ####
+##############
+# output list of files/dirs beneath paths given on STDIN with stat info
+sub find {
+    while (my $line = <STDIN>) {
+        chomp $line;
+        $opts{$_} = undef foreach (qw(srcfs tar_name tar_tell));
+        my @args = split(/\s+/, $line);
+        my $ref = pop @args;
+        print "ref $ref\n";
+        while (scalar(@args) > 3) {
+            my $opt = pop @args;
+            $opts{$1} = $2 if ($opt =~ /(\w+)=(\S+)/);
+        }
+        find1(map {unescape($_)} @args);
+    }
+}
+             
+###############
+#### find1 ####
+###############
+# output list of files/dirs beneath given paths with stat info
+sub find1 {
+    my ($shost, $spath, $dst) = @_;
+
+    # process local tar files
+    if ($opts{'extract-tar'}) {
+        find_tar($shost, $spath, $dst);
+        return;
+    }
+
+    # check for existence of various commands
+    my %have;
+    foreach my $bin (qw(dmget lfs getfacl getfattr)) {
+        foreach my $path (split(/:/, $ENV{PATH})) {
+            if (-x "$path/$bin") {
+                $have{$bin} = 1;
+                last;
+            }
+        }
+    }
+
+    my $dmf = $have{dmget} && $opts{srcfs} =~ /,dmi/ ? 1 : 0;
+    my ($dmfh, $dmtmp);
+
+    my $sdir = dirname($spath);
+    $sdir = "" if ($sdir eq '/');
+    my $ddir = dirname($dst);
+    $ddir = "" if ($ddir eq '/');
+    my $tdir = $opts{'create-tar'} ? dirname($opts{tar_name}) : undef;
+    $tdir = "" if ($tdir eq '.');
+    $tdir .= "/" if ($tdir && $tdir !~ /\/$/);
+    my $dname = basename($dst);
+    my @files = (basename($spath));
+    FILE: foreach my $file0 (@files) {
+        if (ref $file0) {
+            # processing subdir so update prefix
+            $sdir = $file0->[0];
+            $ddir = $file0->[1];
+            $tdir = $file0->[2] . "/" if ($opts{'create-tar'});
+            # dname only needed on first iteration where src/dst name may differ
+            $dname = undef;
+            next;
+        }
+        next if ($file0 eq '.' || $file0 eq '..');
+        my $file = "$sdir/$file0";
+        my $dfile0 = $dname ? $dname : $file0;
+
+        # dereference before stat
+        $file = abs_path($file) if ($opts{dereference});
+        # always get stat info of real file
+        my @stat = lstat($file);
+        my $mode;
+        if (scalar(@stat) == 0) {
+            $file = "$sdir/$file0" if ($opts{dereference});
+            if (scalar(@files) == 1) {
+                # escape commas
+                $file =~ s/(,)/sprintf("%%%02X", ord($1))/eg;
+                # return error if original file
+                print "Cannot stat $file\n";
+                next;
+            }
+            # lower level files cannot return errors because there is no way
+            # to back out of previously added operations, so instead a find
+            # op is added, which will succeed/fail on its own when processed
+        } else {
+            $mode = $stat[2];
+            $stat[2] &= 07777;
+
+            # only directories, regular files, and symlinks are supported
+            next if (!S_ISDIR($mode) && !S_ISREG($mode) && !S_ISLNK($mode));
+            # dmf handling for individual files is carried out by transport_dmf
+            $dmf = 0 if (scalar(@files) == 1 && !S_ISDIR($mode));
+        }
+
+        if (scalar(@stat) == 0 || S_ISDIR($mode)) {
+            my $err = "";
+            if (scalar(@stat) > 0 && (!$opts{dereference} || scalar(@files) == 1) && 
+                    (!defined $opts{'find-files'} ||
+                    scalar(@files) < $opts{'find-files'})) {
+                # add subdirs of this directory for processing when below limit
+                if (opendir(DIR, $file)) {
+                    $! = undef;
+                    my @sub_files = readdir DIR;
+                    if ($! || scalar(@sub_files) == 0) {
+                        # there is currently no good way to detect readdir errors
+                        # dirs should always contain . and .. at a minimum
+                        $err = "Error reading directory $file";
+                    } else {
+                        my $dirs = [$file, "$ddir/$dfile0"];
+                        push(@{$dirs}, "$tdir$file0") if ($opts{'create-tar'});
+                        push(@files, $dirs, @sub_files);
+                        $err = undef;
+                    }
+                    closedir DIR;
+                } else {
+                    $err = "Error opening directory $file";
+                }
+                if ($err && scalar(@files) == 1) {
+                    # escape commas
+                    $err =~ s/(,)/sprintf("%%%02X", ord($1))/eg;
+                    # return error if original file
+                    print $err, "\n";
+                    next;
+                }
+            }
+            if (defined $err) {
+                # this handles directories as well as lower level stat failures
+                print "args=find,", escape("$shost:$file"), ",";
+                if ($opts{'create-tar'}) {
+                    print escape($dst), " tar_name=" . escape("$tdir$file0");
+                } else {
+                    print escape("$ddir/$dfile0");
+                }
+                print "\n";
+                next;
+            }
+        }
+
+        # include files
+        if (defined $opts{include}) {
+            my $found;
+            foreach my $re (@{$opts{include}}) {
+                my $ure = unescape($re);
+                next if (eval {$file !~ /$ure/});
+                $found = 1;
+                last;
+            }
+            next if (!$found);
+        }
+        # exclude files
+        if (defined $opts{exclude}) {
+            foreach my $re (@{$opts{exclude}}) {
+                my $ure = unescape($re);
+                next FILE if (eval {$file =~ /$ure/});
+            }
+        }
+        # newer/older files
+        next if (defined $opts{newer} && $stat[9] < $opts{newer});
+        next if (defined $opts{older} && $stat[9] >= $opts{older});
+
+        # dereference before stat
+        # resolve uid/gid if possible
+        my $user = getpwuid($stat[4]);
+        my $group = getgrgid($stat[5]);
+        $user = "uid_$stat[4]" if (!$user);
+        $group = "gid_$stat[5]" if (!$group);
+        my $attrs = join(",", @stat[2,4,5,8,9],
+            escape($user), escape($group), $stat[7], 512 * $stat[12]);
+
+        my @acls;
+        my @lattrs;
+        my @xattrs;
+        # try to get acls
+        if ($have{getacl} && !$opts{'create-tar'} && $opts{preserve} &&
+                (!$opts{srcfs} || $opts{srcfs} =~ /,acl/)) {
+            open(FILE, '-|', "getfacl", "-cPps", "--", $file);
+            while (<FILE>) {
+                chomp;
+                next if (!$_);
+                push(@acls, escape($_));
+            }
+            close FILE;
+        }
+
+        # try to get xattrs
+        if ($have{getfattr} && !$opts{'create-tar'} && $opts{preserve} &&
+                (!$opts{srcfs} || $opts{srcfs} =~ /,xattr/)) {
+            open(FILE, '-|', "getfattr", "-dhe", "base64", $file);
+            while (<FILE>) {
+                chomp;
+                next if (!$_ || /^\s*#/);
+                push(@xattrs, escape($_));
+            }
+            close FILE;
+        }
+
+        # try to get lustre striping
+        if ($have{lfs} && !S_ISLNK($mode) && !$opts{'create-tar'} &&
+                $opts{preserve} && $opts{srcfs} =~ /^lustre/) {
+            # ignore symlinks as link to fifo can hang forever
+            open(FILE, '-|', "lfs", "getstripe", "-d", $file);
+            while (<FILE>) {
+                $lattrs[0] = $1 if (/stripe_count:\s*(-?\d+)/);
+                $lattrs[1] = $1 if (/stripe_size:\s*(-?\d+)/);
+            }
+            close FILE;
+        }
+        $lattrs[0] = 0 if (!defined $lattrs[0] && defined $lattrs[1]);
+        $lattrs[1] = 0 if (!defined $lattrs[1] && defined $lattrs[0]);
+
+        # begin log entry
+        my $index_len = !$opts{'index-tar'} ? 0 : 28 + length("$tdir$file0") +
+            length(sprintf("%7s%7s%9d", $user, $group, $stat[7]));
+        if (S_ISLNK($mode)) {
+            my $ln = readlink($file);
+            print "args=ln,", escape($ln);
+            $index_len += 4 + length($ln);
+        } elsif (S_ISDIR($mode)) {
+            print "args=mkdir";
+        } elsif ($opts{sync}) {
+            print "args=ckattr", $opts{'ignore-times'} ? "0" : "",
+                ",", escape("$shost:$file");
+        } else {
+            print "args=cp,", escape("$shost:$file");
+        }
+        print ",", escape($opts{'create-tar'} ? $dst : "$ddir/$dfile0");
+        print " acls=" . join(",", @acls) if (scalar(@acls) > 0);
+        print " xattrs=" . join(",", @xattrs) if (scalar(@xattrs) > 0);
+        print " lustre_attrs=" . join(",", @lattrs) if (scalar(@lattrs) > 0);
+        print " tar_index=$index_len" if ($opts{'index-tar'});
+        print " tar_name=" . escape("$tdir$file0") if ($opts{'create-tar'});
+        print " size=$stat[7] attrs=$attrs\n";
+        if ($dmf) {
+            ($dmfh, $dmtmp) = tempfile() if (!$dmtmp);
+            print $dmfh $file, "\n" if (!S_ISLNK($mode) && !S_ISDIR($mode));
+        }
+    }
+
+    if ($dmf) {
+        close $dmfh;
+        # fork to avoid intermittent hangs of dmget
+        my $pid = fork_setsid();
+        if ($pid) {
+            waitpid($pid, 0);
+        } else {
+            # ignore errors since files will be automatically retrieved anyway
+            open3_get([$dmtmp, -1, -1], "dmget -nq");
+            unlink $dmtmp;
+            POSIX::_exit(0);
+        }
+    }
+}
+
+##################
+#### find_tar ####
+##################
+# output list of files/dirs within given files with stat info
+# based on Tar/Archive::Tar 0.07 by Calle Dybedahl (no license specified)
+sub find_tar {
+    my ($shost, $spath, $dst) = @_;
+    my $src = "$shost:$spath";
+
+    my $fh;
+    $fh = undef if (!open($fh, '<', $spath));
+
+    my $tell = defined $opts{tar_tell} ? $opts{tar_tell} : 0;
+    if (!$fh) {
+        # escape commas
+        $src =~ s/(,)/sprintf("%%%02X", ord($1))/eg;
+        print "Unable to open tar file $src\n";
+        return;
+    } elsif ($tell > 0 && !seek($fh, $tell, 0)) {
+        # escape commas
+        $src =~ s/(,)/sprintf("%%%02X", ord($1))/eg;
+        print "Unable to seek in tar file $src\n";
+        return;
+    }
+    binmode $fh;
+
+    my %real;
+    my ($eof, $err, $head, $nfiles);
+    read($fh, $head, 512);
+    while ((!defined $opts{'find-files'} || $nfiles < $opts{'find-files'}) &&
+            length($head) == 512) {
+        # end of archive is two blocks of 512 but GNU tar uses one sometimes
+        if ($head eq "\0" x 512) {
+            $eof = 1;
+            last;
+        }
+
+        # uid, gid, and size must be 'a' instead of 'A' for base-256 encoding
+        # name, lnk, mgc, unam, gnam, and pfx are 'Z' for trailing whitespace
+        my @attrs = unpack('Z100A8a8a8a12A12A8A1Z100Z6A2Z32Z32A8A8Z155', $head);
+        # name mode uid gid size time sum type lnk mgc ver unam gnam dmj dmn pfx
+        #  0    1    2   3   4    5    6   7    8   9   10  11   12   13  14  15
+
+        # prepend prefix to name
+        if ($attrs[15]) {
+            $attrs[0] = $attrs[15] . "/" . $attrs[0];
+            $attrs[15] = "";
+        }
+        # remove last non-standalone slash
+        $attrs[0] =~ s/(?!^)\/$//;
+
+        if (!$attrs[0]) {
+            # only record error if no progress made
+            if (defined $opts{tar_tell} && $opts{tar_tell} == $tell) {
+                $err = 1;
+                # escape commas
+                $src =~ s/(,)/sprintf("%%%02X", ord($1))/eg;
+                print "Empty file name in tar file $src\n";
+            }
+            last;
+        }
+        # old GNU tar may have space after ustar
+        if ($attrs[9] ne 'ustar' && $attrs[9] ne 'ustar ') {
+            # only record error if no progress made
+            if (defined $opts{tar_tell} && $opts{tar_tell} == $tell) {
+                $err = 1;
+                # escape commas
+                $src =~ s/(,)/sprintf("%%%02X", ord($1))/eg;
+                print "Tar file $src not in supported ustar format\n";
+            }
+            last;
+        }
+
+        # convert octal numeric fields
+        $attrs[$_] = oct($attrs[$_]) foreach (1, 5, 6, 13, 14);
+
+        # handle GNU large uid/gid/size extension (two's-complement base-256)
+        foreach my $i (2 .. 4) {
+            if (substr($attrs[$i], 0, 1) eq "\x80") {
+                my $val = ord(substr($attrs[$i], 1, 1)) & 0xff;
+                for (2 .. ($i == 4 ? 11 : 7)) {
+                    $val <<= 8;
+                    $val |= (ord(substr($attrs[$i], $_, 1)) & 0xff);
+                }
+                $attrs[$i] = $val;
+            } else {
+                $attrs[$i] = oct $attrs[$i];
+            }
+        }
+
+        # validate checksum
+        substr($head, 148, 8) = "        ";
+        if (unpack("%16C*", $head) != $attrs[6]) {
+            # only record error if no progress made
+            if (defined $opts{tar_tell} && $opts{tar_tell} == $tell) {
+                $err = 1;
+                # escape commas
+                $attrs[0] =~ s/(,)/sprintf("%%%02X", ord($1))/eg;
+                print "Invalid tar header checksum for $attrs[0]\n";
+            }
+            last;
+        }
+
+        # handle GNU long names
+        if ($attrs[7] =~ /^[LK]$/) {
+            do {
+                # read next header
+                read($fh, $head, 512);
+                $head = substr($head, 0, $attrs[4]) if ($attrs[4] < 512);
+                # remove the extra byte used for \0
+                $head =~ s/\0$//;
+                $real{$attrs[7]} .= $head;
+                $attrs[4] -= 512;
+            } while ($attrs[4] > 0);
+            # read next header
+            read($fh, $head, 512);
+            next;
+        }
+
+        # find next header
+        my $offset = tell($fh);
+        if (!seek($fh, $attrs[4], 1)) {
+            # only record error if no progress made
+            if (defined $opts{tar_tell} && $opts{tar_tell} == $tell) {
+                $err = 1;
+                # escape commas
+                $src =~ s/(,)/sprintf("%%%02X", ord($1))/eg;
+                print "Unable to seek in tar file $src\n";
+            }
+            last;
+        }
+        my $diff = $attrs[4] % 512;
+        # ignore padding
+        if ($diff != 0 && !seek($fh, 512 - $diff, 1)) {
+            $err = 1;
+            # only record error if no progress made
+            if (defined $opts{tar_tell} && $opts{tar_tell} == $tell) {
+                # escape commas
+                $src =~ s/(,)/sprintf("%%%02X", ord($1))/eg;
+                print "Unable to ignore padding in tar file $src\n";
+            }
+            last;
+        }
+        $tell = $offset + $attrs[4] + ($diff ? 512 - $diff : 0);
+
+        if ($real{L}) {
+            $attrs[0] = $real{L};
+            $real{L} = undef;
+        }
+        if ($real{K}) {
+            $attrs[8] = $real{K};
+            $real{K} = undef;
+        }
+
+        # read next header
+        read($fh, $head, 512);
+
+        # include files
+        if (defined $opts{include}) {
+            my $found;
+            foreach my $re (@{$opts{include}}) {
+                my $ure = unescape($re);
+                next if (eval {$attrs[0] !~ /$ure/});
+                $found = 1;
+                last;
+            }
+            next if (!$found);
+        }
+        # exclude files
+        if (defined $opts{exclude}) {
+            my $found;
+            foreach my $re (@{$opts{exclude}}) {
+                my $ure = unescape($re);
+                next if (eval {$attrs[0] !~ /$ure/});
+                $found = 1;
+                last;
+            }
+            next if ($found);
+        }
+        # newer/older files
+        next if (defined $opts{newer} && $attrs[5] < $opts{newer});
+        next if (defined $opts{older} && $attrs[5] >= $opts{older});
+
+        my $udst = tar_canonpath($attrs[0]);
+        substr($udst, 0, 0) = "/" if ($udst !~ /^\//);
+        $udst = escape($dst . $udst);
+
+        # print operation and stat info separated by commas
+        if ($attrs[7] eq '2') {
+            print "args=ln,", escape($attrs[8]), ",", $udst;
+        } elsif ($attrs[7] eq '5') {
+            print "args=mkdir,", $udst;
+        } elsif ($attrs[7] eq '0') {
+            print "args=cp,", escape($src), ",", $udst;
+        } else {
+            # unsupported file type (e.g. pipes, devices, etc.)
+            next;
+        }
+        print " size=$attrs[4] attrs=", join(",", @attrs[1,2,3,5,5],
+            escape($attrs[11]), escape($attrs[12]), @attrs[4,4]);
+        my $bytes = $offset . "-" . ($offset + $attrs[4]);
+        print " bytes=$bytes tar_bytes=$bytes\n";
+        $nfiles++;
+    }
+    if (length($head) < 512) {
+        # escape commas
+        $src =~ s/(,)/sprintf("%%%02X", ord($1))/eg;
+        print "Unable to read header at offset $tell in tar file $src\n";
+    } elsif (!$eof && !$err) {
+        # over init limit or error occurred without notification
+        print "args=find,", escape($src), ",", escape($dst), " tar_tell=$tell\n";
+    }
+    close $fh;
+}
+
+##############
+#### fish ####
+##############
+# initiate fish protocol and perform each transfer given on STDIN
+sub fish {
+    $SIG{'CHLD'} = 'IGNORE';
+
+    my $in = \*STDIN;
+    my $out = \*STDOUT;
+    $out->autoflush(1);
+
+    # default is to indicate running
+    my $rc = "### 200";
+    my ($port, $sock, $key);
+    if (!$have_threads && $opts{tcp}) {
+        # indicate that threads are not supported
+        $rc = "### 500 nothread";
+        $opts{tcp} = 0;
+    } elsif ($opts{tcp}) {
+        my ($port1, $port2) = split(/:/, $opts{ports});
+        foreach (sort {(-1,1)[rand 2]} ($port1..$port2)) {
+            $port = $_;
+            $sock = IO::Socket::INET->new(
+                LocalPort => $port,
+                Listen => $opts{streams},
+                Proto => 'tcp',
+            );
+            last if ($sock);
+        }
+        if (!$sock) {
+            $rc = "### 500 noport";
+            $opts{tcp} = 0;
+        } else {
+            if ($opts{window}) {
+                $sock->sockopt(SO_RCVBUF, $opts{window});
+                $sock->sockopt(SO_SNDBUF, $opts{window});
+            }
+            #TODO: de-hardcode 60 second timeout
+            $sock->sockopt(SO_RCVTIMEO, pack('L!L!', +60, 0));
+            $key = "" . rand();
+            $rc = "$port $key\n$rc";
+        }
+    }
+    $out->write($rc . "\n");
+
+    my @fcmds;
+    while (defined($_ = $in->getline)) {
+        s/^\s+|\s+$//g;
+        next if (!s/^#//);
+        my @args = map {unescape($_)} split(/\s+/);
+        if ($opts{tcp}) {
+            if ($args[0] eq 'exit') {
+                last;
+            } elsif ($args[0] eq 'streams') {
+                $opts{streams} = $args[1];
+            } else {
+                push(@fcmds, [@args]);
+            }
+        } else {
+            return if ($args[0] eq 'exit');
+            fish_io($in, $out, @args);
+        }
+    }
+    return if (!$opts{tcp});
+    require Digest::HMAC_SHA1;
+
+    my @threads = map {threads->create(sub {
+        my ($tsock, $trc0);
+        $tsock = $sock->accept;
+        my $trc = fish_return($tsock);
+        my ($nonce, $hmac) = split(/\s+/, $trc);
+        my $my_hmac = Digest::HMAC_SHA1::hmac_sha1_hex($nonce, $key);
+        if ($hmac ne $my_hmac) {
+            # remote side cannot be authenticated
+            close $tsock;
+            return;
+        }
+        my $nonce2 = "" . rand();
+        my $hmac2 = Digest::HMAC_SHA1::hmac_sha1_hex($nonce . $nonce2, $key);
+        $tsock->print($nonce2 . " " . $hmac2 . "\n### 100\n");
+
+        while (1) {
+            my $trc = fish_return($tsock);
+            my ($fi, $fi_hmac) = split(/\s+/, $trc);
+            my $my_fi_hmac = Digest::HMAC_SHA1::hmac_sha1_hex(
+                $fi . $nonce2++, $key);
+            if ($fi_hmac ne $my_fi_hmac) {
+                # remote side cannot be authenticated
+                close $tsock;
+                return;
+            }
+            last if ($fi == -1);
+            fish_io($tsock, $tsock, @{$fcmds[$fi]});
+        }
+        close $tsock;
+    })} (1 .. $opts{streams});
+    $_->join foreach (@threads);
+    close $sock;
+}
+
+#################
+#### fish_io ####
+#################
+# perform given transfer and return result or return error message in hash
+sub fish_io {
+    my ($in, $out, $cmd, $src, $dst, $size, $len, $off) = @_;
+    my ($err, $file, $fh);
+    if ($cmd !~ /^(?:get|put)$/ || !$src || !$dst) {
+        $err = {error => "Invalid arguments"};
+    } else {
+        # untaint cmd as it taints other things via conditionals
+        $cmd = $1 if ($cmd =~ /(.*)/);
+        $file = $cmd eq 'get' ? $src : $dst;
+        # untaint file
+        $file = $1 if ($file =~ /(.*)/s);
+        $len = (stat $file)[7] if (!defined $len && $cmd eq 'get');
+
+        # create implicit directories
+        eval {mkpath(dirname($file))} if ($cmd eq 'put');
+
+        my $flags = $cmd eq 'get' ? O_RDONLY : O_WRONLY | O_CREAT;
+        $flags |= O_TRUNC if (!defined $off && $cmd eq 'put');
+        $fh = IO::File->new($file, $flags);
+        if (!defined $fh) {
+            $err = {error => "Error opening $file: $!"};
+        } elsif (defined $off && !$fh->seek($off, 0)) {
+            $fh->close;
+            $err = {error => "Error seeking $file: $!"};
+        }
+    }
+    if ($err) {
+        # remove cr/lf so doesn't interfere with protocol
+        $err->{error} =~ s/[\n\r]//g;
+        $out->write("### 500 $err->{error}\n");
+    } else {
+        $out->write("$len\n") if ($cmd eq 'get');
+        $out->write("### 100\n");
+    }
+    my $rc = fish_return($in);
+    return (ref $err ? $err : $rc) if (ref $err || ref $rc);
+    $len = $rc if ($cmd eq 'put');
+    $rc = undef;
+
+    my $sopts = !$opts{verify} || $cmd ne 'get' ? 0 :
+        verify_init(length => $len);
+    my $nbytes = $opts{'buffer-size'};
+    while ($len > 0) {
+        $nbytes = $len if ($len < $nbytes);
+        if ($cmd eq 'put') {
+            $rc = fish_return($in);
+            if (ref $rc) {
+                $fh->close;
+                return $rc;
+            }
+        }
+        my $buf;
+        my $n = $cmd eq 'put' ?
+            $in->read($buf, $nbytes) : $fh->sysread($buf, $nbytes);
+        last if ($n < $nbytes);
+        $out->write("### 200\n") if ($cmd eq 'get');
+        $cmd eq 'put' ? $fh->syswrite($buf) : $out->write($buf);
+        $len -= $n;
+        verify_buffer($sopts, $buf, $sopts->{length} - $len)
+            if ($opts{verify} && $cmd eq 'get');
+    }
+    $fh->close;
+
+    if ($len > 0) {
+        $rc = {error => "Error reading $file: $!"};
+        # remove cr/lf so doesn't interfere with protocol
+        $rc->{error} =~ s/[\n\r]//g;
+        $out->write("### 500 $rc->{error}\n");
+        fish_return($in);
+    } else {
+        if ($cmd eq 'put' && defined $size && $size != -1 &&
+                $len + $off == $size && (stat $dst)[7] > $size) {
+            # truncate dst if last split
+            truncate($dst, $size);
+        }
+        if ($opts{verify} && $cmd eq 'get') {
+            $out->write("### 500 \\H" . verify_buffer_end($sopts, $src, $off) . "\n");
+        } else {
+            $out->write("### 200\n");
+        }
+        $rc = fish_return($in);
+    }
+    return $rc;
+}
+
+#####################
+#### fish_return ####
+#####################
+# parse fish return values and return text or return error message in hash
+sub fish_return {
+    my $in = shift;
+    my $text;
+    while (defined($_ = $in->getline)) {
+        if (/^###\s+(\d+)\s*(.*)/) {
+            if ($1 != 200 && $1 != 100) {
+                return {error => $2};
+            } else {
+                $text =~ s/\s+$//;
+                return $text;
+            }
+        } else {
+            $text .= $_;
+        }
+    }
+    return {error => "Invalid protocol return"};
+}
+
+#####################
+#### fork_setsid ####
+#####################
+sub fork_setsid {
+    my $pid = fork;
+    if (!$pid) {
+        close STDIN;
+        close STDOUT;
+        close STDERR;
+        setsid;
+        open(STDIN, "</dev/null");
+        open(STDOUT, ">/dev/null");
+        open(STDERR, ">/dev/null");
+        POSIX::_exit(0) if (fork);
+    }
+    return $pid;
+}
+
+##############
+#### fqdn ####
+##############
+# return fully qualified version of given host name
+sub fqdn {
+    my $host = shift;
+    if ($host =~ /^\d+\.\d+\.\d+\.\d+$/) {
+        my $name = gethostbyaddr(inet_aton($host), AF_INET);
+        return $name if ($name);
+    } else {
+        my @cols = gethostbyname($host);
+        return $cols[0] if ($cols[0]);
+    }
+    return $host;
+}
+
+###############
+#### mount ####
+###############
+# output the set of remotely mounted file systems
+sub mount {
+    my $host = fqdn(hostname);
+    my %mnt;
+    $mnt{host} = $host;
+    $mnt{args} = "mount";
+
+    # check for existence of getfacl
+    my $acl;
+    foreach my $path (split(/:/, $ENV{PATH})) {
+        if (-x "$path/getfacl") {
+            $acl = 1;
+            last;
+        }
+    }
+ 
+    # gather file system information from mount
+    my $fhpid = open3_run([-1, undef, -1], "mount");
+    while (defined $fhpid && defined ($_ = $fhpid->[1]->getline)) {
+        $mnt{opts} = /[\(,]ro[\),]/ ? "ro" : "rw";
+        # acl support is the default unless explicitly disabled
+        $mnt{opts} .= ",acl" if (/[\(,]acl[\),]/ || $acl && !/[\(,]noacl[\),]/);
+        $mnt{opts} .= ",dmi" if (/[\(,]dmi[\),]/);
+        $mnt{opts} .= ",xattr" if (/[\(,]user_xattr[\),]/);
+        #TODO: need to escape local and remote?
+        (my $dev, $mnt{local}, $mnt{type}) = ($1, $2, $3)
+            if (/(\S+)\s+on\s+(\S+)\s+type\s+(\S+)/);
+        if ($mnt{local}) {
+            # try to avoid NFS hangs by resolving dir but not base
+            my ($base, $dir) = fileparse($mnt{local});
+            $dir = abs_path($dir);
+            $dir =~ s/\/$//;
+            $mnt{local} = "$dir/$base";
+        }
+        if (/server_list=\(([^\)]+)\)/) {
+            # cxfs appears as xfs but with server_list set
+            $mnt{servers} = join(",", map {$_ = fqdn($_)} split(/,/, $1));
+            $mnt{type} = "cxfs";
+            $mnt{remote} = $mnt{local};
+        } elsif (/^(\S+):(\S+)/) {
+            # typical form for nfs
+            $mnt{remote} = $2;
+            $mnt{servers} = $1;
+            $mnt{servers} =~ s/@.*//;
+            $mnt{servers} = fqdn($mnt{servers});
+        } elsif ($mnt{type} eq 'gpfs') {
+            # gpfs servers do not appear in mount output so call mmlsmgr
+            my $srv = open3_get([-1, undef, -1], "mmlsmgr $dev");
+            # try a default location if not in path
+            $srv = open3_get([-1, undef, -1],
+                "/usr/lpp/mmfs/bin/mmlsmgr $dev") if (!$srv);
+            next if (!defined $srv);
+            # output is file system then server ip address
+            if ($srv =~ /^(\w+)\s+(\d+\.\d+\.\d+\.\d+)/m) {
+                $mnt{remote} = "/$1";
+                $mnt{servers} = fqdn($2);
+            }
+        } elsif ($mnt{opts} =~ /,dmi/) {
+            # always report dmi file systems even if local
+            $mnt{servers} = $mnt{host};
+            $mnt{remote} = $mnt{local};
+        } else {
+            # ignore local file systems
+            next;
+        }
+        # print hash in single line with space-separated key=val form
+        print join(" ", map {"$_=$mnt{$_}"} sort(keys(%mnt))), "\n";
+    }
+    open3_wait($fhpid);
+
+    # check if host under PBS control
+    my $pbs;
+    $fhpid = open3_run([-1, undef, -1], "ps -uroot -ocommand");
+    while (defined $fhpid && defined ($_ = $fhpid->[1]->getline)) {
+        if (/(?:^|\/)pbs_mom(?:\s|$)/) {
+            $pbs = 1;
+            last;
+        }
+    }
+    open3_wait($fhpid);
+
+    # indicate that system is accessible
+    print "args=shell host=$host", ($pbs ? " pbs=1" : ""), "\n";
+} 
+
+###################
+#### open3_get ####
+###################
+# run given command with stdin/stdout/stderr from/to given files
+# and return command output when requested
+sub open3_get {
+    my $files = shift;
+    my @args = @_;
+    my $fhpid = open3_run($files, @args);
+    return undef if (!defined $fhpid);
+    my $ifh;
+    if (!defined $files->[1]) {
+        $ifh = 1;
+    } elsif (scalar(@{$files}) == 3 && !defined $files->[2]) {
+        $ifh = 2;
+    }
+    my $out;
+    if ($ifh) {
+        $out .= $_ while (defined ($_ = $fhpid->[$ifh]->getline));
+    }
+    open3_wait($fhpid);
+    return $out;
+}
+
+###################
+#### open3_run ####
+###################
+# run given command with stdin/stdout/stderr either from/to given files
+# or from/to autocreated pipes and return associated file handles and pid
+sub open3_run {
+    my $files = shift;
+    my @args = @_;
+    if (scalar(@args) == 1) {
+        $args[0] =~ s/^\s+|\s+$//g;
+        @args = quotewords('\s+', 0, $args[0]);
+    }
+    my (@fh, @o3);
+    foreach my $i (0 .. scalar(@{$files}) - 1) {
+        my $dir = $i ? '>' : '<';
+        my $file = $files->[$i];
+        $file = File::Spec->devnull if ($file == -1);
+        if ($file) {
+            open($fh[$i], $dir, $file);
+            $o3[$i] = $dir . '&' . $fh[$i]->fileno;
+        } else {
+            $o3[$i] = gensym;
+            $fh[$i] = $o3[$i];
+        }
+    }
+    # combine stdout/stderr if nothing given for stderr
+    $o3[2] = $o3[1] if (scalar(@{$files}) == 2);
+    my $pid;
+    eval {$pid = IPC::Open3::open3(@o3, @args)};
+    if ($@ || !defined $pid) {
+        open3_wait([@fh]);
+        return undef;
+    } else {
+        $o3[0]->autoflush(1) if (ref $o3[0]);
+        return [@fh, $pid];
+    }
+}
+
+####################
+#### open3_wait ####
+####################
+# wait for processes and clean up handles created by open3_run
+sub open3_wait {
+    my $fhpid = shift;
+    return if (!defined $fhpid);
+    my $pid = pop(@{$fhpid});
+    close $_ foreach(@{$fhpid});
+    waitpid($pid, 0);
+}
+
+#############
+#### sum ####
+#############
+# output whether or not the hash given on STDIN matches the hash
+# computed for the file given on STDIN
+sub sum {
+    # adjust sizes to powers of 2
+    foreach my $key (qw(buffer-size split-size)) {
+        $opts{$key} = 1 if ($opts{$key} < 0);
+        my $tmp = $opts{$key};
+        my $new = 1;
+        $new <<= 1 while ($tmp >>= 1);
+        $opts{$key} = $new;
+    }
+
+    # scale sizes appropriately
+    $opts{'buffer-size'} <<= 20;
+    $opts{'split-size'} <<= 20;
+    $opts{'split-size'} = $opts{'buffer-size'}
+        if ($opts{'split-size'} < $opts{'buffer-size'});
+
+    my ($qi, $q, $qret, @sums);
+    if ($have_threads && $opts{threads} > 1) {
+        require Thread::Queue;
+        $q = Thread::Queue->new;
+        $qret = Thread::Queue->new;
+        $qi = 0;
+    }
+
+    # check hashes
+    while (my $line = <STDIN>) {
+        chomp $line;
+        my ($start, $stop, $partial);
+        if ($line =~ /^#mutil#(\d+)-(\d+)/) {
+            # hash specific file subset
+            $start = $1;
+            $stop = $2;
+            $partial = 1;
+        }
+        $line =~ s/^#mutil#[^#]*#//;
+        # ignore comment lines that do not contain mutil
+        next if ($line =~ /^#/);
+        if ($line =~ /^(\S+)\s.(.*)/) {
+            # lines contain a hex hash then two chars then file path
+            my ($hash0, $file) = ($1, $2);
+            # unescape according to md5sum input rules
+            $file =~ s/\\([\\n])/$1 eq "n" ? "\n" : "\\"/eg
+                if ($hash0 =~ s/^\\//);
+            # use file start if no start given
+            $start = 0 if (!defined $start);
+            # use file end if no end given
+            $stop = (stat($file))[7] if (!defined $stop);
+            if (!$have_threads || $opts{threads} <= 1) {
+                my $hash = sum1($file, $start, $stop);
+                sum_check($file, $hash0, $hash, $start, $stop, $partial);
+                next;
+            }
+            my $i = 0;
+            for (my $x1 = $start; $x1 == $start || $x1 < $stop;
+                    $x1 += $opts{'split-size'}) {
+                my $x2 = min($x1 + $opts{'split-size'}, $stop);
+                $q->enqueue([$qi, $i++, $file, $x1, $x2]);
+            }
+            push(@sums, [$file, $hash0, [], $start, $stop, $partial]);
+            $qi++;
+        }
+    }
+
+    return if (!$have_threads || $opts{threads} <= 1);
+    # choose min of specified threads and amount of work
+    my $nthr = min($opts{threads}, $q->pending);
+    my @threads = map {threads->create(sub {
+        while (defined (my $sum = $q->dequeue)) {
+            my ($qi, $i, $file, $x1, $x2) = @{$sum};
+            my $hash = sum1($file, $x1, $x2);
+            $qret->enqueue([$qi, $i, $hash]);
+        }
+    })} (1 .. $nthr);
+    # force threads to exit
+    $q->enqueue(undef) foreach (1 .. $nthr);
+    $_->join foreach (@threads);
+    # append any error messages back to original ref text
+    while (defined (my $sumret = $qret->dequeue_nb)) {
+        my ($qi, $i, $hash) = @{$sumret};
+        $sums[$qi]->[2]->[$i] = $hash;
+    }
+    foreach my $sum (@sums) {
+        $sum->[2] = join("", @{$sum->[2]});
+        sum_check(@{$sum});
+    }
+}
+
+##############
+#### sum1 ####
+##############
+# return hex hash of given file between given start and stop
+sub sum1 {
+    my ($file, $start, $stop) = @_;
+    my ($hash, $fh);
+    if (open($fh, '<', $file)) {
+        if ($start == $stop) {
+            # compute empty hex hash
+            $hash .= unpack("H*", md5(""));
+        } else {
+            # compute concatenated list of hex hashes for each split
+            for (my $x1 = $start; $x1 < $stop; $x1 += $opts{'split-size'}) {
+                my $x2 = min($x1 + $opts{'split-size'}, $stop);
+                sysseek($fh, $x1, 0) or
+                    print STDERR "Unable to seek '$file': $!\n";
+                my ($buf, $md5, $total) = ("", Digest::MD5->new, 0);
+                while ($total < $x2 - $x1) {
+                    # read data into buffer
+                    my $n = sysread($fh, $buf,
+                        min($opts{'buffer-size'}, $x2 - $x1 - $total));
+                    print STDERR "Unable to read '$file': $!\n" if (!defined $n);
+                    last if (!$n);
+                    last if (!$n);
+                    # add data to hash
+                    $md5->add($buf);
+                    $total += $n;
+                }
+                $hash .= unpack("H*", $md5->digest);
+            }
+        }
+        close $fh;
+    } else {
+        print STDERR "Unable to open '$file'\n";
+    }
+    return $hash;
+}
+
+###################
+#### sum_check ####
+###################
+# output whether or not the given file's two given hashes match in the
+# given range
+sub sum_check {
+    my ($file, $hash0, $hash, $start, $stop, $partial) = @_;
+    print "$file: ";
+    if ($hash eq $hash0) {
+        # computed hash matches given hash
+        print "OK";
+        print ",$start-$stop" if ($partial);
+    } else {
+        # computed hash differs from given hash
+        print "FAILED";
+        if (defined $stop) {
+            # output which splits of file differed
+            my $i = 0;
+            for (my $x1 = $start; $x1 < $stop; $x1 += $opts{'split-size'}) {
+                my $x2 = min($x1 + $opts{'split-size'}, $stop);
+                if (substr($hash, $i * 32, 32) ne substr($hash0, $i * 32, 32)) {
+                    print ",", $x1, "-", $x2;
+                }
+                $i++;
+            }
+        } elsif ($partial) {
+            # output portion of file that differed
+            print ",$start-$stop";
+        }
+    }
+    print "\n";
+}
+
+#######################
+#### tar_canonpath ####
+#######################
+# return given path logically cleaned of . and .. and stripped of leading ..
+sub tar_canonpath {
+    my $path = shift;
+    my $abs = $path =~ /^\//;
+    my @dirs = File::Spec->splitdir($path);
+    for (my $i = 0; $i < scalar(@dirs); $i++) {
+        if ($dirs[$i] eq '.' || $dirs[$i] eq '') {
+            # ./foo becomes foo, foo//bar becomes foo/bar
+            splice(@dirs, $i--, 1);
+        } elsif ($dirs[$i] ne '..' && $dirs[$i + 1] eq '..') {
+            # foo/../bar becomes bar
+            splice(@dirs, $i, 2);
+            $i -= 2;
+        }
+    }
+    # remove leading ..
+    shift @dirs while ($dirs[0] eq '..');
+    # make path absolute if it was originally
+    unshift(@dirs, "/") if ($abs);
+    return File::Spec->catdir(@dirs);
+}
+
+##################
+#### unescape ####
+##################
+# return uri-unescaped version of given string
+sub unescape {
+    my $text = shift;
+    $text =~ s/%([0-9A-Fa-f]{2})/chr(hex($1))/eg if (defined $text);
+    return $text;
+}
+
+#######################
+#### verify_buffer ####
+#######################
+sub verify_buffer {
+    my ($sopts, $buf, $n_read_total) = @_;
+    my $n_hash = 0;
+    while ($sopts->{n_hash_total} + $sopts->{split_size} <= $n_read_total) {
+        verify_buffer_leaf($sopts, substr($buf, $n_hash,
+            $sopts->{split_size} - $sopts->{hash_ctx_len}));
+        $n_hash += $sopts->{split_size} - $sopts->{hash_ctx_len};
+        $sopts->{hash_ctx_len} = 0;
+        $sopts->{n_hash_total} += $sopts->{split_size};
+    }
+    if ($n_read_total >= $sopts->{length}) {
+        # last iteration
+        if ($n_read_total > $sopts->{n_hash_total}) {
+            verify_buffer_leaf($sopts, substr($buf, $n_hash,
+                $n_read_total - $sopts->{n_hash_total} - $sopts->{hash_ctx_len}));
+        }
+    } else {
+        # store in hash for next iteration
+        if ($n_read_total - $sopts->{n_hash_total} > 0) {
+            $sopts->{hash_ctx}->add(substr($buf, $n_hash,
+                $n_read_total - $sopts->{n_hash_total} - $sopts->{hash_ctx_len}));
+        }
+        $sopts->{hash_ctx_len} = $n_read_total - $sopts->{n_hash_total};
+    }
+}
+
+###########################
+#### verify_buffer_end ####
+###########################
+sub verify_buffer_end {
+    my ($sopts, $file, $offset) = @_;
+    # push empty hash onto stack if stack empty
+    push(@{$sopts->{stack}}, $sopts->{hash_ctx}->digest)
+        if (scalar(@{$sopts->{stack}}) == 0);
+    my $hash = "#mutil#";
+    $hash .= $offset . "-" . ($offset + $sopts->{length}) if ($offset);
+    $hash .= "#";
+    $hash .= "\\" if ($file =~ /\\|\n/);
+    $hash .= join("", map {unpack("H*", $_)} @{$sopts->{stack}});
+    return $hash;
+}
+
+############################
+#### verify_buffer_leaf ####
+############################
+sub verify_buffer_leaf {
+    my ($sopts, $buf) = @_;
+    my $buf_len = length $buf;
+    if ($sopts->{hash_ctx_len} + $buf_len > 0 ||
+            $sopts->{n_hash_total} == 0) {
+        # something to hash or zero-length buffer
+        # compute hash of block [start, end)
+        $sopts->{hash_ctx}->add($buf) if ($buf_len > 0);
+        # store hash on stack
+        push(@{$sopts->{stack}}, $sopts->{hash_ctx}->digest);
+    }
+}
+
+#####################
+#### verify_init ####
+#####################
+sub verify_init {
+    my %sopts = (
+        buffer_size => $opts{buffer} ? $opts{buffer} >> 20 : 4,
+        hash_ctx => Digest::MD5->new,
+        split_size => 1024,
+        stack => [],
+        @_,
+    );
+
+    # adjust sizes to powers of 2
+    foreach my $key (qw(buffer_size split_size)) {
+        $sopts{$key} = 1 if ($sopts{$key} < 0);
+        my $tmp = $sopts{$key};
+        my $new = 1;
+        $new <<= 1 while ($tmp >>= 1);
+        $sopts{$key} = $new;
+    }
+
+    # scale sizes appropriately
+    $sopts{buffer_size} <<= 20;
+    $sopts{split_size} <<= 20;
+    $sopts{split_size} = $sopts{buffer_size}
+        if ($sopts{split_size} < $sopts{buffer_size});
+
+    return \%sopts;
+}
+
+# This chunk of stuff was generated by App::FatPacker. To find the original
+# file's code, look for the end of this BEGIN block or the string 'FATPACK'
+BEGIN {
+my %fatpacked;
+
+$fatpacked{"Digest/HMAC.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'DIGEST_HMAC';
+  package Digest::HMAC;$VERSION="1.03";use strict;sub new {my($class,$key,$hasher,$block_size)=@_;$block_size ||=64;$key=$hasher->new->add($key)->digest if length($key)> $block_size;my$self=bless {},$class;$self->{k_ipad}=$key ^ (chr(0x36)x $block_size);$self->{k_opad}=$key ^ (chr(0x5c)x $block_size);$self->{hasher}=$hasher->new->add($self->{k_ipad});$self}sub reset {my$self=shift;$self->{hasher}->reset->add($self->{k_ipad});$self}sub add {my$self=shift;$self->{hasher}->add(@_);$self}sub addfile {my$self=shift;$self->{hasher}->addfile(@_);$self}sub _digest {my$self=shift;my$inner_digest=$self->{hasher}->digest;$self->{hasher}->reset->add($self->{k_opad},$inner_digest)}sub digest {shift->_digest->digest}sub hexdigest {shift->_digest->hexdigest}sub b64digest {shift->_digest->b64digest}require Exporter;*import=\&Exporter::import;use vars qw(@EXPORT_OK);@EXPORT_OK=qw(hmac hmac_hex);sub hmac {my($data,$key,$hash_func,$block_size)=@_;$block_size ||=64;$key=&$hash_func($key)if length($key)> $block_size;my$k_ipad=$key ^ (chr(0x36)x $block_size);my$k_opad=$key ^ (chr(0x5c)x $block_size);&$hash_func($k_opad,&$hash_func($k_ipad,$data))}sub hmac_hex {unpack("H*",&hmac)}1;
+DIGEST_HMAC
+
+$fatpacked{"Digest/HMAC_MD5.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'DIGEST_HMAC_MD5';
+  package Digest::HMAC_MD5;$VERSION="1.01";use strict;use Digest::MD5 qw(md5);use Digest::HMAC qw(hmac);use vars qw(@ISA);@ISA=qw(Digest::HMAC);sub new {my$class=shift;$class->SUPER::new($_[0],"Digest::MD5",64)}require Exporter;*import=\&Exporter::import;use vars qw(@EXPORT_OK);@EXPORT_OK=qw(hmac_md5 hmac_md5_hex);sub hmac_md5 {hmac($_[0],$_[1],\&md5,64)}sub hmac_md5_hex {unpack("H*",&hmac_md5)}1;
+DIGEST_HMAC_MD5
+
+$fatpacked{"Digest/HMAC_SHA1.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'DIGEST_HMAC_SHA1';
+  package Digest::HMAC_SHA1;$VERSION="1.03";use strict;use Digest::SHA::PurePerl qw(sha1);use Digest::HMAC qw(hmac);use vars qw(@ISA);@ISA=qw(Digest::HMAC);sub new {my$class=shift;$class->SUPER::new($_[0],"Digest::SHA",64)}require Exporter;*import=\&Exporter::import;use vars qw(@EXPORT_OK);@EXPORT_OK=qw(hmac_sha1 hmac_sha1_hex);sub hmac_sha1 {hmac($_[0],$_[1],\&sha1,64)}sub hmac_sha1_hex {unpack("H*",&hmac_sha1)}1;
+DIGEST_HMAC_SHA1
+
+$fatpacked{"Digest/SHA/PurePerl.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'DIGEST_SHA_PUREPERL';
+  package Digest::SHA::PurePerl;require 5.003000;use strict;use warnings;use vars qw($VERSION @ISA @EXPORT @EXPORT_OK);use Fcntl;use integer;use Carp qw(croak);$VERSION='5.95';require Exporter;@ISA=qw(Exporter);@EXPORT_OK=();eval {require Digest::base;push(@ISA,'Digest::base')};my$MAX32=0xffffffff;my$uses64bit=(((1 << 16)<< 16)<< 16)<< 15;my@H01=(0x67452301,0xefcdab89,0x98badcfe,0x10325476,0xc3d2e1f0);my@H0224=(0xc1059ed8,0x367cd507,0x3070dd17,0xf70e5939,0xffc00b31,0x68581511,0x64f98fa7,0xbefa4fa4);my@H0256=(0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19);my(@H0384,@H0512,@H0512224,@H0512256);sub _c_SL32 {my($x,$n)=@_;"($x << $n)"}sub _c_SR32 {my($x,$n)=@_;my$mask=(1 << (32 - $n))- 1;"(($x >> $n) & $mask)"}sub _c_Ch {my($x,$y,$z)=@_;"($z ^ ($x & ($y ^ $z)))"}sub _c_Pa {my($x,$y,$z)=@_;"($x ^ $y ^ $z)"}sub _c_Ma {my($x,$y,$z)=@_;"(($x & $y) | ($z & ($x | $y)))"}sub _c_ROTR {my($x,$n)=@_;"(" ._c_SR32($x,$n)." | " ._c_SL32($x,32 - $n).")"}sub _c_ROTL {my($x,$n)=@_;"(" ._c_SL32($x,$n)." | " ._c_SR32($x,32 - $n).")"}sub _c_SIGMA0 {my($x)=@_;"(" ._c_ROTR($x,2)." ^ " ._c_ROTR($x,13)." ^ " ._c_ROTR($x,22).")"}sub _c_SIGMA1 {my($x)=@_;"(" ._c_ROTR($x,6)." ^ " ._c_ROTR($x,11)." ^ " ._c_ROTR($x,25).")"}sub _c_sigma0 {my($x)=@_;"(" ._c_ROTR($x,7)." ^ " ._c_ROTR($x,18)." ^ " ._c_SR32($x,3).")"}sub _c_sigma1 {my($x)=@_;"(" ._c_ROTR($x,17)." ^ " ._c_ROTR($x,19)." ^ " ._c_SR32($x,10).")"}sub _c_M1Ch {my($a,$b,$c,$d,$e,$k,$w)=@_;"$e += " ._c_ROTL($a,5)." + " ._c_Ch($b,$c,$d)." + $k + $w; $b = " ._c_ROTL($b,30).";\n"}sub _c_M1Pa {my($a,$b,$c,$d,$e,$k,$w)=@_;"$e += " ._c_ROTL($a,5)." + " ._c_Pa($b,$c,$d)." + $k + $w; $b = " ._c_ROTL($b,30).";\n"}sub _c_M1Ma {my($a,$b,$c,$d,$e,$k,$w)=@_;"$e += " ._c_ROTL($a,5)." + " ._c_Ma($b,$c,$d)." + $k + $w; $b = " ._c_ROTL($b,30).";\n"}sub _c_M11Ch {my($k,$w)=@_;_c_M1Ch('$a','$b','$c','$d','$e',$k,$w)}sub _c_M11Pa {my($k,$w)=@_;_c_M1Pa('$a','$b','$c','$d','$e',$k,$w)}sub _c_M11Ma {my($k,$w)=@_;_c_M1Ma('$a','$b','$c','$d','$e',$k,$w)}sub _c_M12Ch {my($k,$w)=@_;_c_M1Ch('$e','$a','$b','$c','$d',$k,$w)}sub _c_M12Pa {my($k,$w)=@_;_c_M1Pa('$e','$a','$b','$c','$d',$k,$w)}sub _c_M12Ma {my($k,$w)=@_;_c_M1Ma('$e','$a','$b','$c','$d',$k,$w)}sub _c_M13Ch {my($k,$w)=@_;_c_M1Ch('$d','$e','$a','$b','$c',$k,$w)}sub _c_M13Pa {my($k,$w)=@_;_c_M1Pa('$d','$e','$a','$b','$c',$k,$w)}sub _c_M13Ma {my($k,$w)=@_;_c_M1Ma('$d','$e','$a','$b','$c',$k,$w)}sub _c_M14Ch {my($k,$w)=@_;_c_M1Ch('$c','$d','$e','$a','$b',$k,$w)}sub _c_M14Pa {my($k,$w)=@_;_c_M1Pa('$c','$d','$e','$a','$b',$k,$w)}sub _c_M14Ma {my($k,$w)=@_;_c_M1Ma('$c','$d','$e','$a','$b',$k,$w)}sub _c_M15Ch {my($k,$w)=@_;_c_M1Ch('$b','$c','$d','$e','$a',$k,$w)}sub _c_M15Pa {my($k,$w)=@_;_c_M1Pa('$b','$c','$d','$e','$a',$k,$w)}sub _c_M15Ma {my($k,$w)=@_;_c_M1Ma('$b','$c','$d','$e','$a',$k,$w)}sub _c_W11 {my($s)=@_;'$W[' .(($s + 0)& 0xf).']'}sub _c_W12 {my($s)=@_;'$W[' .(($s + 13)& 0xf).']'}sub _c_W13 {my($s)=@_;'$W[' .(($s + 8)& 0xf).']'}sub _c_W14 {my($s)=@_;'$W[' .(($s + 2)& 0xf).']'}sub _c_A1 {my($s)=@_;my$tmp=_c_W11($s)." ^ " ._c_W12($s)." ^ " ._c_W13($s)." ^ " ._c_W14($s);"((\$tmp = $tmp), (" ._c_W11($s)." = " ._c_ROTL('$tmp',1)."))"}my$sha1_code='
+  
+  my($K1, $K2, $K3, $K4) = (	# SHA-1 constants
+  	0x5a827999, 0x6ed9eba1, 0x8f1bbcdc, 0xca62c1d6
+  );
+  
+  sub _sha1 {
+  	my($self, $block) = @_;
+  	my(@W, $a, $b, $c, $d, $e, $tmp);
+  
+  	@W = unpack("N16", $block);
+  	($a, $b, $c, $d, $e) = @{$self->{H}};
+  ' ._c_M11Ch('$K1','$W[ 0]')._c_M12Ch('$K1','$W[ 1]')._c_M13Ch('$K1','$W[ 2]')._c_M14Ch('$K1','$W[ 3]')._c_M15Ch('$K1','$W[ 4]')._c_M11Ch('$K1','$W[ 5]')._c_M12Ch('$K1','$W[ 6]')._c_M13Ch('$K1','$W[ 7]')._c_M14Ch('$K1','$W[ 8]')._c_M15Ch('$K1','$W[ 9]')._c_M11Ch('$K1','$W[10]')._c_M12Ch('$K1','$W[11]')._c_M13Ch('$K1','$W[12]')._c_M14Ch('$K1','$W[13]')._c_M15Ch('$K1','$W[14]')._c_M11Ch('$K1','$W[15]')._c_M12Ch('$K1',_c_A1(0))._c_M13Ch('$K1',_c_A1(1))._c_M14Ch('$K1',_c_A1(2))._c_M15Ch('$K1',_c_A1(3))._c_M11Pa('$K2',_c_A1(4))._c_M12Pa('$K2',_c_A1(5))._c_M13Pa('$K2',_c_A1(6))._c_M14Pa('$K2',_c_A1(7))._c_M15Pa('$K2',_c_A1(8))._c_M11Pa('$K2',_c_A1(9))._c_M12Pa('$K2',_c_A1(10))._c_M13Pa('$K2',_c_A1(11))._c_M14Pa('$K2',_c_A1(12))._c_M15Pa('$K2',_c_A1(13))._c_M11Pa('$K2',_c_A1(14))._c_M12Pa('$K2',_c_A1(15))._c_M13Pa('$K2',_c_A1(0))._c_M14Pa('$K2',_c_A1(1))._c_M15Pa('$K2',_c_A1(2))._c_M11Pa('$K2',_c_A1(3))._c_M12Pa('$K2',_c_A1(4))._c_M13Pa('$K2',_c_A1(5))._c_M14Pa('$K2',_c_A1(6))._c_M15Pa('$K2',_c_A1(7))._c_M11Ma('$K3',_c_A1(8))._c_M12Ma('$K3',_c_A1(9))._c_M13Ma('$K3',_c_A1(10))._c_M14Ma('$K3',_c_A1(11))._c_M15Ma('$K3',_c_A1(12))._c_M11Ma('$K3',_c_A1(13))._c_M12Ma('$K3',_c_A1(14))._c_M13Ma('$K3',_c_A1(15))._c_M14Ma('$K3',_c_A1(0))._c_M15Ma('$K3',_c_A1(1))._c_M11Ma('$K3',_c_A1(2))._c_M12Ma('$K3',_c_A1(3))._c_M13Ma('$K3',_c_A1(4))._c_M14Ma('$K3',_c_A1(5))._c_M15Ma('$K3',_c_A1(6))._c_M11Ma('$K3',_c_A1(7))._c_M12Ma('$K3',_c_A1(8))._c_M13Ma('$K3',_c_A1(9))._c_M14Ma('$K3',_c_A1(10))._c_M15Ma('$K3',_c_A1(11))._c_M11Pa('$K4',_c_A1(12))._c_M12Pa('$K4',_c_A1(13))._c_M13Pa('$K4',_c_A1(14))._c_M14Pa('$K4',_c_A1(15))._c_M15Pa('$K4',_c_A1(0))._c_M11Pa('$K4',_c_A1(1))._c_M12Pa('$K4',_c_A1(2))._c_M13Pa('$K4',_c_A1(3))._c_M14Pa('$K4',_c_A1(4))._c_M15Pa('$K4',_c_A1(5))._c_M11Pa('$K4',_c_A1(6))._c_M12Pa('$K4',_c_A1(7))._c_M13Pa('$K4',_c_A1(8))._c_M14Pa('$K4',_c_A1(9))._c_M15Pa('$K4',_c_A1(10))._c_M11Pa('$K4',_c_A1(11))._c_M12Pa('$K4',_c_A1(12))._c_M13Pa('$K4',_c_A1(13))._c_M14Pa('$K4',_c_A1(14))._c_M15Pa('$K4',_c_A1(15)).'	$self->{H}->[0] += $a; $self->{H}->[1] += $b; $self->{H}->[2] += $c;
+  	$self->{H}->[3] += $d; $self->{H}->[4] += $e;
+  }
+  ';eval($sha1_code);sub _c_M2 {my($a,$b,$c,$d,$e,$f,$g,$h,$w)=@_;"\$T1 = $h + " ._c_SIGMA1($e)." + " ._c_Ch($e,$f,$g)." + \$K256[\$i++] + $w; $h = \$T1 + " ._c_SIGMA0($a)." + " ._c_Ma($a,$b,$c)."; $d += \$T1;\n"}sub _c_M21 {_c_M2('$a','$b','$c','$d','$e','$f','$g','$h',$_[0])}sub _c_M22 {_c_M2('$h','$a','$b','$c','$d','$e','$f','$g',$_[0])}sub _c_M23 {_c_M2('$g','$h','$a','$b','$c','$d','$e','$f',$_[0])}sub _c_M24 {_c_M2('$f','$g','$h','$a','$b','$c','$d','$e',$_[0])}sub _c_M25 {_c_M2('$e','$f','$g','$h','$a','$b','$c','$d',$_[0])}sub _c_M26 {_c_M2('$d','$e','$f','$g','$h','$a','$b','$c',$_[0])}sub _c_M27 {_c_M2('$c','$d','$e','$f','$g','$h','$a','$b',$_[0])}sub _c_M28 {_c_M2('$b','$c','$d','$e','$f','$g','$h','$a',$_[0])}sub _c_W21 {my($s)=@_;'$W[' .(($s + 0)& 0xf).']'}sub _c_W22 {my($s)=@_;'$W[' .(($s + 14)& 0xf).']'}sub _c_W23 {my($s)=@_;'$W[' .(($s + 9)& 0xf).']'}sub _c_W24 {my($s)=@_;'$W[' .(($s + 1)& 0xf).']'}sub _c_A2 {my($s)=@_;"(" ._c_W21($s)." += " ._c_sigma1(_c_W22($s))." + " ._c_W23($s)." + " ._c_sigma0(_c_W24($s)).")"}my$sha256_code='
+  
+  my @K256 = (			# SHA-224/256 constants
+  	0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
+  	0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+  	0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+  	0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+  	0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+  	0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+  	0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+  	0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+  	0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+  	0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+  	0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
+  	0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+  	0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
+  	0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+  	0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+  	0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+  );
+  
+  sub _sha256 {
+  	my($self, $block) = @_;
+  	my(@W, $a, $b, $c, $d, $e, $f, $g, $h, $i, $T1);
+  
+  	@W = unpack("N16", $block);
+  	($a, $b, $c, $d, $e, $f, $g, $h) = @{$self->{H}};
+  ' ._c_M21('$W[ 0]')._c_M22('$W[ 1]')._c_M23('$W[ 2]')._c_M24('$W[ 3]')._c_M25('$W[ 4]')._c_M26('$W[ 5]')._c_M27('$W[ 6]')._c_M28('$W[ 7]')._c_M21('$W[ 8]')._c_M22('$W[ 9]')._c_M23('$W[10]')._c_M24('$W[11]')._c_M25('$W[12]')._c_M26('$W[13]')._c_M27('$W[14]')._c_M28('$W[15]')._c_M21(_c_A2(0))._c_M22(_c_A2(1))._c_M23(_c_A2(2))._c_M24(_c_A2(3))._c_M25(_c_A2(4))._c_M26(_c_A2(5))._c_M27(_c_A2(6))._c_M28(_c_A2(7))._c_M21(_c_A2(8))._c_M22(_c_A2(9))._c_M23(_c_A2(10))._c_M24(_c_A2(11))._c_M25(_c_A2(12))._c_M26(_c_A2(13))._c_M27(_c_A2(14))._c_M28(_c_A2(15))._c_M21(_c_A2(0))._c_M22(_c_A2(1))._c_M23(_c_A2(2))._c_M24(_c_A2(3))._c_M25(_c_A2(4))._c_M26(_c_A2(5))._c_M27(_c_A2(6))._c_M28(_c_A2(7))._c_M21(_c_A2(8))._c_M22(_c_A2(9))._c_M23(_c_A2(10))._c_M24(_c_A2(11))._c_M25(_c_A2(12))._c_M26(_c_A2(13))._c_M27(_c_A2(14))._c_M28(_c_A2(15))._c_M21(_c_A2(0))._c_M22(_c_A2(1))._c_M23(_c_A2(2))._c_M24(_c_A2(3))._c_M25(_c_A2(4))._c_M26(_c_A2(5))._c_M27(_c_A2(6))._c_M28(_c_A2(7))._c_M21(_c_A2(8))._c_M22(_c_A2(9))._c_M23(_c_A2(10))._c_M24(_c_A2(11))._c_M25(_c_A2(12))._c_M26(_c_A2(13))._c_M27(_c_A2(14))._c_M28(_c_A2(15)).'	$self->{H}->[0] += $a; $self->{H}->[1] += $b; $self->{H}->[2] += $c;
+  	$self->{H}->[3] += $d; $self->{H}->[4] += $e; $self->{H}->[5] += $f;
+  	$self->{H}->[6] += $g; $self->{H}->[7] += $h;
+  }
+  ';eval($sha256_code);sub _sha512_placeholder {return}my$sha512=\&_sha512_placeholder;my$_64bit_code='
+  
+  no warnings qw(portable);
+  
+  my @K512 = (
+  	0x428a2f98d728ae22, 0x7137449123ef65cd, 0xb5c0fbcfec4d3b2f,
+  	0xe9b5dba58189dbbc, 0x3956c25bf348b538, 0x59f111f1b605d019,
+  	0x923f82a4af194f9b, 0xab1c5ed5da6d8118, 0xd807aa98a3030242,
+  	0x12835b0145706fbe, 0x243185be4ee4b28c, 0x550c7dc3d5ffb4e2,
+  	0x72be5d74f27b896f, 0x80deb1fe3b1696b1, 0x9bdc06a725c71235,
+  	0xc19bf174cf692694, 0xe49b69c19ef14ad2, 0xefbe4786384f25e3,
+  	0x0fc19dc68b8cd5b5, 0x240ca1cc77ac9c65, 0x2de92c6f592b0275,
+  	0x4a7484aa6ea6e483, 0x5cb0a9dcbd41fbd4, 0x76f988da831153b5,
+  	0x983e5152ee66dfab, 0xa831c66d2db43210, 0xb00327c898fb213f,
+  	0xbf597fc7beef0ee4, 0xc6e00bf33da88fc2, 0xd5a79147930aa725,
+  	0x06ca6351e003826f, 0x142929670a0e6e70, 0x27b70a8546d22ffc,
+  	0x2e1b21385c26c926, 0x4d2c6dfc5ac42aed, 0x53380d139d95b3df,
+  	0x650a73548baf63de, 0x766a0abb3c77b2a8, 0x81c2c92e47edaee6,
+  	0x92722c851482353b, 0xa2bfe8a14cf10364, 0xa81a664bbc423001,
+  	0xc24b8b70d0f89791, 0xc76c51a30654be30, 0xd192e819d6ef5218,
+  	0xd69906245565a910, 0xf40e35855771202a, 0x106aa07032bbd1b8,
+  	0x19a4c116b8d2d0c8, 0x1e376c085141ab53, 0x2748774cdf8eeb99,
+  	0x34b0bcb5e19b48a8, 0x391c0cb3c5c95a63, 0x4ed8aa4ae3418acb,
+  	0x5b9cca4f7763e373, 0x682e6ff3d6b2b8a3, 0x748f82ee5defb2fc,
+  	0x78a5636f43172f60, 0x84c87814a1f0ab72, 0x8cc702081a6439ec,
+  	0x90befffa23631e28, 0xa4506cebde82bde9, 0xbef9a3f7b2c67915,
+  	0xc67178f2e372532b, 0xca273eceea26619c, 0xd186b8c721c0c207,
+  	0xeada7dd6cde0eb1e, 0xf57d4f7fee6ed178, 0x06f067aa72176fba,
+  	0x0a637dc5a2c898a6, 0x113f9804bef90dae, 0x1b710b35131c471b,
+  	0x28db77f523047d84, 0x32caab7b40c72493, 0x3c9ebe0a15c9bebc,
+  	0x431d67c49c100d4c, 0x4cc5d4becb3e42b6, 0x597f299cfc657e2a,
+  	0x5fcb6fab3ad6faec, 0x6c44198c4a475817);
+  
+  @H0384 = (
+  	0xcbbb9d5dc1059ed8, 0x629a292a367cd507, 0x9159015a3070dd17,
+  	0x152fecd8f70e5939, 0x67332667ffc00b31, 0x8eb44a8768581511,
+  	0xdb0c2e0d64f98fa7, 0x47b5481dbefa4fa4);
+  
+  @H0512 = (
+  	0x6a09e667f3bcc908, 0xbb67ae8584caa73b, 0x3c6ef372fe94f82b,
+  	0xa54ff53a5f1d36f1, 0x510e527fade682d1, 0x9b05688c2b3e6c1f,
+  	0x1f83d9abfb41bd6b, 0x5be0cd19137e2179);
+  
+  @H0512224 = (
+  	0x8c3d37c819544da2, 0x73e1996689dcd4d6, 0x1dfab7ae32ff9c82,
+  	0x679dd514582f9fcf, 0x0f6d2b697bd44da8, 0x77e36f7304c48942,
+  	0x3f9d85a86a1d36c8, 0x1112e6ad91d692a1);
+  
+  @H0512256 = (
+  	0x22312194fc2bf72c, 0x9f555fa3c84c64c2, 0x2393b86b6f53b151,
+  	0x963877195940eabd, 0x96283ee2a88effe3, 0xbe5e1e2553863992,
+  	0x2b0199fc2c85b8aa, 0x0eb72ddc81c52ca2);
+  
+  use warnings;
+  
+  sub _c_SL64 { my($x, $n) = @_; "($x << $n)" }
+  
+  sub _c_SR64 {
+  	my($x, $n) = @_;
+  	my $mask = (1 << (64 - $n)) - 1;
+  	"(($x >> $n) & $mask)";
+  }
+  
+  sub _c_ROTRQ {
+  	my($x, $n) = @_;
+  	"(" . _c_SR64($x, $n) . " | " . _c_SL64($x, 64 - $n) . ")";
+  }
+  
+  sub _c_SIGMAQ0 {
+  	my($x) = @_;
+  	"(" . _c_ROTRQ($x, 28) . " ^ " .  _c_ROTRQ($x, 34) . " ^ " .
+  		_c_ROTRQ($x, 39) . ")";
+  }
+  
+  sub _c_SIGMAQ1 {
+  	my($x) = @_;
+  	"(" . _c_ROTRQ($x, 14) . " ^ " .  _c_ROTRQ($x, 18) . " ^ " .
+  		_c_ROTRQ($x, 41) . ")";
+  }
+  
+  sub _c_sigmaQ0 {
+  	my($x) = @_;
+  	"(" . _c_ROTRQ($x, 1) . " ^ " .  _c_ROTRQ($x, 8) . " ^ " .
+  		_c_SR64($x, 7) . ")";
+  }
+  
+  sub _c_sigmaQ1 {
+  	my($x) = @_;
+  	"(" . _c_ROTRQ($x, 19) . " ^ " .  _c_ROTRQ($x, 61) . " ^ " .
+  		_c_SR64($x, 6) . ")";
+  }
+  
+  my $sha512_code = q/
+  sub _sha512 {
+  	my($self, $block) = @_;
+  	my(@N, @W, $a, $b, $c, $d, $e, $f, $g, $h, $T1, $T2);
+  
+  	@N = unpack("N32", $block);
+  	($a, $b, $c, $d, $e, $f, $g, $h) = @{$self->{H}};
+  	for ( 0 .. 15) { $W[$_] = (($N[2*$_] << 16) << 16) | $N[2*$_+1] }
+  	for (16 .. 79) { $W[$_] = / .
+  		_c_sigmaQ1(q/$W[$_- 2]/) . q/ + $W[$_- 7] + / .
+  		_c_sigmaQ0(q/$W[$_-15]/) . q/ + $W[$_-16] }
+  	for ( 0 .. 79) {
+  		$T1 = $h + / . _c_SIGMAQ1(q/$e/) .
+  			q/ + (($g) ^ (($e) & (($f) ^ ($g)))) +
+  				$K512[$_] + $W[$_];
+  		$T2 = / . _c_SIGMAQ0(q/$a/) .
+  			q/ + ((($a) & ($b)) | (($c) & (($a) | ($b))));
+  		$h = $g; $g = $f; $f = $e; $e = $d + $T1;
+  		$d = $c; $c = $b; $b = $a; $a = $T1 + $T2;
+  	}
+  	$self->{H}->[0] += $a; $self->{H}->[1] += $b; $self->{H}->[2] += $c;
+  	$self->{H}->[3] += $d; $self->{H}->[4] += $e; $self->{H}->[5] += $f;
+  	$self->{H}->[6] += $g; $self->{H}->[7] += $h;
+  }
+  /;
+  
+  eval($sha512_code);
+  $sha512 = \&_sha512;
+  
+  ';eval($_64bit_code)if$uses64bit;sub _SETBIT {my($self,$pos)=@_;my@c=unpack("C*",$self->{block});$c[$pos >> 3]=0x00 unless defined$c[$pos >> 3];$c[$pos >> 3]|=(0x01 << (7 - $pos % 8));$self->{block}=pack("C*",@c)}sub _CLRBIT {my($self,$pos)=@_;my@c=unpack("C*",$self->{block});$c[$pos >> 3]=0x00 unless defined$c[$pos >> 3];$c[$pos >> 3]&=~(0x01 << (7 - $pos % 8));$self->{block}=pack("C*",@c)}sub _BYTECNT {my($bitcnt)=@_;$bitcnt > 0 ? 1 + (($bitcnt - 1)>> 3): 0}sub _digcpy {my($self)=@_;my@dig;for (@{$self->{H}}){push(@dig,(($_>>16)>>16)& $MAX32)if$self->{alg}>= 384;push(@dig,$_ & $MAX32)}$self->{digest}=pack("N" .($self->{digestlen}>>2),@dig)}sub _sharewind {my($self)=@_;my$alg=$self->{alg};$self->{block}="";$self->{blockcnt}=0;$self->{blocksize}=$alg <= 256 ? 512 : 1024;for (qw(lenll lenlh lenhl lenhh)){$self->{$_}=0}$self->{digestlen}=$alg==1 ? 20 : ($alg % 1000)/8;if ($alg==1){$self->{sha}=\&_sha1;$self->{H}=[@H01]}elsif ($alg==224){$self->{sha}=\&_sha256;$self->{H}=[@H0224]}elsif ($alg==256){$self->{sha}=\&_sha256;$self->{H}=[@H0256]}elsif ($alg==384){$self->{sha}=$sha512;$self->{H}=[@H0384]}elsif ($alg==512){$self->{sha}=$sha512;$self->{H}=[@H0512]}elsif ($alg==512224){$self->{sha}=$sha512;$self->{H}=[@H0512224]}elsif ($alg==512256){$self->{sha}=$sha512;$self->{H}=[@H0512256]}push(@{$self->{H}},0)while scalar(@{$self->{H}})< 8;$self}sub _shaopen {my($alg)=@_;my($self);return unless grep {$alg==$_}(1,224,256,384,512,512224,512256);return if ($alg >= 384 &&!$uses64bit);$self->{alg}=$alg;_sharewind($self)}sub _shadirect {my($bitstr,$bitcnt,$self)=@_;my$savecnt=$bitcnt;my$offset=0;my$blockbytes=$self->{blocksize}>> 3;while ($bitcnt >= $self->{blocksize}){&{$self->{sha}}($self,substr($bitstr,$offset,$blockbytes));$offset += $blockbytes;$bitcnt -= $self->{blocksize}}if ($bitcnt > 0){$self->{block}=substr($bitstr,$offset,_BYTECNT($bitcnt));$self->{blockcnt}=$bitcnt}$savecnt}sub _shabytes {my($bitstr,$bitcnt,$self)=@_;my($numbits);my$savecnt=$bitcnt;if ($self->{blockcnt}+ $bitcnt >= $self->{blocksize}){$numbits=$self->{blocksize}- $self->{blockcnt};$self->{block}.= substr($bitstr,0,$numbits >> 3);$bitcnt -= $numbits;$bitstr=substr($bitstr,$numbits >> 3,_BYTECNT($bitcnt));&{$self->{sha}}($self,$self->{block});$self->{block}="";$self->{blockcnt}=0;_shadirect($bitstr,$bitcnt,$self)}else {$self->{block}.= substr($bitstr,0,_BYTECNT($bitcnt));$self->{blockcnt}+= $bitcnt}$savecnt}sub _shabits {my($bitstr,$bitcnt,$self)=@_;my($i,@buf);my$numbytes=_BYTECNT($bitcnt);my$savecnt=$bitcnt;my$gap=8 - $self->{blockcnt}% 8;my@c=unpack("C*",$self->{block});my@b=unpack("C" .$numbytes,$bitstr);$c[$self->{blockcnt}>>3]&=(~0 << $gap);$c[$self->{blockcnt}>>3]|=$b[0]>> (8 - $gap);$self->{block}=pack("C*",@c);$self->{blockcnt}+= ($bitcnt < $gap)? $bitcnt : $gap;return($savecnt)if$bitcnt < $gap;if ($self->{blockcnt}==$self->{blocksize}){&{$self->{sha}}($self,$self->{block});$self->{block}="";$self->{blockcnt}=0}return($savecnt)if ($bitcnt -= $gap)==0;for ($i=0;$i < $numbytes - 1;$i++){$buf[$i]=(($b[$i]<< $gap)& 0xff)| ($b[$i+1]>> (8 - $gap))}$buf[$numbytes-1]=($b[$numbytes-1]<< $gap)& 0xff;_shabytes(pack("C*",@buf),$bitcnt,$self);$savecnt}sub _shawrite {my($bitstr,$bitcnt,$self)=@_;return(0)unless$bitcnt > 0;no integer;my$TWO32=4294967296;if (($self->{lenll}+= $bitcnt)>= $TWO32){$self->{lenll}-= $TWO32;if (++$self->{lenlh}>= $TWO32){$self->{lenlh}-= $TWO32;if (++$self->{lenhl}>= $TWO32){$self->{lenhl}-= $TWO32;if (++$self->{lenhh}>= $TWO32){$self->{lenhh}-= $TWO32}}}}use integer;my$blockcnt=$self->{blockcnt};return(_shadirect($bitstr,$bitcnt,$self))if$blockcnt==0;return(_shabytes ($bitstr,$bitcnt,$self))if$blockcnt % 8==0;return(_shabits ($bitstr,$bitcnt,$self))}my$no_downgrade='sub utf8::downgrade { 1 }';my$pp_downgrade=q {
+  	sub utf8::downgrade {
+  
+  		# No need to downgrade if character and byte
+  		# semantics are equivalent.  But this might
+  		# leave the UTF-8 flag set, harmlessly.
+  
+  		require bytes;
+  		return 1 if length($_[0]) == bytes::length($_[0]);
+  
+  		use utf8;
+  		return 0 if $_[0] =~ /[^\x00-\xff]/;
+  		$_[0] = pack('C*', unpack('U*', $_[0]));
+  		return 1;
+  	}
+  };{no integer;if ($] < 5.006){eval$no_downgrade}elsif ($] < 5.008){eval$pp_downgrade}}my$WSE='Wide character in subroutine entry';my$MWS=16384;sub _shaWrite {my($bytestr_r,$bytecnt,$self)=@_;return(0)unless$bytecnt > 0;croak$WSE unless utf8::downgrade($$bytestr_r,1);return(_shawrite($$bytestr_r,$bytecnt<<3,$self))if$bytecnt <= $MWS;my$offset=0;while ($bytecnt > $MWS){_shawrite(substr($$bytestr_r,$offset,$MWS),$MWS<<3,$self);$offset += $MWS;$bytecnt -= $MWS}_shawrite(substr($$bytestr_r,$offset,$bytecnt),$bytecnt<<3,$self)}sub _shafinish {my($self)=@_;my$LENPOS=$self->{alg}<= 256 ? 448 : 896;_SETBIT($self,$self->{blockcnt}++);while ($self->{blockcnt}> $LENPOS){if ($self->{blockcnt}< $self->{blocksize}){_CLRBIT($self,$self->{blockcnt}++)}else {&{$self->{sha}}($self,$self->{block});$self->{block}="";$self->{blockcnt}=0}}while ($self->{blockcnt}< $LENPOS){_CLRBIT($self,$self->{blockcnt}++)}if ($self->{blocksize}> 512){$self->{block}.= pack("N",$self->{lenhh}& $MAX32);$self->{block}.= pack("N",$self->{lenhl}& $MAX32)}$self->{block}.= pack("N",$self->{lenlh}& $MAX32);$self->{block}.= pack("N",$self->{lenll}& $MAX32);&{$self->{sha}}($self,$self->{block})}sub _shadigest {my($self)=@_;_digcpy($self);$self->{digest}}sub _shahex {my($self)=@_;_digcpy($self);join("",unpack("H*",$self->{digest}))}sub _shabase64 {my($self)=@_;_digcpy($self);my$b64=pack("u",$self->{digest});$b64 =~ s/^.//mg;$b64 =~ s/\n//g;$b64 =~ tr|` -_|AA-Za-z0-9+/|;my$numpads=(3 - length($self->{digest})% 3)% 3;$b64 =~ s/.{$numpads}$// if$numpads;$b64}sub _shadsize {my($self)=@_;$self->{digestlen}}sub _shacpy {my($to,$from)=@_;$to->{alg}=$from->{alg};$to->{sha}=$from->{sha};$to->{H}=[@{$from->{H}}];$to->{block}=$from->{block};$to->{blockcnt}=$from->{blockcnt};$to->{blocksize}=$from->{blocksize};for (qw(lenhh lenhl lenlh lenll)){$to->{$_}=$from->{$_}}$to->{digestlen}=$from->{digestlen};$to}sub _shadup {my($self)=@_;my($copy);_shacpy($copy,$self)}sub _shadump {my$self=shift;for (qw(alg H block blockcnt lenhh lenhl lenlh lenll)){return unless defined$self->{$_}}my@state=();my$fmt=($self->{alg}<= 256 ? "%08x" : "%016x");push(@state,"alg:" .$self->{alg});my@H=map {$self->{alg}<= 256 ? $_ & $MAX32 : $_}@{$self->{H}};push(@state,"H:" .join(":",map {sprintf($fmt,$_)}@H));my@c=unpack("C*",$self->{block});push(@c,0x00)while scalar(@c)< ($self->{blocksize}>> 3);push(@state,"block:" .join(":",map {sprintf("%02x",$_)}@c));push(@state,"blockcnt:" .$self->{blockcnt});push(@state,"lenhh:" .$self->{lenhh});push(@state,"lenhl:" .$self->{lenhl});push(@state,"lenlh:" .$self->{lenlh});push(@state,"lenll:" .$self->{lenll});join("\n",@state)."\n"}sub _shaload {my$state=shift;my%s=();for (split(/\n/,$state)){s/^\s+//;s/\s+$//;next if (/^(#|$)/);my@f=split(/[:\s]+/);my$tag=shift(@f);$s{$tag}=join('',@f)}grep {$_==$s{alg}}(1,224,256,384,512,512224,512256)or return;length($s{H})==($s{alg}<= 256 ? 64 : 128)or return;length($s{block})==($s{alg}<= 256 ? 128 : 256)or return;{no integer;for (qw(blockcnt lenhh lenhl lenlh lenll)){0 <= $s{$_}or return;$s{$_}<= 4294967295 or return}$s{blockcnt}< ($s{alg}<= 256 ? 512 : 1024)or return}my$self=_shaopen($s{alg})or return;my@h=$s{H}=~ /(.{8})/g;for (@{$self->{H}}){$_=hex(shift@h);if ($self->{alg}> 256){$_=(($_ << 16)<< 16)| hex(shift@h)}}$self->{blockcnt}=$s{blockcnt};$self->{block}=pack("H*",$s{block});$self->{block}=substr($self->{block},0,_BYTECNT($self->{blockcnt}));$self->{lenhh}=$s{lenhh};$self->{lenhl}=$s{lenhl};$self->{lenlh}=$s{lenlh};$self->{lenll}=$s{lenll};$self}sub _hmacopen {my($alg,$key)=@_;my($self);$self->{isha}=_shaopen($alg)or return;$self->{osha}=_shaopen($alg)or return;croak$WSE unless utf8::downgrade($key,1);if (length($key)> $self->{osha}->{blocksize}>> 3){$self->{ksha}=_shaopen($alg)or return;_shawrite($key,length($key)<< 3,$self->{ksha});_shafinish($self->{ksha});$key=_shadigest($self->{ksha})}$key .= chr(0x00)while length($key)< $self->{osha}->{blocksize}>> 3;my@k=unpack("C*",$key);for (@k){$_ ^=0x5c}_shawrite(pack("C*",@k),$self->{osha}->{blocksize},$self->{osha});for (@k){$_ ^=(0x5c ^ 0x36)}_shawrite(pack("C*",@k),$self->{isha}->{blocksize},$self->{isha});$self}sub _hmacWrite {my($bytestr_r,$bytecnt,$self)=@_;_shaWrite($bytestr_r,$bytecnt,$self->{isha})}sub _hmacfinish {my($self)=@_;_shafinish($self->{isha});_shawrite(_shadigest($self->{isha}),$self->{isha}->{digestlen}<< 3,$self->{osha});_shafinish($self->{osha})}sub _hmacdigest {my($self)=@_;_shadigest($self->{osha})}sub _hmachex {my($self)=@_;_shahex($self->{osha})}sub _hmacbase64 {my($self)=@_;_shabase64($self->{osha})}my@suffix_extern=("","_hex","_base64");my@suffix_intern=("digest","hex","base64");my($i,$alg);for$alg (1,224,256,384,512,512224,512256){for$i (0 .. 2){my$fcn='sub sha' .$alg .$suffix_extern[$i].' {
+  			my $state = _shaopen(' .$alg .') or return;
+  			for (@_) { _shaWrite(\$_, length($_), $state) }
+  			_shafinish($state);
+  			_sha' .$suffix_intern[$i].'($state);
+  		}';eval($fcn);push(@EXPORT_OK,'sha' .$alg .$suffix_extern[$i]);$fcn='sub hmac_sha' .$alg .$suffix_extern[$i].' {
+  			my $state = _hmacopen(' .$alg .', pop(@_)) or return;
+  			for (@_) { _hmacWrite(\$_, length($_), $state) }
+  			_hmacfinish($state);
+  			_hmac' .$suffix_intern[$i].'($state);
+  		}';eval($fcn);push(@EXPORT_OK,'hmac_sha' .$alg .$suffix_extern[$i])}}sub hashsize {my$self=shift;_shadsize($self)<< 3}sub algorithm {my$self=shift;$self->{alg}}sub add {my$self=shift;for (@_){_shaWrite(\$_,length($_),$self)}$self}sub digest {my$self=shift;_shafinish($self);my$rsp=_shadigest($self);_sharewind($self);$rsp}sub hexdigest {my$self=shift;_shafinish($self);my$rsp=_shahex($self);_sharewind($self);$rsp}sub b64digest {my$self=shift;_shafinish($self);my$rsp=_shabase64($self);_sharewind($self);$rsp}sub new {my($class,$alg)=@_;$alg =~ s/\D+//g if defined$alg;if (ref($class)){if (!defined($alg)|| ($alg==$class->algorithm)){_sharewind($class);return($class)}my$self=_shaopen($alg)or return;return(_shacpy($class,$self))}$alg=1 unless defined$alg;my$self=_shaopen($alg)or return;bless($self,$class);$self}sub clone {my$self=shift;my$copy=_shadup($self)or return;bless($copy,ref($self))}BEGIN {*reset=\&new}sub add_bits {my($self,$data,$nbits)=@_;unless (defined$nbits){$nbits=length($data);$data=pack("B*",$data)}$nbits=length($data)* 8 if$nbits > length($data)* 8;_shawrite($data,$nbits,$self);return($self)}sub _bail {my$msg=shift;$msg .= ": $!";croak$msg}sub _addfile {my ($self,$handle)=@_;my$n;my$buf="";while (($n=read($handle,$buf,4096))){$self->add($buf)}_bail("Read failed")unless defined$n;$self}{my$_can_T_filehandle;sub _istext {local*FH=shift;my$file=shift;if (!defined$_can_T_filehandle){local $^W=0;my$istext=eval {-T FH};$_can_T_filehandle=$@ ? 0 : 1;return$_can_T_filehandle ? $istext : -T $file}return$_can_T_filehandle ? -T FH : -T $file}}sub addfile {my ($self,$file,$mode)=@_;return(_addfile($self,$file))unless ref(\$file)eq 'SCALAR';$mode=defined($mode)? $mode : "";my ($binary,$UNIVERSAL,$BITS,$portable)=map {$_ eq $mode}("b","U","0","p");local*FH;$file eq '-' and open(FH,'< -')or sysopen(FH,$file,O_RDONLY)or _bail('Open failed');if ($BITS){my ($n,$buf)=(0,"");while (($n=read(FH,$buf,4096))){$buf =~ s/[^01]//g;$self->add_bits($buf)}_bail("Read failed")unless defined$n;close(FH);return($self)}binmode(FH)if$binary || $portable || $UNIVERSAL;if ($UNIVERSAL && _istext(*FH,$file)){while (<FH>){s/\015\012/\012/g;s/\015/\012/g;$self->add($_)}}elsif ($portable && _istext(*FH,$file)){while (<FH>){s/\015?\015\012/\012/g;s/\015/\012/g;$self->add($_)}}else {$self->_addfile(*FH)}close(FH);$self}sub getstate {my$self=shift;return _shadump($self)}sub putstate {my$class=shift;my$state=shift;if (ref($class)){my$self=_shaload($state)or return;return(_shacpy($class,$self))}my$self=_shaload($state)or return;bless($self,$class);return($self)}sub dump {my$self=shift;my$file=shift;my$state=$self->getstate or return;$file="-" if (!defined($file)|| $file eq "");local*FH;open(FH,"> $file")or return;print FH$state;close(FH);return($self)}sub load {my$class=shift;my$file=shift;$file="-" if (!defined($file)|| $file eq "");local*FH;open(FH,"< $file")or return;my$str=join('',<FH>);close(FH);$class->putstate($str)}1;
+DIGEST_SHA_PUREPERL
+
+$fatpacked{"IPC/Open3.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'IPC_OPEN3';
+  package IPC::Open3;use strict;no strict 'refs';our ($VERSION,@ISA,@EXPORT);require Exporter;use Carp;use Symbol qw(gensym qualify);$VERSION='1.18';@ISA=qw(Exporter);@EXPORT=qw(open3);our$Me='open3 (bug)';sub xpipe {pipe $_[0],$_[1]or croak "$Me: pipe($_[0], $_[1]) failed: $!"}sub xopen {open $_[0],$_[1],@_[2..$#_]and return;local $"=', ';carp "$Me: open(@_) failed: $!"}sub xclose {$_[0]=~ /\A=?(\d+)\z/ ? do {my$fh;open($fh,$_[1].'&=' .$1)and close($fh)}: close $_[0]or croak "$Me: close($_[0]) failed: $!"}sub xfileno {return $1 if $_[0]=~ /\A=?(\d+)\z/;return fileno $_[0]}use constant FORCE_DEBUG_SPAWN=>0;use constant DO_SPAWN=>$^O eq 'os2' || $^O eq 'MSWin32' || FORCE_DEBUG_SPAWN;sub _open3 {local$Me=shift;splice @_,0,1,undef if \$_[0]==\undef;splice @_,1,1,undef if \$_[1]==\undef;unless (eval {$_[0]=gensym unless defined $_[0]&& length $_[0];$_[1]=gensym unless defined $_[1]&& length $_[1];1}){$@ =~ s/(?<=value attempted) at .*//s;croak "$Me: $@"}my@handles=({mode=>'<',handle=>\*STDIN },{mode=>'>',handle=>\*STDOUT },{mode=>'>',handle=>\*STDERR },);for (@handles){$_->{parent}=shift;$_->{open_as}=gensym}if (@_ > 1 and $_[0]eq '-'){croak "Arguments don't make sense when the command is '-'"}$handles[2]{parent}||=$handles[1]{parent};$handles[2]{dup_of_out}=$handles[1]{parent}eq $handles[2]{parent};my$package;for (@handles){$_->{dup}=($_->{parent}=~ s/^[<>]&//);if ($_->{parent}!~ /\A=?(\d+)\z/){$package=caller 1 if (!defined$package);$_->{parent}=qualify $_->{parent},$package}next if $_->{dup}or $_->{dup_of_out};if ($_->{mode}eq '<'){xpipe $_->{open_as},$_->{parent}}else {xpipe $_->{parent},$_->{open_as}}}my$kidpid;if (!DO_SPAWN){xpipe my$stat_r,my$stat_w;$kidpid=fork;croak "$Me: fork failed: $!" unless defined$kidpid;if ($kidpid==0){eval {untie*STDIN;untie*STDOUT;untie*STDERR;close$stat_r;require Fcntl;my$flags=fcntl$stat_w,&Fcntl::F_GETFD,0;croak "$Me: fcntl failed: $!" unless$flags;fcntl$stat_w,&Fcntl::F_SETFD,$flags|&Fcntl::FD_CLOEXEC or croak "$Me: fcntl failed: $!";if (!$handles[2]{dup_of_out}&& $handles[2]{dup}&& xfileno($handles[2]{parent})==fileno \*STDOUT){my$tmp=gensym;xopen($tmp,'>&',$handles[2]{parent});$handles[2]{parent}=$tmp}for (@handles){if ($_->{dup_of_out}){xopen \*STDERR,">&STDOUT" if defined fileno STDERR && fileno STDERR!=fileno STDOUT}elsif ($_->{dup}){xopen $_->{handle},$_->{mode}.'&',$_->{parent}if fileno $_->{handle}!=xfileno($_->{parent})}else {xclose $_->{parent},$_->{mode};xopen $_->{handle},$_->{mode}.'&=',fileno $_->{open_as}}}return 1 if ($_[0]eq '-');exec @_ or do {local($")=(" ");croak "$Me: exec of @_ failed"}}and do {close$stat_w;return 0};my$bang=0+$!;my$err=$@;utf8::encode$err if $] >= 5.008;print$stat_w pack('IIa*',$bang,length($err),$err);close$stat_w;eval {require POSIX;POSIX::_exit(255)};exit 255}else {close$stat_w;my$to_read=length(pack('I',0))* 2;my$bytes_read=read($stat_r,my$buf='',$to_read);if ($bytes_read){(my$bang,$to_read)=unpack('II',$buf);read($stat_r,my$err='',$to_read);waitpid$kidpid,0;if ($err){utf8::decode$err if $] >= 5.008}else {$err="$Me: " .($!=$bang)}$!=$bang;die($err)}}}else {my@close;for (@handles){if ($_->{dup_of_out}){$_->{open_as}=$handles[1]{open_as}}elsif ($_->{dup}){$_->{open_as}=$_->{parent}=~ /\A[0-9]+\z/ ? $_->{parent}: \*{$_->{parent}};push@close,$_->{open_as}}else {push@close,\*{$_->{parent}},$_->{open_as}}}require IO::Pipe;$kidpid=eval {spawn_with_handles(\@handles,\@close,@_)};die "$Me: $@" if $@}for (@handles){next if $_->{dup}or $_->{dup_of_out};xclose $_->{open_as},$_->{mode}}xclose$handles[0]{parent},$handles[0]{mode}if$handles[0]{dup};select((select($handles[0]{parent}),$|=1)[0]);$kidpid}sub open3 {if (@_ < 4){local $"=', ';croak "open3(@_): not enough arguments"}return _open3 'open3',@_}sub spawn_with_handles {my$fds=shift;my$close_in_child=shift;my ($fd,%saved,@errs);for$fd (@$fds){$fd->{tmp_copy}=IO::Handle->new_from_fd($fd->{handle},$fd->{mode});$saved{fileno$fd->{handle}}=$fd->{tmp_copy}if$fd->{tmp_copy}}for$fd (@$fds){bless$fd->{handle},'IO::Handle' unless eval {$fd->{handle}->isa('IO::Handle')};my$open_as=$fd->{open_as};my$fileno=fileno($open_as);$fd->{handle}->fdopen(defined($fileno)? $saved{$fileno}|| $open_as : $open_as,$fd->{mode})}unless ($^O eq 'MSWin32'){require Fcntl;for$fd (@$close_in_child){next unless fileno$fd;fcntl($fd,Fcntl::F_SETFD(),1)or push@errs,"fcntl $fd: $!" unless$saved{fileno$fd}}}my$pid;unless (@errs){if (FORCE_DEBUG_SPAWN){pipe my$r,my$w or die "Pipe failed: $!";$pid=fork;die "Fork failed: $!" unless defined$pid;if (!$pid){{no warnings;exec @_}print$w 0 + $!;close$w;require POSIX;POSIX::_exit(255)}close$w;my$bad=<$r>;if (defined$bad){$!=$bad;undef$pid}}else {$pid=eval {system 1,@_}}push@errs,"IO::Pipe: Can't spawn-NOWAIT: $!" if!$pid || $pid < 0}for$fd (reverse @$fds){$fd->{handle}->fdopen($fd->{tmp_copy},$fd->{mode})}for (values%saved){$_->close or croak "Can't close: $!"}croak join "\n",@errs if@errs;return$pid}1;
+IPC_OPEN3
+
+s/^  //mg for values %fatpacked;
+
+my $class = 'FatPacked::'.(0+\%fatpacked);
+no strict 'refs';
+*{"${class}::files"} = sub { keys %{$_[0]} };
+
+if ($] < 5.008) {
+  *{"${class}::INC"} = sub {
+     if (my $fat = $_[0]{$_[1]}) {
+       return sub {
+         return 0 unless length $fat;
+         $fat =~ s/^([^\n]*\n?)//;
+         $_ = $1;
+         return 1;
+       };
+     }
+     return;
+  };
+}
+
+else {
+  *{"${class}::INC"} = sub {
+    if (my $fat = $_[0]{$_[1]}) {
+      open my $fh, '<', \$fat
+        or die "FatPacker error loading $_[1] (could be a perl installation issue?)";
+      return $fh;
+    }
+    return;
+  };
+}
+
+unshift @INC, bless \%fatpacked, $class;
+  } # END OF FATPACK CODE
+

@@ -1,0 +1,150 @@
+CHANGES
+=======
+
+* Shift 3.0 (01/09/14)
+    - First public release
+    - Note that --no-offline is currently enabled by default due to
+        DMF corruption issues found when releasing files immediately
+        after they are copied
+
+* Shift 3.1 (01/13/14)
+    - Fixed bad metadata counts during --sync preventing dirs from completing
+    - Removed some site-specific config that was mistakenly included in shiftc
+
+* Shift 3.2 (02/07/14)
+    - Added note about mcp/msum >= 1.76.7 since earlier versions do not
+        support all required functionality
+    - Added warning message when --no-check option specified
+    - Fixed leftover temp files after --status
+    - Fixed hung transfers with one but not both of --no-check/--no-preserve
+    - Fixed not an array reference exception during some rsync scenarios
+    - Fixed use of undefined value exception during some tar scenarios
+
+* Shift 3.3 (10/15/14)
+    - Added file name to fish error messages
+    - Changed final file size checks to reread src size when dst size differs
+    - Changed status totals to use total+ instead of - during initialization
+    - Changed mkdir and dir chattr ops to be limited by --files setting
+    - Fixed tar file renaming when multiple unsplit tar files created via stdin
+    - Fixed remote tar extraction due to missing fields in shift-aux tar parsing
+    - Fixed parsing of @ in remote addresses (user name still dropped however)
+    - Fixed local lustre striping when stripes > 160 for lustre < 2.4
+    - Fixed unescape of src for tar link validation
+    - Fixed display of ssize in --stats when --verify not used
+    - Fixed addition to meta file if --meta=0 specified
+    - Fixed reversion of metadata corruption after abrupt termination
+    - Fixed truncation of existing file during file corruption recovery
+    - Fixed possible truncation of directory prefix during tar creation
+    - Fixed writability check of remote files
+    - Fixed hang when getting striping of link to fifo (due to lfs bug)
+
+* Shift 3.4 (01/07/15)
+    - Added support for GNU long names/links during tar creation
+    - Added inclusion/exclusion of file names based on regular expressions
+    - Added --io[rw] and --net[rw] options to throttle by read/write only
+    - Added global throttling to throttle read/writes/both by fs/host/user
+    - Added --sync-fast to synchronize files without verifying integrity
+    - Added built-in metadata sync mechanism for improved scalability
+    - Added estimated time until completion in status
+    - Added ability to specify some transport options in manager config
+    - Added background spawn of dmget/dmput to avoid intermittent hangs
+    - Changed disk throttling based on high/low threshold for suspend/resume
+    - Fixed inadvertent tar file renaming when transfer completes with errors
+    - Fixed error parsing of mcp/msum based on coreutils 8.x
+    - Fixed table of contents truncation during remote tar creation
+
+* Shift 4.0 (07/23/15)
+    - Note that this version is not backward compatible with previous versions
+    - Added backgroundable, parallelizable, and restartable initialization
+    - Added --newer and --older options for incremental backups
+    - Added --preallocate option to preallocate files below given sparsity
+    - Added --no-verify to disable verification, which is now enabled by default
+    - Added preservation of extended attributes during non-tar transfers
+    - Added backoff to alternate transports/checksums during retries
+    - Added error handling when transfer metadata dir can't be created
+    - Added ability to use --state w/o --id for brief status of xfers in state
+    - Added situational attribute handling for optimized transfer initialization
+    - Added ability to specify default tar split size in manager config
+    - Changed handling of embedded modules to use App::FatPacker
+    - Changed detailed status to show source file during tar creation
+    - Changed intra-source symlink dereferencing due to initialization changes
+        (location of dereferenced links may differ depending on traversal order)
+    - Changed status output to omit some completed transfers beyond threshold
+    - Changed --meta manager option to require --id
+    - Fixed verification of files ending in whitespace
+    - Fixed time estimate to reflect mgr overhead, parallelism, and chattr speed
+    - Fixed sum handling of names containing trailing carriage returns
+    - Fixed handling of pathological umasks
+    - Fixed overrun of metadata directories when linux subdir limit reached
+    - Fixed automatic striping of tar files on lustre
+    - Fixed tar extraction of files with trailing spaces
+    - Fixed preservation of symlink times
+    - Fixed --no-cron propagation across parallel clients
+    - Fixed tar header validation of symlinks containing escaped characters
+    - Fixed bbftp inability to handle vt character
+    - Fixed rsync inability to handle cr/lf characters (due to --files-from)
+    - Fixed rsync unexpected rename behavior when one file in --files-from list
+    - Fixed fish handling of errors with linefeeds
+    - Removed --sync-fast since it is now equivalent to --sync --no-verify
+    - Removed file/dir meter during initialization since init now backgrounded
+
+* Shift 5.0 (07/12/16)
+    - Added better detection of lan transfers in stats
+    - Added error handling for malformed tar headers
+    - Added --buffer option to adjust buffer size used by underlying transports
+    - Added --streams option to adjust tcp streams used by tcp-based transports
+    - Added --window option to set tcp window size used by tcp-based transports
+    - Added --ports option to set the remote ports used by tcp-based transports
+    - Added --threads option to set number of threads used by local transports
+    - Added --bandwidth option to set bandwidth for stream/window calculation
+    - Added adjustment of tcp window/streams based on b/w heuristics and latency
+    - Added ability to set small file breakeven points for local/lan/wan cases
+    - Added minimum split setting to prevent file system overload with metadata
+    - Added rescan of mesh keys between batches to pick up newly generated keys
+    - Added support for bbcp as underlying transport
+    - Added support for all remote transports to be used as local transports
+    - Added manager setting for lustre default stripe count
+    - Added multi-threading of single/multi-file batches to built-in transports
+    - Added multi-threading of single/multi-file batches to built-in hashing
+    - Added multi-threaded tcp-based remote transport based on fish protocol
+    - Added support for --verify-fast during fish gets
+    - Added output across transfers of all users when --status invoked as root
+    - Added zero-padding to duration and estimated time when --status=pad used
+    - Changed status emails to limit length of original command sent
+    - Changed brief status so at least one completed transfer is always shown
+    - Changed --encrypt to --secure, which also changes ssh cipher/mac selection
+    - Changed dmput handling so -r is no longer used in automatic offlining
+    - Changed help output into functional units
+    - Changed external invocations to eliminate all extra shell processes
+    - Changed client selection to use selection hook instead of random policy
+    - Changed shift-aux sums so file issues are errors and not bad checksums
+    - Changed handling of estimated completion to reflect actual operation rates
+    - Changed extraction of tar files to remove relative path components
+    - Changed --stats output to omit rows without non-empty values
+    - Fixed gridftp support using unbuffer utility to interlace stderr/stdout
+    - Fixed umask for root transfers so won't inadvertently expose files
+    - Fixed status after --wait, which sometimes did not appear when redirected
+    - Fixed getting/setting of acls and xattrs on symlinks
+    - Fixed existence check of target path when using openssh 7.x
+    - Fixed infinite loop in built-in hashing when source file shrinks
+    - Fixed reported rate when operations report in after transfer stopped
+    - Fixed improper dst truncation in some non-tar corruption recovery cases
+    - Fixed infinite loop when extracting tar files less than 512 bytes
+    - Fixed host/process failures due to dmgets on every command line file
+    - Fixed --include/--exclude options to handle malformed regular expressions
+    - Fixed truncation of built-in local copies when dst larger than src
+    - Fixed toc file empty blocks of increasing size during split tar creation
+    - Fixed built-in hashing chopping off range when file has backslash/newline
+    - Fixed correction of corruption in multiple byte ranges during tar creation
+    - Fixed distribution of clients to remote hosts when more clients than hosts
+    - Fixed built-in transport detection when user $PATH is empty
+    - Fixed sum file rename when no regular files during tar creation
+    - Fixed -d with unwritable or trailing slash dst (bug report by J. Otey)
+    - Fixed exception in fish protocol when input stream is invalid
+    - Fixed transport selection order when first transport not suitable
+    - Fixed crontab handling with csh variants
+    - Fixed exception when fish input stream is unreadable
+    - Fixed mkdir errors during parallelization in some scenarios
+    - Fixed sum file rename when transfer w/o regular files grouped with regular
+    - Fixed abort due to embedded use of Time::HiRes in some perl versions
+    - Removed use of File::Copy for built-in local copies
