@@ -124,8 +124,6 @@ $opts{d} = "MESHCONF_key_days";
 $opts{p} = "MESHCONF_mp_host";
 $opts{pf} = "MESHCONF_mp_print";
 
-$opts{d} = 60 if ($opts{'keygen-user'}); #SITE
-
 #######################
 #### parse options ####
 #######################
