@@ -58,16 +58,20 @@ user_dir /home/%u/.shift
 ###########################
 
 # supported local transports by decreasing performance/preference
-#   (example: default_local mcp,rsync,shift)
-#default_local fish,shift
+#   (example: default_local mcp,shift,fish,fish-tcp,rsync,bbftp)
+#default_local shift,fish,fish-tcp
+
+# port range for remote tcp-based transports
+#   (example: default_ports 10000:20000)
+#default_ports 50000:51000
 
 # supported remote transports by decreasing performance/preference
 #   (example: default_remote fish-tcp,bbftp,rsync,fish,shift)
 #default_remote shift
 
 # supported local transports by decreasing small file performance/preference
-#   (example: local_small mcp,rsync,shift)
-#local_small fish,shift
+#   (example: mcp,shift,fish,fish-tcp,rsync,bbftp)
+#local_small shift,fish,fish-tcp
 
 # minimum size allowed for --split and --split-tar options
 #   (use suffix {k,m,g,t} for {KB,MB,GB,TB})
