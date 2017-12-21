@@ -148,3 +148,44 @@ CHANGES
     - Fixed sum file rename when transfer w/o regular files grouped with regular
     - Fixed abort due to embedded use of Time::HiRes in some perl versions
     - Removed use of File::Copy for built-in local copies
+
+* Shift 5.1 (12/21/17)
+    - Added --plot to visualize transfer performance when piped to gnuplot
+    - Added support for setting stripe size and stripe pool via --stripe
+    - Added code location in fish/fish-tcp invalid protocol returns
+    - Added colorized status using --status=color
+    - Added total time throttled to --stats output
+    - Added --no-recall to prevent automated dmget handling
+    - Added ability to prevent restart using no_restart file in mgr meta dir
+    - Added disk overrun protection when cp would exceed throttling threshold
+    - Added support for wildcard expansion when args piped in via stdin
+    - Added check of overwrite of same file at transfer initiation
+    - Changed rates in --stats to ignore --sync transfers to prevent skewed max
+    - Changed tar preallocation to allocate during first tar file operation
+    - Fixed mgr sync when user has many transfers/many clients in one transfer
+    - Fixed high estimated completion when few small files copied before large
+    - Fixed --status/--stats in overflow dir when no transfers in parent dir
+    - Fixed failed auth in remote --wait due to agent killed by child process
+    - Fixed error handling in remote --wait to show error output instead of ref
+    - Fixed collection of os type and perl version from non-origin hosts
+    - Fixed backout from fish-tcp when client does not have threading support
+    - Fixed duplication of built-in transport error messages in thread splits
+    - Fixed empty file name in detailed status during tar renames
+    - Fixed metadata recovery after host/process failures preventing retries
+    - Fixed cleanup of temporary files during transfer and at completion
+    - Fixed detailed status line wrap when one large file and some smaller files
+    - Fixed stall due to repeated timeout when very large dir hierarchy
+    - Fixed --stripe forcing nearest power of 2 instead of specified
+    - Fixed overspawn of dmget processes causing process failures
+    - Fixed incorrect dereferencing of dangling symlinks during tar creation
+    - Fixed status of transfers that only have errors in final tar rename
+    - Fixed exception when unable to open sum file
+    - Fixed zero-length files when copying dangling symlinks to lustre
+    - Fixed file system load recording for throttling during sum/cksum
+    - Fixed aux/mgr taint sanitization of insecure env variables on some OS's
+    - Fixed mgr exit delay and exit code during background sync
+    - Fixed tar creation when mount point name differs during parallel find
+    - Fixed tar corruption of dir entries with specific (rare) name format
+        (IMPORTANT - SEE "BUGS")
+    - Removed deprecated options
+

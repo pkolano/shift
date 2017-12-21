@@ -66,7 +66,7 @@ use Symbol qw(gensym);
 use Sys::Hostname;
 use Text::ParseWords;
 
-our $VERSION = 0.90;
+our $VERSION = 0.94;
 
 # need threads and version of Thread::Queue from perl >= 5.10.1
 my $have_threads = eval 'require 5.010_001; use threads; use Thread::Queue; 1';
@@ -164,12 +164,13 @@ sub chattr {
         if ($cmd eq 'fallocate') {
             @copts = ("-n", "-l", $uattrs, $ufile);
         } elsif ($cmd eq 'lfs') {
-            my ($count, $size) = split(/\s+/, $uattrs);
+            my ($count, $size, $pool) = split(/\s+/, unescape($attrs));
             $count = 0 if (!$count);
             $size = 0 if (!$size);
             # stripes > 160 may fail due to max of lustre < 2.4
             $count = 160 if ($count > 160);
             @copts = ("setstripe", "-c", $count, "-s", $size, $ufile);
+            splice(@copts, -1, 0, "-p", $pool) if ($pool);
         } elsif ($cmd eq 'setfacl') {
             $uattrs =~ s/,/\n/g;
             $cin = $uattrs;
@@ -223,6 +224,22 @@ sub find {
         }
         find1(map {unescape($_)} @args);
     }
+
+    if ($opts{dmtmp}) {
+        close $opts{dmfh};
+        # fork to avoid intermittent hangs of dmget
+        my $pid = fork_setsid();
+        if ($pid) {
+            waitpid($pid, 0);
+            delete $opts{dmfh};
+            delete $opts{dmtmp};
+        } else {
+            # ignore errors since files will be automatically retrieved anyway
+            open3_get([$opts{dmtmp}, -1, -1], "dmget -nq");
+            unlink $opts{dmtmp};
+            POSIX::_exit(0);
+        }
+    }
 }
              
 ###############
@@ -250,7 +267,6 @@ sub find1 {
     }
 
     my $dmf = $have{dmget} && $opts{srcfs} =~ /,dmi/ ? 1 : 0;
-    my ($dmfh, $dmtmp);
 
     my $sdir = dirname($spath);
     $sdir = "" if ($sdir eq '/');
@@ -440,23 +456,9 @@ sub find1 {
         print " tar_index=$index_len" if ($opts{'index-tar'});
         print " tar_name=" . escape("$tdir$file0") if ($opts{'create-tar'});
         print " size=$stat[7] attrs=$attrs\n";
-        if ($dmf) {
-            ($dmfh, $dmtmp) = tempfile() if (!$dmtmp);
-            print $dmfh $file, "\n" if (!S_ISLNK($mode) && !S_ISDIR($mode));
-        }
-    }
-
-    if ($dmf) {
-        close $dmfh;
-        # fork to avoid intermittent hangs of dmget
-        my $pid = fork_setsid();
-        if ($pid) {
-            waitpid($pid, 0);
-        } else {
-            # ignore errors since files will be automatically retrieved anyway
-            open3_get([$dmtmp, -1, -1], "dmget -nq");
-            unlink $dmtmp;
-            POSIX::_exit(0);
+        if ($dmf && !S_ISLNK($mode) && !S_ISDIR($mode)) {
+            ($opts{dmfh}, $opts{dmtmp}) = tempfile() if (!$opts{dmtmp});
+            print {$opts{dmfh}} $file, "\n";
         }
     }
 }
@@ -745,7 +747,7 @@ sub fish {
     my @threads = map {threads->create(sub {
         my ($tsock, $trc0);
         $tsock = $sock->accept;
-        my $trc = fish_return($tsock);
+        my $trc = fish_return($tsock, "rinit");
         my ($nonce, $hmac) = split(/\s+/, $trc);
         my $my_hmac = Digest::HMAC_SHA1::hmac_sha1_hex($nonce, $key);
         if ($hmac ne $my_hmac) {
@@ -758,7 +760,7 @@ sub fish {
         $tsock->print($nonce2 . " " . $hmac2 . "\n### 100\n");
 
         while (1) {
-            my $trc = fish_return($tsock);
+            my $trc = fish_return($tsock, "rauth");
             my ($fi, $fi_hmac) = split(/\s+/, $trc);
             my $my_fi_hmac = Digest::HMAC_SHA1::hmac_sha1_hex(
                 $fi . $nonce2++, $key);
@@ -814,7 +816,7 @@ sub fish_io {
         $out->write("$len\n") if ($cmd eq 'get');
         $out->write("### 100\n");
     }
-    my $rc = fish_return($in);
+    my $rc = fish_return($in, "ropen");
     return (ref $err ? $err : $rc) if (ref $err || ref $rc);
     $len = $rc if ($cmd eq 'put');
     $rc = undef;
@@ -825,7 +827,7 @@ sub fish_io {
     while ($len > 0) {
         $nbytes = $len if ($len < $nbytes);
         if ($cmd eq 'put') {
-            $rc = fish_return($in);
+            $rc = fish_return($in, "rcopy $len");
             if (ref $rc) {
                 $fh->close;
                 return $rc;
@@ -848,7 +850,7 @@ sub fish_io {
         # remove cr/lf so doesn't interfere with protocol
         $rc->{error} =~ s/[\n\r]//g;
         $out->write("### 500 $rc->{error}\n");
-        fish_return($in);
+        fish_return($in, "rread");
     } else {
         if ($cmd eq 'put' && defined $size && $size != -1 &&
                 $len + $off == $size && (stat $dst)[7] > $size) {
@@ -860,7 +862,7 @@ sub fish_io {
         } else {
             $out->write("### 200\n");
         }
-        $rc = fish_return($in);
+        $rc = fish_return($in, "rexit");
     }
     return $rc;
 }
@@ -871,6 +873,7 @@ sub fish_io {
 # parse fish return values and return text or return error message in hash
 sub fish_return {
     my $in = shift;
+    my $msg = shift;
     my $text;
     while (defined($_ = $in->getline)) {
         if (/^###\s+(\d+)\s*(.*)/) {
@@ -884,7 +887,7 @@ sub fish_return {
             $text .= $_;
         }
     }
-    return {error => "Invalid protocol return"};
+    return {error => "Invalid protocol return ($msg)"};
 }
 
 #####################

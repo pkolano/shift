@@ -1,6 +1,6 @@
 #!/usr/bin/perl -T
 #
-# Copyright (C) 2012-2016 United States Government as represented by the
+# Copyright (C) 2012-2017 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration
 # (NASA).  All Rights Reserved.
 #
@@ -62,9 +62,12 @@ use Net::Ping;
 use POSIX qw(ceil setsid setuid strftime);
 use Storable qw(dclone nfreeze nstore retrieve thaw);
 use Symbol qw(gensym);
+use Term::ANSIColor;
 use Text::ParseWords;
 
-our $VERSION = 0.90;
+our $VERSION = 0.94;
+
+$Term::ANSIColor::EACHLINE = "\n";
 
 # binary byte string conversions
 my %bibytes = (
@@ -158,8 +161,8 @@ umask 077;
 
 # untaint path
 $ENV{PATH} = "/bin:/usr/bin:/usr/local/bin";
-# untaint env
-delete $ENV{ENV};
+# untaint insecure environment variables
+delete $ENV{$_} foreach (qw(BASH_ENV CDPATH ENV IFS));
 
 # unlock files at program termination
 END {
@@ -172,8 +175,8 @@ END {
 my %opts;
 my $rc = GetOptions(\%opts,
     "alive", "get", "history", "host=s", "id=s", "lock", "meta:1", "mounts",
-    "pid=i", "put", "restart", "search=s", "shift-mgr", "state=s", "stats",
-    "status:s", "stop", "sync", "user=s",
+    "pid=i", "plot:s", "put", "restart", "search=s", "shift-mgr", "state=s",
+    "stats", "status:s", "stop", "sync", "user=s",
 );
 die "Invalid options\n" if (!$rc || scalar(@ARGV) != 0);
 
@@ -337,7 +340,7 @@ if ($opts{put} && !defined $opts{id}) {
     nstore(\%udb, $conf{udb_file});
 
     # synchronize user db
-    sync_local("$opts{user}.db") if ($conf{sync_host});
+    sync_queue("$opts{user}.db") if ($conf{sync_host});
     exit;
 } elsif (defined $opts{meta}) {
     $opts{meta} = 1 if ($opts{meta} <= 0);
@@ -349,6 +352,9 @@ if ($opts{put} && !defined $opts{id}) {
     exit;
 } elsif (!defined $opts{id} && defined $opts{status}) {
     status();
+    exit;
+} elsif (defined $opts{plot}) {
+    plot();
     exit;
 } elsif ($opts{sync}) {
     sync_remote();
@@ -379,8 +385,8 @@ if ($opts{lock}) {
     # indicate ok to proceed
     print "OK\n";
     STDIN->flush;
-    $SIG{ALRM} = sub {exit 1};
-    alarm 300;
+#    $SIG{ALRM} = sub {exit 1};
+#    alarm 300;
     # block until alarm or connection closed
     <STDIN>;
     exit;
@@ -400,6 +406,13 @@ if (defined $opts{status} && $opts{state} eq 'none') {
 } elsif ($opts{restart} && !($meta{stop} || $meta{time1} &&
         sum(map {$meta{"e_$_"}} qw(chattr cksum cp find ln mkdir sum)) > 0)) {
     die "Only transfers in stop or error states can be restarted\n";
+} elsif ($opts{restart} && -e "$opts{base}/no_restart") {
+    open(FILE, '<', "$opts{base}/no_restart");
+    my $msg;
+    $msg .= $_ while (<FILE>);
+    $msg =~ s/\n/ /g;
+    close FILE;
+    die "Restarts of this transfer have been blocked by the administrator: $msg\n";
 } elsif ($opts{stop} && ($meta{stop} || $meta{time1})) {
     die "Only running transfers can be stopped\n";
 }
@@ -548,12 +561,13 @@ foreach my $file (glob "$opts{base}/*") {
 put_meta(\%meta);
 
 # synchronize log files
-sync_local() if ($conf{sync_host});
+sync_queue() if ($conf{sync_host});
 
 # unlock id before cleanup
 close $ilockfh if (defined $ilockfh);
 
 # detach process during cleanup
+exit if (fork);
 close STDIN;
 close STDOUT;
 close STDERR;
@@ -602,9 +616,10 @@ if ($opts{get} || $opts{put}) {
     }
     nstore(\%loaddb, "$conf{user_dir}/$opts{user}.load");
     chmod(0644, "$conf{user_dir}/$opts{user}.load");
-    sync_local("$opts{user}.load") if ($conf{sync_host});
+    sync_queue("$opts{user}.load") if ($conf{sync_host});
     # unlock user info
     close $ulockfh;
+    sync_local() if ($conf{sync_host});
 }
 
 # remove status directories older than expiration time
@@ -621,7 +636,7 @@ while (-d "$conf{user_dir}/$more") {
         if ($mtime + $conf{data_expire} < $time) {
             rmtree($dir);
             # synchronize deleted directory
-            sync_local("$more$opts{user}.$id") if ($conf{sync_host});
+            sync_queue("$more$opts{user}.$id") if ($conf{sync_host});
         }
     }
     $more .= "$opts{user}.more/";
@@ -848,30 +863,16 @@ sub format_bytes {
 #############
 # output a set of operations for the invoking client to process
 sub get {
+    # retrieve global and user database from file
+    local $SIG{__WARN__} = sub {die};
+    %db = eval {%{retrieve($conf{db_file})}};
+    %udb = eval {%{retrieve($conf{udb_file})}};
+    local $SIG{__WARN__} = 'DEFAULT';
+
     if ($meta{"host_$opts{host}"} == 1) {
         $meta{"host_$opts{host}"} = 2;
         # host retrieving operations so reduce outstanding hosts
         $meta{ohosts}--;
-    }
-
-    # retrieve global database from file
-    eval {
-        local $SIG{__WARN__} = sub {die};
-        %db = %{retrieve($conf{db_file})};
-    };
-    if ($@) {
-        # database could not be opened
-        %db = ();
-    }
-
-    # retrieve user database from file
-    eval {
-        local $SIG{__WARN__} = sub {die};
-        %udb = %{retrieve($conf{udb_file})};
-    };
-    if ($@) {
-        # database could not be opened
-        %udb = ();
     }
 
     if ($meta{"warn_$opts{host}$opts{cid}"} == 1) {
@@ -893,9 +894,8 @@ sub get {
     my $sleep = throttle();
     if ($sleep > 0) {
         debug_print('GET', "args=sleep,$sleep\n");
-        $meta{"throttle_$opts{host}$opts{cid}"} += $sleep;
+        $meta{e_throttle} += $sleep;
         $meta{"throttled_$opts{host}$opts{cid}"} = 1;
-        #TODO: do something with throttle info in stats
         return;
     } else {
         delete $meta{"throttled_$opts{host}$opts{cid}"};
@@ -904,7 +904,8 @@ sub get {
     # send static options first
     foreach (qw(check create-tar cron dereference exclude extract-tar find-files
                 ignore-times include index-tar newer no-stripe offline older
-                ports preallocate preserve secure stripe sync verify
+                ports preallocate preserve recall secure stripe stripe-pool
+                stripe-size sync verify
                 verify-fast)) {
         debug_print('GET', "args=getopt,$_ text=", escape($meta{$_}), "\n")
             if (defined $meta{$_});
@@ -940,6 +941,7 @@ sub get {
     #TODO: need error if cannot be opened
     my ($size, $files, $ops, $all);
     my (%diskfs, %localfs, %rtthost);
+    my %cli_load = split(/[= ]+/, $meta{"load_$opts{host}$opts{cid}"});
     LOG: foreach my $log (@logs) {
         # process dir attrs last by themselves
         last if ($log eq 'rtree' && (!$meta{last} || $meta{t_run} || $ops ||
@@ -979,6 +981,8 @@ sub get {
             my @args = split(/,/, $op{args});
             my $cmd = shift @args;
             my $save_arg = $args[-1];
+            # never propagate suspend
+            delete $op{suspend};
 
             # only mkdirs are used for dir chattrs
             next if ($cmd ne 'mkdir' && $log eq 'rtree');
@@ -1032,7 +1036,7 @@ sub get {
                         # only include hosts in new domains
                         $rtthost{$host} = $meta{"rtt_$dn"} ? -1 : 1;
                     }
-                    if ($cmd eq 'cp' && $i == 1 && $ref->{local}) {
+                    if ($cmd =~ /^(?:cp|find)/ && $i == 1 && $ref->{local}) {
                         # store target file systems for disk throttling
                         $diskfs{"$host:$ref->{local}"} =
                             "$ref->{servers}:$ref->{remote}";
@@ -1043,7 +1047,7 @@ sub get {
                         $args[$i] = $new;
                         next if (!$ref->{local});
                         $localfs{$ref->{local}} |= $ref->{rw};
-                        if ($cmd eq 'cp' && $i == 1) {
+                        if ($cmd =~ /^(?:cp|find)/ && $i == 1) {
                             # store target file systems for disk throttling
                             $diskfs{"localhost:$ref->{local}"} =
                                 "$ref->{servers}:$ref->{remote}";
@@ -1063,11 +1067,26 @@ sub get {
                 if ($cmd eq 'cp' || $cmd eq 'sum' && $i == 0 ||
                         $cmd eq 'cksum' && $i == 1) {
                     if ($cmd eq 'cp' && $i == 1) {
-                        $nload{"iow_fs_$ref->{servers}:$ref->{remote}"} += $op{size};
+                        my $dpath = "$ref->{servers}:$ref->{remote}";
+                        $nload{"iow_fs_$dpath"} += $op{size};
                         $nload{"iow_host_$ref->{host}"} += $op{size};
                         if ($args[0] !~ /^\// || $args[1] !~ /^\//) {
                             # remote transfer so record network load
                             $nload{"netr_host_$ref->{host}"} += $op{size};
+                        }
+                        # disk overrun prevention
+                        foreach my $hl ($meta{disk}, $conf{"throttle_disk_$dpath"}) {
+                            next if ($hl !~ /^(\d+):(\d+)$/);
+                            my ($high, $low) = split(/:/, $hl);
+                            my $use = $cli_load{"used_$dpath"} +
+                                ($nload{"iow_fs_$dpath"} >> 10);
+                            my $tot = $cli_load{"used_$dpath"} +
+                                $cli_load{"left_$dpath"};
+                            if ($tot && 100 * $use / $tot >= $high) {
+                                $op{suspend} = $low / 100 * $tot;
+                                $meta{"throttled_$opts{host}$opts{cid}"} = 1;
+                                last;
+                            }
                         }
                     } else {
                         $nload{"ior_fs_$ref->{servers}:$ref->{remote}"} += $op{size};
@@ -1123,6 +1142,18 @@ sub get {
             $op{doing} = tell DOING;
             delete $op{state};
             delete $op{tool};
+
+            # dynamically insert tar_creat for first record of each tar split
+            if ($meta{'create-tar'} && defined $op{tar_start} &&
+                    $op{tar_start} == 0) {
+                if ($cmd =~ /^(?:cp|ln|mkdir)$/) {
+                    # use tar_last instead of tar_size since tar name may differ
+                    $op{tar_creat} = abs $meta{"tar_last_$save_arg"};
+                } else {
+                    # prevent tar_creat from propagating
+                    delete $op{tar_creat};
+                }
+            }
 
             # dynamically insert tar_last for last record of last tar split
             if ($meta{'create-tar'} && $meta{"tar_last_$save_arg"} > 0) {
@@ -1320,7 +1351,6 @@ sub get {
                     close $fh;
                     nstore(\%hosts, $file);
                     # invoke configured selection hook
-                    #TODO: remove extra shell spawn
                     $host = open3_get([-1, undef, -1],
                         "$conf{select_hook} $opts{host} $opts{host} $file");
                 }
@@ -1393,7 +1423,7 @@ sub get_meta {
             if ($log =~ /^doing_/ && defined $meta->{"$log\_size"}) {
                 # undo all operations that were processed after last good state
                 open(FILE, '+<', $file);
-                my $tell0 = $meta->{"$log\_size"};
+                my $tell0 = $meta->{$log};
                 seek(FILE, $tell0, 0);
                 while (<FILE>) {
                     my $tell = tell FILE;
@@ -1414,8 +1444,7 @@ sub get_meta {
         # truncate last in case any other operations interrupted
         truncate($mfile, $mtell);
     }
-    #TODO: handle errors;
-    return $meta;
+    return $meta ? $meta : {};
 }
 
 #################
@@ -1504,7 +1533,7 @@ sub id_status {
             # ignore rows that do not match optional search
             next if ($opts{search} && join(" ", @args) !~ qr/$opts{search}/);
             # target is the same for all files during tar creation so use source
-            $args[-1] = $op{tar_name} if ($meta{'create-tar'});
+            $args[-1] = $op{tar_name} if ($meta{'create-tar'} && !$op{tar_mv});
             my $size = "-";
             $size = format_bytes($op{size}) if ($args[0] =~ /^(?:cksum|cp|sum)/);
             if ($op{state} eq 'warn' && (!$state || $state eq 'warn')) {
@@ -1523,6 +1552,11 @@ sub id_status {
                 $row2[2] = "\"$row2[2]\"" if ($row2[2] =~ /[,"\n]/);
                 print join(",", @row, @row2), "\n";
             } else {
+                if ($opts{status} eq 'color') {
+                    my $color = $row[0] eq 'queue' ? "cyan" : "yellow";
+                    @row = map {colored($_, $color)} @row;
+                    @row2 = map {colored($_, $color)} @row2;
+                }
                 $t->row(@row);
                 $t->row(@row2) if ($row[0] ne 'queue');
                 if (++$rows >= $nrows) {
@@ -1556,7 +1590,7 @@ sub id_status {
                 # ignore rows that do not match optional search
                 next if ($opts{search} && join(" ", @args) !~ qr/$opts{search}/);
                 # target is the same for all files during tar creation so use source
-                $args[-1] = $op{tar_name} if ($meta{'create-tar'});
+                $args[-1] = $op{tar_name} if ($meta{'create-tar'} && !$op{tar_mv});
                 my $size = "-";
                 $size = format_bytes($op{size}) if ($args[0] =~ /^(?:cksum|cp|sum)/);
                 # add first row for each operation with bulk of info
@@ -1572,6 +1606,10 @@ sub id_status {
                     $row2[2] = "\"$row2[2]\"" if ($row2[2] =~ /[,"\n]/);
                     print join(",", @row, @row2), "\n";
                 } else {
+                    if ($opts{status} eq 'color') {
+                        @row = map {colored($_, "green")} @row;
+                        @row2 = map {colored($_, "green")} @row2;
+                    }
                     $t->row(@row);
                     $t->row(@row2);
                     if (++$rows >= $nrows) {
@@ -1599,7 +1637,7 @@ sub id_status {
             # ignore rows that do not match optional search
             next if ($opts{search} && join(" ", @args) !~ qr/$opts{search}/);
             # target is the same for all files during tar creation so use source
-            $args[-1] = $op{tar_name} if ($meta{'create-tar'});
+            $args[-1] = $op{tar_name} if ($meta{'create-tar'} && !$op{tar_mv});
             my $size = "-";
             $size = format_bytes($op{size}) if ($args[0] =~ /^(?:cksum|cp|sum)/);
             # add first row for each operation with bulk of info
@@ -1611,6 +1649,10 @@ sub id_status {
                 $row2[2] = "\"$row2[2]\"" if ($row2[2] =~ /[,"\n]/);
                 print join(",", @row, @row2), "\n";
             } else {
+                if ($opts{status} eq 'color') {
+                    @row = map {colored($_, "red")} @row;
+                    @row2 = map {colored($_, "red")} @row2;
+                }
                 $t->row(@row);
                 $t->row(@row2);
                 if (++$rows >= $nrows) {
@@ -1637,7 +1679,7 @@ sub id_status {
             # ignore rows that do not match optional search
             next if ($opts{search} && join(" ", @args) !~ qr/$opts{search}/);
             # target is the same for all files during tar creation so use source
-            $args[-1] = $op{tar_name} if ($meta{'create-tar'});
+            $args[-1] = $op{tar_name} if ($meta{'create-tar'} && !$op{tar_mv});
             my $secs = $op{time} > 0 ? $op{time} : 1;
             my $size = "-";
             my $rate = "-";
@@ -1697,13 +1739,22 @@ sub init_id {
     # change files unit from billion to gig
     $meta{files} =~ tr/[bB]/g/ if (defined $meta{files});
 
+    # stripe can include additional specifiers using colons
+    if ($meta{stripe} =~ /:/) {
+        ($meta{stripe}, $meta{'stripe-size'}, $meta{'stripe-pool'}) =
+            split(/:/, $meta{stripe});
+        foreach (qw(stripe stripe-size stripe-pool)) {
+            delete $meta{$_} if ($meta{$_} eq '');
+        }
+    }
+
     # convert size strings to numbers
     foreach my $key (qw(bandwidth buffer files find-files size split split-tar
-                        stripe window)) {
+                        stripe stripe-size window)) {
         # stripe can be zero
         next if ($key eq 'stripe' && defined $meta{$key} && $meta{$key} == 0);
         # parse some values in binary bytes instead of decimal bytes
-        my $bin = $key =~ /^(?:buffer|split|stripe)$/ ? 1 : 0;
+        my $bin = $key =~ /^(?:buffer|split|stripe|stripe-size)$/ ? 1 : 0;
         my $new = defined $meta{$key} ? parse_bytes($meta{$key}, $bin) : undef;
         if (!defined $new && defined $conf{"default_$key"}) {
             $new = parse_bytes($conf{"default_$key"}, $bin);
@@ -1711,7 +1762,7 @@ sub init_id {
             $meta{'no-stripe'} = 1 if ($key eq 'stripe');
         }
 
-        if ($key =~ /^(?:buffer|split|stripe)$/) {
+        if ($key =~ /^(?:buffer|split|stripe-size)$/) {
             # adjust binary values to power of 2 if string not used
             if ($new && $meta{$key} !~ /\D/) {
                 my $tmp = 1;
@@ -1784,7 +1835,7 @@ sub lock_id {
 my %fs_cache;
 sub fs_mount {
     my ($host, $path) = @_;
-    
+
     # check cache first to see if mount already computed
     my $pos = length($path);
     while (($pos = rindex($path, "/", $pos)) > 0) {
@@ -1953,7 +2004,7 @@ sub map_remote {
                 close $fh;
                 nstore(\%picks, $file);
                 # invoke configured selection hook
-                $pick = open3_get([-1, undef],
+                $pick = open3_get([-1, undef, -1],
                     "$conf{select_hook} $lhost $rhost $file");
             }
             # revert to default selection policy when no selection
@@ -2106,11 +2157,240 @@ sub parse_bytes {
     return undef;
 }
 
+##############
+#### plot ####
+##############
+sub plot {
+    #TODO: fail={errors, warnings, corruptions, exceptions}, fs
+    #TODO: not all gnuplots have pdf terminal
+    my $by;
+    if ($opts{plot} =~ /^(host|id|user)$/) {
+        ($by, $opts{plot}) = ($opts{plot}, "io");
+    } elsif ($opts{plot} =~ /(\S+):(\S+)/) {
+        ($by, $opts{plot}) = ($1, $2);
+    } elsif (!$opts{plot}) {
+        $opts{plot} = "io,meta";
+    }
+    $opts{plot} =~ s/io/cp,sum,cksum/g;
+    $opts{plot} =~ s/meta/find,mkdir,ln,chattr/g;
+
+    my %keys;
+    $keys{$_} = "d_" foreach (qw(chattr find ln mkdir));
+    $keys{$_} = "s_" foreach (qw(cksum cp sum));
+
+    my @cmds = split(/,/, $opts{plot});
+    my %hcmds;
+    # separate io and meta operations
+    push(@{$hcmds{$keys{$_}}}, $_) foreach (@cmds);
+    $hcmds{1} = defined $hcmds{s_} ? $hcmds{s_} : $hcmds{d_};
+    my $unit = defined $hcmds{s_} ? "MB" : "ops";
+    @cmds = @{$hcmds{1}};
+    push(@cmds, @{$hcmds{d_}}) if (defined $hcmds{d_});
+
+    my %times;
+    my (@metas, @seen);
+    my $dir = $> != 0 ? $conf{user_dir} : $opts{user_dir};
+    my $user = $> != 0 ? $opts{user} : "*";
+    do {
+        push(@metas, glob "$dir/$user.[0-9]*/meta");
+        $dir .= "/*.more";
+    } while (scalar(glob $dir));
+    foreach my $file (@metas) {
+        my $user = $file;
+        $user =~ s/.*\/([\w-]+)\.\d+\/meta/$1/g;
+        my $id = $file;
+        if ($> != 0) {
+            $id =~ s/.*\.|\/meta//g;
+        } else {
+            # ignore old transfers
+            next if ((stat $file)[9] + $conf{data_expire} < $time);
+            # leave user name in id
+            $id =~ s/.*\/([\w-]+\.\d+)\/meta/$1/g;
+        }
+        if ($opts{id}) {
+            # ignore other ids when id is defined
+            next if ($id != $opts{id});
+        } else {
+            # retrieve metadata from file
+            %meta = %{get_meta($file)};
+        }
+        # skip transfers that use --sync
+        next if ($meta{sync});
+        my $state = "run";
+        # compute number of operations in various states
+        my $done = sum(map {$meta{"d_$_"}} qw(chattr cksum cp find ln mkdir sum));
+        my $error = sum(map {$meta{"e_$_"}} qw(chattr cksum cp find ln mkdir sum));
+        my $total = sum(map {$meta{"t_$_"}} qw(chattr cksum cp find ln mkdir sum));
+        # determine transfer state
+        if ($meta{last} && defined $meta{time1} && $done == $total) {
+            $state = "done";
+        } elsif ($meta{stop}) {
+            $state = "stop";
+        } elsif ($meta{time1}) {
+            $state = "error";
+        } else {
+            if ($meta{w_run} > 0) {
+                $state .= "+warn";
+            }
+            if ($error > 0) {
+                $state .= "+error";
+            }
+            if (grep(/^throttled_/, keys(%meta))) {
+                $state .= "+throttle";
+            }
+        }
+        # skip transfers that do not match the given state
+        next if (!$opts{id} && $opts{state} &&
+                $state !~ /(?:^|\+)\Q$opts{state}\E(?:$|\+)/);
+        my %gets;
+        my $meta0;
+        my $fh;
+        open($fh, '<', $file) or die;
+        while (my $line = <$fh>) {
+            last if (!defined $line);
+            last if (substr($line, 0, 1) != '[' || substr($line, -1, 1) != ']');
+            my $meta = thaw(uncompress(decode_base64(substr($line, 1, -1))));
+            foreach my $last (grep(/^last_/, keys %{$meta})) {
+                next if ($meta0->{$last} == $meta->{$last});
+                my $host = $last;
+                $host =~ s/^last_//;
+                my $time = $meta->{$last};
+                # record rates when hosts have completed operations (put)
+                if ($gets{$host} && ($meta->{do_size} > $meta0->{do_size} ||
+                        $meta->{done_size} > $meta0->{done_size} ||
+                        $meta->{error_size} > $meta0->{error_size})) {
+                    my @counts;
+                    foreach (@cmds) {
+                        my $rate = $meta->{$keys{$_} . $_} -
+                            $meta0->{$keys{$_} . $_};
+                        # io operations are shown in MB/s
+                        $rate /= 1E6 if ($keys{$_} eq 's_');
+                        # throw out negative results due to retries
+                        $rate = 0 if ($rate < 0);
+                        push(@counts, ceil($rate / ($time - $gets{$host})));
+                    }
+                    if (sum(@counts)) {
+                        # add to operations if something done (i.e. not --alive)
+                        $times{$gets{$host}} = []
+                            if (!defined $times{$gets{$host}});
+                        $times{$time} = [] if (!defined $times{$time});
+                        # computed rates begin when the get occurred
+                        push(@{$times{$gets{$host}}},
+                            [$user, $id, $host, @counts]);
+                        # computed rates end when the put occurred
+                        push(@{$times{$time}},
+                            [$user, $id, $host, map {-$_} @counts]);
+                        # record id/host/user for creation of header/data rows
+                        $seen[0]->{$user} = 1;
+                        $seen[1]->{$id} = 1;
+                        $seen[2]->{$host} = 1;
+                        # no more outstanding operations on host
+                        delete $gets{$host};
+                    }
+                }
+                # record when hosts have operations in progress (get)
+                $gets{$host} = $time
+                    if ($meta->{"doing_$host\_size"} >
+                        $meta0->{"doing_$host\_size"});
+            }
+            $meta0 = $meta;
+        }
+        close $fh;
+    }
+
+    my $index = $by eq 'user' ? 0 : ($by eq 'id' ? 1 : 2);
+    my @header = $by ? sort(keys %{$seen[$index]}) : @cmds;
+
+    # embed data inline so output can be piped directly into gnuplot
+    print "# This output requires gnuplot version 5 or higher\n";
+    print '$data << EOF', "\n";
+    print join(" ", "time", @header), "\n";
+
+    my ($time0, $time1);
+    my %vals = map {$_ => 0} @header;
+    # ensure all initial rates are zero
+    print join(" ", 0, values %vals), "\n";
+    foreach my $time (sort {$a <=> $b} keys(%times)) {
+        # record first time witnessed
+        $time0 = $time if (!defined $time0);
+        foreach my $val (@{$times{$time}}) {
+            # add to running totals for 
+            if ($by) {
+                $vals{$val->[$index]} += sum(@{$val}[3 .. 2 + scalar(@cmds)]);
+            } else {
+                foreach my $i (0 .. scalar(@cmds) - 1) {
+                    $vals{$cmds[$i]} += $val->[3 + $i];
+                }
+            }
+        }
+        # populate adjusted time and data columns
+        print join(" ", $time - $time0, map {$vals{$_}} @header), "\n";
+        # record last time witnessed
+        $time1 = $time;
+    }
+    # ensure all final rates are zero
+    print join(" ", $time1 - $time0, map {0} @header), "\n";
+    print "EOF\n";
+
+    # set basic plot characteristics
+    print "set terminal pdf enhanced\n";
+    print "set xlabel 'time (s)' textcolor rgb 'white'\n";
+    print "set border linecolor rgb 'white'\n";
+    print "set key outside textcolor rgb 'white'\n";
+    print "set obj 1 rect behind from screen 0,0 to screen 1,1 fillcolor rgb 'black' behind\n";
+    print "set ylabel '", join("-", @{$hcmds{1}}),
+        " performance ($unit/s)' textcolor rgb 'white'\n";
+
+    # set color of each data column (based on savors palette)
+    my @palette = qw(
+        FF0000 FF7F00 FFFF00 80FF00 00FF00 00FF80 00FFFF 0080FF 0000FF 7F00FF
+        FF00FF FF007F CC0000 CC6600 CCCC00 66CC00 00CC00 00CC66 00CCCC 0066CC
+        0000CC 6600CC CC00CC CC0066 990000 994C00 999900 4D9900 009900 00994D
+        009999 004C99 000099 4D0099 990099 99004D FF7F7F FFBF80 FFFF7F BFFF80
+        80FF80 80FFBF 80FFFF 80BFFF 807FFF BF7FFF FF7FFF FF7FBF CC6666 CC9966
+        CCCC66 99CC66 66CC66 66CC99 66CCCC 6699CC 6666CC 9966CC CC66CC CC6699
+        994C4D 99734C 99994D 73994D 4D994D 4D9973 4D9999 4D7399 4D4C99 734C99
+        994C99 994C73 FFBFBF FFDFBF FFFFBF DFFFBF BFFFBF BFFFDF BFFFFF BFDFFF
+        BFBFFF DFBFFF FFBFFF FFBFDF CC9999 CCB399 CCCC99 B3CC99 99CC99 99CCB3
+        99CCCC 99B2CC 9999CC B399CC CC99CC CC99B3
+    );
+    foreach my $i (2 .. 1 + scalar(@header)) {
+        print "set style line $i linecolor rgb '#",
+            # reuse colors when more columns than palette colors
+            $palette[($i - 2) % scalar(@palette)], "'\n";
+    }
+
+    if (scalar(keys %hcmds) == 3) {
+        # set up dual y-axes when plotting both io and meta operations
+        print "set ytics nomirror\n";
+        print "set y2tics nomirror\n";
+        print "set y2range [0:]\n";
+        print "set y2label '", join("-", @{$hcmds{d_}}),
+            " performance (ops/s)' textcolor rgb 'white'\n";
+        @header = @{$hcmds{1}};
+    }
+    print "plot for [i=2:", 1 + scalar(@header),
+        "] \$data using 1:i ti columnheader(i) with steps ls i";
+    if (scalar(keys %hcmds) == 3) {
+        # add plot for meta operations on second y-axis
+        print ", \\\n";
+        print "for [i=", 2 + scalar(@{$hcmds{1}}), ":", 1 + scalar(@cmds),
+            "] \$data using 1:i ti columnheader(i) with steps ls i axes x1y2";
+    }
+    print "\n";
+}
+
 #############
 #### put ####
 #############
 # record the state of file operations that were processed by a client
 sub put {
+    # retrieve global and user database from file
+    local $SIG{__WARN__} = sub {die};
+    %db = eval {%{retrieve($conf{db_file})}};
+    %udb = eval {%{retrieve($conf{udb_file})}};
+    local $SIG{__WARN__} = 'DEFAULT';
+
     # open/create log files
     my %fhs;
     foreach (qw(do done error tree)) {
@@ -2124,8 +2404,8 @@ sub put {
     my %find;
     my %mnts;
     $meta{"warn_$opts{host}$opts{cid}"} = -1;
-    $SIG{ALRM} = sub {exit 1};
-    alarm 300;
+#    $SIG{ALRM} = sub {exit 1};
+#    alarm 300;
     while (my $line = <STDIN>) {
         debug_print('PUT', $line);
         $line =~ s/\s*\r?\n$//;
@@ -2229,7 +2509,7 @@ sub put {
             # initialize transfer settings once all getopt lines received
             init_id() if ($args[0] eq 'end');
             # check validity of option
-            next if ($args[0] !~ /^(?:bandwidth|buffer|check|clients|command|cpu|create-tar|cron|cwd|dereference|disk|exception|exclude|extract-tar|files|host-list|hosts|ignore-times|include|index-tar|io[rw]?|local|mail|net[rw]?|newer|offline|older|os|perl|ports|preallocate|preserve|remote|retry|secure|size|split|split-tar|streams|stripe|sync|threads|verify|verify-fast|version|window)$/);
+            next if ($args[0] !~ /^(?:bandwidth|buffer|check|clients|command|cpu|create-tar|cron|cwd|dereference|disk|exception|exclude|extract-tar|files|host-list|hosts|ignore-times|include|index-tar|io[rw]?|local|mail|net[rw]?|newer|offline|older|os|perl|ports|preallocate|preserve|recall|remote|retry|secure|size|split|split-tar|streams|stripe|sync|threads|verify|verify-fast|version|window)$/);
             if ($args[0] eq 'exception') {
                 # track exceptions for stats processing
                 $meta{e_exception}++;
@@ -2515,75 +2795,85 @@ sub put {
             $meta{t_chattr}++ if ($meta{check} || $meta{preserve});
 
             if ($meta{'create-tar'} && $cmd =~ /^(?:cp|ln|mkdir)/) {
-                if (!defined $meta{"tar_size_$args[-1]"}) {
+                # map tar file to origin system to keep tar metadata consistent
+                my $tar;
+                $tar = map_local($opts{host}, $args[-1], $meta{origin}, {rw => 1})
+                    if ($args[-1] =~ /^\//);
+                # back out to original if unable to map
+                #TODO: should this be an error?
+                $tar = $args[-1] if (!$tar);
+
+                if (!defined $meta{"tar_size_$tar"}) {
                     # initialize tar metadata for this file
-                    $meta{"tar_size_$args[-1]"} = 0;
-                    $meta{"tar_split_$args[-1]"} = 1;
-                    $meta{"tar_index_$args[-1]"} = 0 if ($meta{'index-tar'});
-                    $meta{"tar_nosum_$args[-1]"} = 1 if ($meta{verify});
-                } elsif ($meta{"tar_size_$args[-1]"} < 0) {
+                    $meta{"tar_size_$tar"} = 0;
+                    $meta{"tar_split_$tar"} = 1;
+                    $meta{"tar_index_$tar"} = 0 if ($meta{'index-tar'});
+                    $meta{"tar_nosum_$tar"} = 1 if ($meta{verify});
+                } elsif ($meta{"tar_size_$tar"} < 0) {
                     # a negative size indicates the final size of the last split
-                    $meta{"tar_size_$args[-1]"} = 0;
-                    $meta{"tar_split_$args[-1]"}++;
-                    $meta{"tar_index_$args[-1]"} = 0 if ($meta{'index-tar'});
+                    $meta{"tar_size_$tar"} = 0;
+                    $meta{"tar_split_$tar"}++;
+                    $meta{"tar_index_$tar"} = 0 if ($meta{'index-tar'});
                 }
 
                 # need .sum mv for reg files / no tracking needed for 2+ splits
-                delete $meta{"tar_nosum_$args[-1]"}
-                    if ($cmd eq 'cp' || $meta{"tar_split_$args[-1]"} > 1);
-                $op{tar_start} = $meta{"tar_size_$args[-1]"};
+                delete $meta{"tar_nosum_$tar"}
+                    if ($cmd eq 'cp' || $meta{"tar_split_$tar"} > 1);
+                $op{tar_start} = $meta{"tar_size_$tar"};
                 if ($cmd eq 'ln') {
                     my $llen = length(unescape($args[0]));
                     if ($llen > 100) {
                         # add size of long link plus extra record
                         my $asize = $llen + 512;
                         $asize += (512 - ($asize % 512)) if ($asize % 512 > 0);
-                        $meta{"tar_size_$args[-1]"} += $asize;
+                        $meta{"tar_size_$tar"} += $asize;
                     }
                 }
                 my $tar_name = unescape($op{tar_name});
+                # per ustar spec, must append / to dirs
+                $tar_name .= "/" if ($cmd eq 'mkdir');
                 if (length($tar_name) > 100) {
                     my $pos = index($tar_name, "/", length($tar_name) - 100);
                     if ($pos == -1 || $pos > 155 || length($tar_name) > 255) {
                         # add size of long name plus extra record
                         my $asize = length($tar_name) + 512;
                         $asize += (512 - ($asize % 512)) if ($asize % 512 > 0);
-                        $meta{"tar_size_$args[-1]"} += $asize;
+                        $meta{"tar_size_$tar"} += $asize;
                     }
                 }
 
                 my $size = $cmd ne 'cp' ? 0 : $op{size};
                 # tar entries contain 512 byte header plus file plus padding
-                $meta{"tar_size_$args[-1]"} += 512;
+                $meta{"tar_size_$tar"} += 512;
                 # file contents are written after the header
-                $op{bytes} = $meta{"tar_size_$args[-1]"} . "-";
-                $meta{"tar_size_$args[-1]"} += $size;
-                $op{bytes} .= $meta{"tar_size_$args[-1]"};
+                $op{bytes} = $meta{"tar_size_$tar"} . "-";
+                $meta{"tar_size_$tar"} += $size;
+                $op{bytes} .= $meta{"tar_size_$tar"};
                 $op{tar_bytes} = $op{bytes};
                 # pad entry to 512 byte boundary
-                $meta{"tar_size_$args[-1]"} += (512 - ($size % 512))
+                $meta{"tar_size_$tar"} += (512 - ($size % 512))
                     if ($size > 0 && $size % 512 > 0);
                 # use appropriate split as target
-                $op{args} .= "-" . $meta{"tar_split_$args[-1]"} . ".tar";
+                $op{args} .= "-" . $meta{"tar_split_$tar"} . ".tar";
 
                 if ($meta{'index-tar'}) {
                     # designate position of entry in index file
-                    $meta{"tar_index_$args[-1]"} += $op{tar_index};
-                    $op{tar_index} = $meta{"tar_index_$args[-1]"} - $op{tar_index};
+                    $meta{"tar_index_$tar"} += $op{tar_index};
+                    $op{tar_index} = $meta{"tar_index_$tar"} - $op{tar_index};
                 }
                 if ($meta{'split-tar'} &&
-                        $meta{"tar_size_$args[-1]"} >= $meta{'split-tar'}) {
+                        $meta{"tar_size_$tar"} >= $meta{'split-tar'}) {
                     # indicate last tar entry so final padding can be added
                     $op{tar_last} = 1;
                     # insert chattr op in tree to preallocate and stripe
-                    $fhs{tree}->print("args=chattr,$args[-1]-" .
-                        $meta{"tar_split_$args[-1]"} . ".tar host=$opts{host}" .
-                        " tar_creat=" . $meta{"tar_size_$args[-1]"} . "\n");
+                    $fhs{tree}->print("args=chattr,$tar-" .
+                        $meta{"tar_split_$tar"} . ".tar host=$opts{host}" .
+                        " tar_creat=" . $meta{"tar_size_$tar"} . "\n");
                     $meta{t_chattr}++;
                     $meta{tar_creat}++;
                     # move to next split by inverting size to save final value
-                    $meta{"tar_size_$args[-1]"} = -$meta{"tar_size_$args[-1]"};
-                    $meta{"tar_index_$args[-1]"} = 0 if ($meta{'index-size'});
+                    $meta{"tar_size_$tar"} = -$meta{"tar_size_$tar"};
+                    $meta{"tar_index_$tar"} = 0 if ($meta{'index-size'});
                 }
 
                 $line = join(" ", map {"$_=$op{$_}"} sort(keys %op));
@@ -2670,7 +2960,7 @@ sub put {
             $mnts{"shell_$op{host}"} = $op{pbs} ? "pbs" : 1;
         }
     }
-    alarm 0;
+#    alarm 0;
 
     if ($more_finds && $meta{d_find} == $meta{t_find} && $meta{'create-tar'}) {
         # tar transition from finds outstanding to no finds outstanding
@@ -2792,7 +3082,7 @@ sub put {
             nstore(\%udb, $conf{udb_file});
 
             # synchronize user db
-            sync_local("$opts{user}.db") if ($conf{sync_host});
+            sync_queue("$opts{user}.db") if ($conf{sync_host});
         }
     }
 }
@@ -2824,31 +3114,34 @@ sub run {
             $meta{last} && $meta{d_chattr} >= $meta{tar_creat}) {
         $expect += $meta{"t_$_"} foreach (qw(cp ln mkdir));
     }
+    # only count chattr errors when not tar_mv errors
+    my $echattr = $meta{t_chattrs} - $meta{d_chattrs} <= $meta{tar_mv} ?
+        0 : $meta{e_chattr};
     if ($meta{verify} && ($meta{check} || $meta{preserve})) {
         # expect sums for done cps and cksums for done sums
         $expect += $meta{"d_$_"} foreach (qw(cp sum));
         # expect file chattrs for done cksums and done lns
-        $expect += $meta{d_cksum} + $meta{d_ln};
+        $expect += $meta{"d_$_"} foreach (qw(cksum ln));
         # expect dir chattrs only when no other errors
-        my $errs = sum(map {$meta{"e_$_"}} qw(chattr cksum cp find ln mkdir sum));
-        $expect += $errs ? 0 : $meta{t_mkdir};
+        my $errs = sum(map {$meta{"e_$_"}} qw(cksum cp find ln mkdir sum));
+        $expect += $echattr + $errs ? 0 : $meta{t_mkdir};
     } elsif ($meta{verify}) {
         # expect sums for done cps and cksums for done sums
         $expect += $meta{"d_$_"} foreach (qw(cp sum));
     } elsif ($meta{check} || $meta{preserve}) {
         # expect file chattrs for done cps and done lns
-        $expect += $meta{d_cp} + $meta{d_ln};
+        $expect += $meta{"d_$_"} foreach (qw(cp ln));
         # expect dir chattrs only when no other errors
-        my $errs = sum(map {$meta{"e_$_"}} qw(chattr cp find ln mkdir));
+        my $errs = sum(map {$meta{"e_$_"}} qw(cp find ln mkdir));
         # when errs > 0 and rtree == 0, any chattr errors are from dirs
         # and not files, so should still expect t_mkdir dir chattrs
-        $expect += $errs && $meta{rtree} ? 0 : $meta{t_mkdir};
+        $expect += $echattr + $errs && $meta{rtree} ? 0 : $meta{t_mkdir};
     }
     my $actual = sum(map {$meta{"d_$_"}} qw(chattr cksum cp find ln mkdir sum));
     my $errs = sum(map {$meta{"e_$_"}} qw(chattr cksum cp find ln mkdir sum));
     $actual += $errs;
     # expect tar_mv chattrs only when no other errors
-    $expect += $errs ? 0 : $meta{tar_mv};
+    $expect += $echattr + $errs - $meta{e_chattr} ? 0 : $meta{tar_mv};
     # running if actual operations differ from expected operations
     return ($expect != $actual);
 }
@@ -2874,15 +3167,15 @@ sub stats {
         [qw(bbcp bbftp fish fish-tcp gridftp mcp msum rsync shiftc shift-aux)];
     $heads{Options_1} =
         [qw(bandwidth buffer clients cpu create-tar exclude extract-tar files host-list
-            hosts include index-tar)];
+            hosts include index-tar io ior)];
     $heads{Options_2} =
-        [qw(io ior iow local net netr netw newer no-check no-cron no-offline
-            no-mail no-preserve no-verify older)];
+        [qw(ior iow local net netr netw newer no-check no-cron no-offline
+            no-mail no-preserve no-recall no-verify older)];
     $heads{Options_3} =
         [qw(ports preallocate remote retry secure size split split-tar streams
             stripe sync threads verify-fast window)];
     $heads{Errors} =
-        [qw(corruption exception chattr cksum cp host ln mkdir sum)];
+        [qw(corruption exception throttle chattr cksum cp host ln mkdir sum)];
 
     # define order in output
     my @order = qw(Transfers Rates Tools Options_1 Options_2 Options_3 Errors);
@@ -2904,12 +3197,10 @@ sub stats {
     # compute totals over all transfers
     my @metas;
     my $dir = $conf{user_dir};
-    while (1) {
-        my @files = glob "$dir/*/meta";
-        last if (scalar(@files) == 0);
-        push(@metas, @files);
+    do {
+        push(@metas, glob "$dir/*/meta");
         $dir .= "/*.more";
-    } 
+    } while (scalar(glob $dir));
 
     foreach my $file (@metas) {
         # skip transfers that have expired
@@ -2935,7 +3226,7 @@ sub stats {
         my $user = $file;
         $user =~ s/.*\/(\w+)\.\d+\/meta/$1/;
 
-        foreach (qw(e_corruption e_exception)) {
+        foreach (qw(e_corruption e_exception e_throttle)) {
             # add corruption/exception totals even if transfer not completed
             $all->{$_} += $meta{$_};
             $users{$user}->{$_} += $meta{$_};
@@ -2977,7 +3268,7 @@ sub stats {
         # options that must be inverted
         $totals{"o_no-offline"} = !$meta{offline} && !$meta{'create-tar'} &&
                 !$meta{'extract-tar'} ? 1 : 0;
-        foreach (qw(check cron mail preserve verify)) {
+        foreach (qw(check cron mail preserve recall verify)) {
             $totals{"o_no-$_"} = !$meta{$_} ? 1 : 0;
         }
         # normal options
@@ -3007,8 +3298,8 @@ sub stats {
         my $dtime = $meta{time1} - $meta{time0};
         $dtime = 1 if ($dtime <= 0);
         my $rate = $meta{s_cp} / $dtime;
-        # ignore rates of zero
-        next if (!$rate);
+        # ignore rates of zero or rates using --sync
+        next if (!$rate || $meta{sync});
 
         # compute rates per user, per type, and overall
         foreach my $ref ($users{$user}, $types{$type}, $all) {
@@ -3184,12 +3475,10 @@ sub status {
     my $dones;
     my $dir = $> != 0 ? $conf{user_dir} : $opts{user_dir};
     my $user = $> != 0 ? $opts{user} : "*";
-    while (1) {
-        my @dirs = glob "$dir/$user.[0-9]*/meta";
-        last if (!scalar(@dirs));
-        push(@metas, @dirs);
+    do {
+        push(@metas, glob "$dir/$user.[0-9]*/meta");
         $dir .= "/*.more";
-    }
+    } while (scalar(glob $dir));
     foreach my $file (sort {$> != 0 ? (stat $a)[9] <=> (stat $b)[9] :
             # sort by user name when root invocation across all transfers
             $a <=> $b} @metas) {
@@ -3211,6 +3500,7 @@ sub status {
         }
         my $time1 = defined $meta{time1} ? $meta{time1} : $time;
         my $state = "run";
+        my $color = "green";
         # compute number of operations in various states
         my $done = sum(map {$meta{"d_$_"}} qw(chattr cksum cp find ln mkdir sum));
         my $error = sum(map {$meta{"e_$_"}} qw(chattr cksum cp find ln mkdir sum));
@@ -3218,15 +3508,30 @@ sub status {
         # determine transfer state
         if ($meta{last} && defined $meta{time1} && $done == $total) {
             $state = "done";
+            # undef color implies default foreground
+            $color = undef;
             $dones++;
         } elsif ($meta{stop}) {
             $state = "stop";
+            my $base = $file;
+            $base =~ s/(\/[^\/]+.more|meta)//g;
+            $color = -e "${base}no_restart" ? "blue" : "cyan";
         } elsif ($meta{time1}) {
             $state = "error";
+            $color = "red";
         } else {
-            $state .= "+warn" if ($meta{w_run} > 0);
-            $state .= "+error" if ($error > 0);
-            $state .= "+throttle" if (grep(/^throttled_/, keys(%meta)));
+            if ($meta{w_run} > 0) {
+                $state .= "+warn";
+                $color = "yellow";
+            }
+            if ($error > 0) {
+                $state .= "+error";
+                $color = "yellow";
+            }
+            if (grep(/^throttled_/, keys(%meta))) {
+                $state .= "+throttle";
+                $color = "magenta" if ($color ne 'yellow');
+            }
         }
         # skip transfers that do not match the given state
         next if (!$opts{id} && $opts{state} &&
@@ -3254,8 +3559,10 @@ sub status {
                 if (defined $meta{"t0_$cmd"} && $time1 > $meta{"t0_$cmd"} &&
                         $meta{"s_$cmd"} > $meta{"s0_$cmd"}) {
                     # use previous rate for same operation type if available
-                    $rate1 = ($meta{"s_$cmd"} - $meta{"s0_$cmd"}) /
+                    my $tmp = ($meta{"s_$cmd"} - $meta{"s0_$cmd"}) /
                         ($time1 - $meta{"t0_$cmd"});
+                    # avoid inflated times by only using rates above total rate
+                    $rate1 = $tmp if ($tmp > $rate);
                 }
                 # use rate for previous operation type otherwise
                 $left += ($meta{s_total} - $meta{"s_$cmd"}) / $rate1;
@@ -3290,6 +3597,9 @@ sub status {
             strftime('%R', localtime($meta{time0})), $left, "");
         if ($opts{status} eq 'csv') {
             print join(",", @row, @row2), "\n";
+        } elsif ($opts{status} eq 'color') {
+            push(@rows, [map {colored($_, $color)} @row]);
+            push(@rows, [map {colored($_, $color)} @row2]);
         } else {
             push(@rows, \@row, \@row2);
         }
@@ -3308,7 +3618,7 @@ sub status {
     my $skip = $> != 0 && $dones && !$opts{id} && !$opts{state} &&
         scalar(@metas) > $conf{status_lines} ? $dones : 0;
     for (my $i = 0; $i < scalar(@rows); $i += 2) {
-        next if ($skip && $rows[$i]->[1] eq 'done' && $dones-- > 0);
+        next if ($skip && $rows[$i]->[1] =~ /^done/ && $dones-- > 0);
         # add saved rows into table
         $t->row(@{$rows[$i]});
         $t->row(@{$rows[$i + 1]});
@@ -3323,49 +3633,52 @@ sub status {
 ####################
 #### sync_local ####
 ####################
-# synchronize given file or metadata of current transfer to configured sync host
+# process files on sync queue to configured sync host
 sub sync_local {
-    my $file = shift;
+    my $sbase = "$conf{user_dir}/$opts{user}.sync";
+    my $sfile = $sbase;
+    my $sdoing = (glob "${sbase}_*")[0];
+    if ($sdoing =~ /_(\d+)$/) {
+        # doing file may exist if previous sync was interrupted
+        my $pid = $1;
+        # check not already running
+        my $run = open3_get([-1, undef, -1], "ps -o command -p $pid");
+        return if ($run =~ /shift-mgr/);
+        $sfile = $sdoing;
+    }
+    # lock sync queue
+    open($ulockfh, '>', "$conf{user_dir}/$opts{user}.lock");
+    flock($ulockfh, LOCK_EX);
+    # process may have finished in meantime
+    $sfile = $sbase if (! -e $sfile);
+    rename($sfile, "${sbase}_$$");
+    close $ulockfh;
+    open(SYNCQ, '<', "${sbase}_$$") or return;
+
     my $fhpid = open3_run([undef, undef, -1],
         "ssh $conf{sync_host} shift-mgr --sync");
     my ($out, $in) = ($fhpid->[0], $fhpid->[1]);
 
     my $rc0 = sync_return($in);
 
-    if ($file && ! -e "$conf{user_dir}/$file") {
-        $out->write("#" . escape($file) . " -1\n### 200\n");
-        sync_return($in);
-    } else {
-        my ($meta1, $meta2);
-        my @files;
-        if ($file) {
-            @files = ($file);
+    while (my $cmd = <SYNCQ>) {
+        if ($cmd =~ /\s-1$/) {
+            $out->write("#" . $cmd . "### 200\n");
+            sync_return($in);
         } else {
-            @files = glob "$opts{base}/*";
-            @files = map {s/^$conf{user_dir}\///; $_} @files;
-            my $mfile = "$opts{base}/meta";
-            $meta1 = get_meta($mfile, 1);
-            $meta2 = get_meta($mfile, 2);
-        }
-        foreach $file (@files) {
-            my $base = basename($file);
-            # find is not log-structured so is rebuilt instead of sync'd
-            next if ($base eq 'find');
-            my $doing;
-            if ($base =~ /^doing_/ && $meta1 && $meta2) {
-                $doing = min($meta1->{$base}, $meta2->{$base});
+            $out->write("#" . $cmd);
+            if ($cmd =~ /(\S+)\s+(\d+)/) {
+                my $rc = sync_local_io($in, $out, $1, $2);
+                last if (ref $rc);
             }
-            # retry on failure
-            foreach (1 .. $conf{default_retry}) {
-                my @stat = stat "$conf{user_dir}/$file";
-                $out->write("#" . escape($file) . " $stat[7] $stat[2] $doing\n");
-                my $rc = sync_local_io($in, $out, $file, $stat[7]);
-                last if (!ref $rc);
-            }
+            # if this condition does not hold, sync queue is corrupt
         }
     }
+    close SYNCQ;
+
     $out->write("#exit\n") if (!ref $rc0);
     open3_wait($fhpid);
+    unlink "${sbase}_$$";
 }
 
 #######################
@@ -3416,6 +3729,51 @@ sub sync_local_io {
         $rc = sync_return($in);
     }
     return $rc;
+}
+
+####################
+#### sync_queue ####
+####################
+# place given file or metadata of current transfer on sync queue
+sub sync_queue {
+    my $file = shift;
+    # lock sync queue
+    open($ulockfh, '>', "$conf{user_dir}/$opts{user}.lock");
+    flock($ulockfh, LOCK_EX);
+    open(SYNCQ, '>>', "$conf{user_dir}/$opts{user}.sync");
+    if ($file && ! -e "$conf{user_dir}/$file") {
+        print SYNCQ escape($file) . " -1\n";
+    } else {
+        my ($meta1, $meta2);
+        my @files;
+        if ($file) {
+            @files = ($file);
+        } else {
+            @files = glob "$opts{base}/*";
+            @files = map {s/^$conf{user_dir}\///; $_} @files;
+            my $mfile = "$opts{base}/meta";
+            $meta1 = get_meta($mfile, 1);
+            $meta2 = get_meta($mfile, 2);
+        }
+        foreach $file (@files) {
+            my $base = basename($file);
+            # find is not log-structured so is rebuilt instead of sync'd
+            next if ($base eq 'find');
+            my $doing;
+            if ($meta1 && $meta2) {
+                $doing = min($meta1->{$base}, $meta2->{$base})
+                    if ($base =~ /^doing_/);
+                # don't sync if size hasn't changed
+                $base .= "_size";
+                next if (defined $meta1->{$base} &&
+                        $meta1->{$base} == $meta2->{$base});
+            }
+            my @stat = stat "$conf{user_dir}/$file";
+            print SYNCQ escape($file) . " $stat[7] $stat[2] $doing\n";
+        }
+    }
+    close SYNCQ;
+    close $ulockfh;
 }
 
 #####################
@@ -3503,6 +3861,7 @@ sub sync_remote_io {
         $rc = sync_return($in);
         if (ref $rc) {
             $fh->close;
+            $out->write("### 500 $rc->{error}\n");
             return $rc;
         }
         my $buf;
@@ -3560,20 +3919,26 @@ sub throttle {
     my $sleep = 0;
 
     # disk throttling
-    foreach my $fs (grep(/^disk_/, keys %cli_load)) {
-        if (defined $meta{$fs} && $cli_load{$fs} <= $meta{$fs}) {
+    foreach my $used (grep(/^used_/, keys %cli_load)) {
+        my $disk = $used;
+        $disk =~ s/^used/disk/;
+        my $left = $used;
+        $left =~ s/^used/left/;
+        my $pct = 100 * $cli_load{$used} / ($cli_load{$used} + $cli_load{$left});
+        if (defined $meta{$disk} && $pct <= $meta{$disk}) {
             # load has become less than lower threshold
-            delete $meta{$fs};
-        } elsif (defined $meta{$fs}) {
+            delete $meta{$disk};
+        } elsif (defined $meta{$disk}) {
             # load still higher than lower threshold
             $sleep = 300;
         }
-        foreach my $hl ($meta{disk}, $conf{"throttle_$fs"}) {
+        # note that {disk} is intentionally not {$disk}
+        foreach my $hl ($meta{disk}, $conf{"throttle_$disk"}) {
             next if ($hl !~ /^(\d+):(\d+)$/);
             my ($high, $low) = split(/:/, $hl);
-            if ($cli_load{$fs} >= $high) {
+            if ($pct >= $high) {
                 # load has become higher than upper threshold
-                $meta{$fs} = $low;
+                $meta{$disk} = $low;
                 $sleep = 300;
             }
         }
@@ -3802,7 +4167,7 @@ BEGIN {
 my %fatpacked;
 
 $fatpacked{"IPC/Open3.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'IPC_OPEN3';
-  package IPC::Open3;use strict;no strict 'refs';our ($VERSION,@ISA,@EXPORT);require Exporter;use Carp;use Symbol qw(gensym qualify);$VERSION='1.18';@ISA=qw(Exporter);@EXPORT=qw(open3);our$Me='open3 (bug)';sub xpipe {pipe $_[0],$_[1]or croak "$Me: pipe($_[0], $_[1]) failed: $!"}sub xopen {open $_[0],$_[1],@_[2..$#_]and return;local $"=', ';carp "$Me: open(@_) failed: $!"}sub xclose {$_[0]=~ /\A=?(\d+)\z/ ? do {my$fh;open($fh,$_[1].'&=' .$1)and close($fh)}: close $_[0]or croak "$Me: close($_[0]) failed: $!"}sub xfileno {return $1 if $_[0]=~ /\A=?(\d+)\z/;return fileno $_[0]}use constant FORCE_DEBUG_SPAWN=>0;use constant DO_SPAWN=>$^O eq 'os2' || $^O eq 'MSWin32' || FORCE_DEBUG_SPAWN;sub _open3 {local$Me=shift;splice @_,0,1,undef if \$_[0]==\undef;splice @_,1,1,undef if \$_[1]==\undef;unless (eval {$_[0]=gensym unless defined $_[0]&& length $_[0];$_[1]=gensym unless defined $_[1]&& length $_[1];1}){$@ =~ s/(?<=value attempted) at .*//s;croak "$Me: $@"}my@handles=({mode=>'<',handle=>\*STDIN },{mode=>'>',handle=>\*STDOUT },{mode=>'>',handle=>\*STDERR },);for (@handles){$_->{parent}=shift;$_->{open_as}=gensym}if (@_ > 1 and $_[0]eq '-'){croak "Arguments don't make sense when the command is '-'"}$handles[2]{parent}||=$handles[1]{parent};$handles[2]{dup_of_out}=$handles[1]{parent}eq $handles[2]{parent};my$package;for (@handles){$_->{dup}=($_->{parent}=~ s/^[<>]&//);if ($_->{parent}!~ /\A=?(\d+)\z/){$package //= caller 1;$_->{parent}=qualify $_->{parent},$package}next if $_->{dup}or $_->{dup_of_out};if ($_->{mode}eq '<'){xpipe $_->{open_as},$_->{parent}}else {xpipe $_->{parent},$_->{open_as}}}my$kidpid;if (!DO_SPAWN){xpipe my$stat_r,my$stat_w;$kidpid=fork;croak "$Me: fork failed: $!" unless defined$kidpid;if ($kidpid==0){eval {untie*STDIN;untie*STDOUT;untie*STDERR;close$stat_r;require Fcntl;my$flags=fcntl$stat_w,&Fcntl::F_GETFD,0;croak "$Me: fcntl failed: $!" unless$flags;fcntl$stat_w,&Fcntl::F_SETFD,$flags|&Fcntl::FD_CLOEXEC or croak "$Me: fcntl failed: $!";if (!$handles[2]{dup_of_out}&& $handles[2]{dup}&& xfileno($handles[2]{parent})==fileno \*STDOUT){my$tmp=gensym;xopen($tmp,'>&',$handles[2]{parent});$handles[2]{parent}=$tmp}for (@handles){if ($_->{dup_of_out}){xopen \*STDERR,">&STDOUT" if defined fileno STDERR && fileno STDERR!=fileno STDOUT}elsif ($_->{dup}){xopen $_->{handle},$_->{mode}.'&',$_->{parent}if fileno $_->{handle}!=xfileno($_->{parent})}else {xclose $_->{parent},$_->{mode};xopen $_->{handle},$_->{mode}.'&=',fileno $_->{open_as}}}return 1 if ($_[0]eq '-');exec @_ or do {local($")=(" ");croak "$Me: exec of @_ failed"}}and do {close$stat_w;return 0};my$bang=0+$!;my$err=$@;utf8::encode$err if $] >= 5.008;print$stat_w pack('IIa*',$bang,length($err),$err);close$stat_w;eval {require POSIX;POSIX::_exit(255)};exit 255}else {close$stat_w;my$to_read=length(pack('I',0))* 2;my$bytes_read=read($stat_r,my$buf='',$to_read);if ($bytes_read){(my$bang,$to_read)=unpack('II',$buf);read($stat_r,my$err='',$to_read);waitpid$kidpid,0;if ($err){utf8::decode$err if $] >= 5.008}else {$err="$Me: " .($!=$bang)}$!=$bang;die($err)}}}else {my@close;for (@handles){if ($_->{dup_of_out}){$_->{open_as}=$handles[1]{open_as}}elsif ($_->{dup}){$_->{open_as}=$_->{parent}=~ /\A[0-9]+\z/ ? $_->{parent}: \*{$_->{parent}};push@close,$_->{open_as}}else {push@close,\*{$_->{parent}},$_->{open_as}}}require IO::Pipe;$kidpid=eval {spawn_with_handles(\@handles,\@close,@_)};die "$Me: $@" if $@}for (@handles){next if $_->{dup}or $_->{dup_of_out};xclose $_->{open_as},$_->{mode}}xclose$handles[0]{parent},$handles[0]{mode}if$handles[0]{dup};select((select($handles[0]{parent}),$|=1)[0]);$kidpid}sub open3 {if (@_ < 4){local $"=', ';croak "open3(@_): not enough arguments"}return _open3 'open3',@_}sub spawn_with_handles {my$fds=shift;my$close_in_child=shift;my ($fd,%saved,@errs);for$fd (@$fds){$fd->{tmp_copy}=IO::Handle->new_from_fd($fd->{handle},$fd->{mode});$saved{fileno$fd->{handle}}=$fd->{tmp_copy}if$fd->{tmp_copy}}for$fd (@$fds){bless$fd->{handle},'IO::Handle' unless eval {$fd->{handle}->isa('IO::Handle')};my$open_as=$fd->{open_as};my$fileno=fileno($open_as);$fd->{handle}->fdopen(defined($fileno)? $saved{$fileno}|| $open_as : $open_as,$fd->{mode})}unless ($^O eq 'MSWin32'){require Fcntl;for$fd (@$close_in_child){next unless fileno$fd;fcntl($fd,Fcntl::F_SETFD(),1)or push@errs,"fcntl $fd: $!" unless$saved{fileno$fd}}}my$pid;unless (@errs){if (FORCE_DEBUG_SPAWN){pipe my$r,my$w or die "Pipe failed: $!";$pid=fork;die "Fork failed: $!" unless defined$pid;if (!$pid){{no warnings;exec @_}print$w 0 + $!;close$w;require POSIX;POSIX::_exit(255)}close$w;my$bad=<$r>;if (defined$bad){$!=$bad;undef$pid}}else {$pid=eval {system 1,@_}}push@errs,"IO::Pipe: Can't spawn-NOWAIT: $!" if!$pid || $pid < 0}for$fd (reverse @$fds){$fd->{handle}->fdopen($fd->{tmp_copy},$fd->{mode})}for (values%saved){$_->close or croak "Can't close: $!"}croak join "\n",@errs if@errs;return$pid}1;
+  package IPC::Open3;use strict;no strict 'refs';our ($VERSION,@ISA,@EXPORT);require Exporter;use Carp;use Symbol qw(gensym qualify);$VERSION='1.18';@ISA=qw(Exporter);@EXPORT=qw(open3);our$Me='open3 (bug)';sub xpipe {pipe $_[0],$_[1]or croak "$Me: pipe($_[0], $_[1]) failed: $!"}sub xopen {open $_[0],$_[1],@_[2..$#_]and return;local $"=', ';carp "$Me: open(@_) failed: $!"}sub xclose {$_[0]=~ /\A=?(\d+)\z/ ? do {my$fh;open($fh,$_[1].'&=' .$1)and close($fh)}: close $_[0]or croak "$Me: close($_[0]) failed: $!"}sub xfileno {return $1 if $_[0]=~ /\A=?(\d+)\z/;return fileno $_[0]}use constant FORCE_DEBUG_SPAWN=>0;use constant DO_SPAWN=>$^O eq 'os2' || $^O eq 'MSWin32' || FORCE_DEBUG_SPAWN;sub _open3 {local$Me=shift;splice @_,0,1,undef if \$_[0]==\undef;splice @_,1,1,undef if \$_[1]==\undef;unless (eval {$_[0]=gensym unless defined $_[0]&& length $_[0];$_[1]=gensym unless defined $_[1]&& length $_[1];1}){$@ =~ s/(?<=value attempted) at .*//s;croak "$Me: $@"}my@handles=({mode=>'<',handle=>\*STDIN },{mode=>'>',handle=>\*STDOUT },{mode=>'>',handle=>\*STDERR },);for (@handles){$_->{parent}=shift;$_->{open_as}=gensym}if (@_ > 1 and $_[0]eq '-'){croak "Arguments don't make sense when the command is '-'"}$handles[2]{parent}||=$handles[1]{parent};$handles[2]{dup_of_out}=$handles[1]{parent}eq $handles[2]{parent};my$package;for (@handles){$_->{dup}=($_->{parent}=~ s/^[<>]&//);if ($_->{parent}!~ /\A=?(\d+)\z/){$package=caller 1 if (!defined$package);$_->{parent}=qualify $_->{parent},$package}next if $_->{dup}or $_->{dup_of_out};if ($_->{mode}eq '<'){xpipe $_->{open_as},$_->{parent}}else {xpipe $_->{parent},$_->{open_as}}}my$kidpid;if (!DO_SPAWN){xpipe my$stat_r,my$stat_w;$kidpid=fork;croak "$Me: fork failed: $!" unless defined$kidpid;if ($kidpid==0){eval {untie*STDIN;untie*STDOUT;untie*STDERR;close$stat_r;require Fcntl;my$flags=fcntl$stat_w,&Fcntl::F_GETFD,0;croak "$Me: fcntl failed: $!" unless$flags;fcntl$stat_w,&Fcntl::F_SETFD,$flags|&Fcntl::FD_CLOEXEC or croak "$Me: fcntl failed: $!";if (!$handles[2]{dup_of_out}&& $handles[2]{dup}&& xfileno($handles[2]{parent})==fileno \*STDOUT){my$tmp=gensym;xopen($tmp,'>&',$handles[2]{parent});$handles[2]{parent}=$tmp}for (@handles){if ($_->{dup_of_out}){xopen \*STDERR,">&STDOUT" if defined fileno STDERR && fileno STDERR!=fileno STDOUT}elsif ($_->{dup}){xopen $_->{handle},$_->{mode}.'&',$_->{parent}if fileno $_->{handle}!=xfileno($_->{parent})}else {xclose $_->{parent},$_->{mode};xopen $_->{handle},$_->{mode}.'&=',fileno $_->{open_as}}}return 1 if ($_[0]eq '-');exec @_ or do {local($")=(" ");croak "$Me: exec of @_ failed"}}and do {close$stat_w;return 0};my$bang=0+$!;my$err=$@;utf8::encode$err if $] >= 5.008;print$stat_w pack('IIa*',$bang,length($err),$err);close$stat_w;eval {require POSIX;POSIX::_exit(255)};exit 255}else {close$stat_w;my$to_read=length(pack('I',0))* 2;my$bytes_read=read($stat_r,my$buf='',$to_read);if ($bytes_read){(my$bang,$to_read)=unpack('II',$buf);read($stat_r,my$err='',$to_read);waitpid$kidpid,0;if ($err){utf8::decode$err if $] >= 5.008}else {$err="$Me: " .($!=$bang)}$!=$bang;die($err)}}}else {my@close;for (@handles){if ($_->{dup_of_out}){$_->{open_as}=$handles[1]{open_as}}elsif ($_->{dup}){$_->{open_as}=$_->{parent}=~ /\A[0-9]+\z/ ? $_->{parent}: \*{$_->{parent}};push@close,$_->{open_as}}else {push@close,\*{$_->{parent}},$_->{open_as}}}require IO::Pipe;$kidpid=eval {spawn_with_handles(\@handles,\@close,@_)};die "$Me: $@" if $@}for (@handles){next if $_->{dup}or $_->{dup_of_out};xclose $_->{open_as},$_->{mode}}xclose$handles[0]{parent},$handles[0]{mode}if$handles[0]{dup};select((select($handles[0]{parent}),$|=1)[0]);$kidpid}sub open3 {if (@_ < 4){local $"=', ';croak "open3(@_): not enough arguments"}return _open3 'open3',@_}sub spawn_with_handles {my$fds=shift;my$close_in_child=shift;my ($fd,%saved,@errs);for$fd (@$fds){$fd->{tmp_copy}=IO::Handle->new_from_fd($fd->{handle},$fd->{mode});$saved{fileno$fd->{handle}}=$fd->{tmp_copy}if$fd->{tmp_copy}}for$fd (@$fds){bless$fd->{handle},'IO::Handle' unless eval {$fd->{handle}->isa('IO::Handle')};my$open_as=$fd->{open_as};my$fileno=fileno($open_as);$fd->{handle}->fdopen(defined($fileno)? $saved{$fileno}|| $open_as : $open_as,$fd->{mode})}unless ($^O eq 'MSWin32'){require Fcntl;for$fd (@$close_in_child){next unless fileno$fd;fcntl($fd,Fcntl::F_SETFD(),1)or push@errs,"fcntl $fd: $!" unless$saved{fileno$fd}}}my$pid;unless (@errs){if (FORCE_DEBUG_SPAWN){pipe my$r,my$w or die "Pipe failed: $!";$pid=fork;die "Fork failed: $!" unless defined$pid;if (!$pid){{no warnings;exec @_}print$w 0 + $!;close$w;require POSIX;POSIX::_exit(255)}close$w;my$bad=<$r>;if (defined$bad){$!=$bad;undef$pid}}else {$pid=eval {system 1,@_}}push@errs,"IO::Pipe: Can't spawn-NOWAIT: $!" if!$pid || $pid < 0}for$fd (reverse @$fds){$fd->{handle}->fdopen($fd->{tmp_copy},$fd->{mode})}for (values%saved){$_->close or croak "Can't close: $!"}croak join "\n",@errs if@errs;return$pid}1;
 IPC_OPEN3
 
 $fatpacked{"Mail/Sendmail.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'MAIL_SENDMAIL';
@@ -3810,7 +4175,7 @@ $fatpacked{"Mail/Sendmail.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'M
 MAIL_SENDMAIL
 
 $fatpacked{"Text/FormatTable.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'TEXT_FORMATTABLE';
-  package Text::FormatTable;use Carp;use strict;use warnings;use vars qw($VERSION);$VERSION='1.03';sub _uncolorized_length($) {my$str=shift;$str =~ s/\e \[ [^m]* m//xmsg;return length$str}sub _min_width($) {my$str=shift;my$min;for my$s (split(/\s+/,$str)){my$l=_uncolorized_length$s;$min=$l if not defined$min or $l > $min}return$min ? $min : 1}sub _max_width($) {my$str=shift;my$len=_uncolorized_length$str;return$len ? $len : 1}sub _max($$) {my ($a,$b)=@_;return$a if defined$a and (not defined$b or $a >= $b);return$b}sub _wrap($$) {my ($width,$text)=@_;my@lines=split(/\n/,$text);my@w=();for my$l (@lines){push@w,@{_wrap_line($width,$l)}}return \@w}sub _wrap_line($$) {my ($width,$text)=@_;my$width_m1=$width-1;my@t=($text);while(1){my$t=pop@t;my$l=_uncolorized_length$t;if($l <= $width){push@t,$t;return \@t}elsif($t =~ /^(.{0,$width_m1}\S)\s+(\S.*?)$/){push@t,$1;push@t,$2}elsif($t =~ /(.{$width,}?\S)\s+(\S.*?)$/){if (_uncolorized_length $1 > $width_m1){my$left=substr($1,0,$width);my$right=substr($1,$width);push@t,$left;push@t,$right;push@t,$2}else {push@t,$1;push@t,$2}}else {my$left=substr($t,0,$width);my$right=substr($t,$width);push@t,$left;push@t,$right;return \@t}}return \@t}sub _l_box($$) {my ($width,$text)=@_;my$lines=_wrap($width,$text);map {$_ .= ' 'x($width-_uncolorized_length($_))}@$lines;return$lines}sub _r_box($$) {my ($width,$text)=@_;my$lines=_wrap($width,$text);map {$_=(' 'x($width-_uncolorized_length($_)).$_)}@$lines;return$lines}sub _distribution_f($) {my$max_width=shift;return log($max_width)}sub _calculate_widths($$) {my ($self,$width)=@_;my@widths=();for my$r (@{$self->{data}}){$r->[0]eq 'data' or $r->[0]eq 'head' or next;my$cn=0;my ($max,$min)=(0,0);for my$c (@{$r->[1]}){if ($self->{fixed_widths}[$cn]){$widths[$cn][0]=$self->{fixed_widths}[$cn];$widths[$cn][1]=$self->{fixed_widths}[$cn]}else {$widths[$cn][0]=_max($widths[$cn][0],_min_width$c);$widths[$cn][1]=_max($widths[$cn][1],_max_width$c)}$cn++}}my ($total_min,$total_max)=(0,0);for my$c (@widths){$total_min += $c->[0];$total_max += $c->[1]}my$extra_width += scalar grep {$_->[0]eq '|' or $_->[0]eq ' '}(@{$self->{format}});$total_min += $extra_width;$total_max += $extra_width;if($total_max <= $width){my$cn=0;for my$c (@widths){$self->{widths}[$cn]=$c->[1];$cn++}$self->{total_width}=$total_max}else {my@dist_width;ITERATION: while(1){my$total_f=0.0;my$fixed_width=0;my$remaining=0;for my$c (@widths){if(defined$c->[2]){$fixed_width += $c->[2]}else {$total_f += _distribution_f($c->[1]);$remaining++}}my$available_width=$width-$extra_width-$fixed_width;if($available_width < $remaining*5){$available_width=$remaining*5;$width=$extra_width+$fixed_width+$available_width}my$cn=-1;COLUMN: for my$c (@widths){$cn++;next COLUMN if defined$c->[2];my$w=_distribution_f($c->[1])* $available_width / $total_f;if($c->[0]> $w){$c->[2]=$c->[0];next ITERATION}if($c->[1]< $w){$c->[2]=$c->[1];next ITERATION}$dist_width[$cn]=int($w)}last}my$cn=0;for my$c (@widths){$self->{widths}[$cn]=defined$c->[2]? $c->[2]: $dist_width[$cn];$cn++}}}sub _render_rule($$) {my ($self,$char)=@_;my$out='';my ($col,$data_col)=(0,0);for my$c (@{$self->{format}}){if($c->[0]eq '|'){if ($char eq '-'){$out .= '+'}elsif($char eq ' '){$out .= '|'}else {$out .= $char}}elsif($c->[0]eq ' '){$out .= $char}elsif($c->[0]eq 'l' or $c->[0]eq 'L' or $c->[0]eq 'r' or $c->[0]eq 'R'){$out .= ($char)x($self->{widths}[$data_col]);$data_col++}$col++}return$out."\n"}sub _render_data($$) {my ($self,$data)=@_;my@rdata;my ($col,$data_col)=(0,0);my$lines=0;my@rows_in_column;for my$c (@{$self->{format}}){if(($c->[0]eq 'l')or ($c->[0]eq 'L')){my$lb=_l_box($self->{widths}[$data_col],$data->[$data_col]);$rdata[$data_col]=$lb;my$l=scalar @$lb ;$lines=$l if$lines < $l;$rows_in_column[$data_col]=$l;$data_col++}elsif(($c->[0]eq 'r')or ($c->[0]eq 'R')){my$rb=_r_box($self->{widths}[$data_col],$data->[$data_col]);$rdata[$data_col]=$rb;my$l=scalar @$rb ;$lines=$l if$lines < $l;$rows_in_column[$data_col]=$l ;$data_col++}$col++}my$out='';for my$l (0..($lines-1)){my ($col,$data_col)=(0,0);for my$c (@{$self->{format}}){if($c->[0]eq '|'){$out .= '|'}elsif($c->[0]eq ' '){$out .= ' '}elsif($c->[0]eq 'L' or $c->[0]eq 'R'){my$start_print=$lines - $rows_in_column[$data_col];if (defined$rdata[$data_col][$l-$start_print]and $l >= $start_print){$out .= $rdata[$data_col][$l-$start_print]}else {$out .= ' 'x($self->{widths}[$data_col])}$data_col++}elsif($c->[0]eq 'l' or $c->[0]eq 'r'){if(defined$rdata[$data_col][$l]){$out .= $rdata[$data_col][$l]}else {$out .= ' 'x($self->{widths}[$data_col])}$data_col++}$col++}$out .= "\n"}return$out}sub _parse_format($$) {my ($self,$format)=@_;my@f=split(//,$format);my@format=();my@width=();my ($col,$data_col)=(0,0);my$wid;for my$f (@f){if ($f =~ /(\d+)/){$wid .= $f;next}if($f eq 'l' or $f eq 'L' or $f eq 'r' or $f eq 'R'){$format[$col]=[$f,$data_col];$width[$data_col]=$wid;$wid=undef;$data_col++}elsif($f eq '|' or $f eq ' '){$format[$col]=[$f]}else {croak "unknown column format: $f"}$col++}$self->{format}=\@format;$self->{fixed_widths}=\@width;$self->{col}=$col;$self->{data_col}=$data_col}sub new($$) {my ($class,$format)=@_;croak "new() requires one argument: format" unless defined$format;my$self={col=>'0',row=>'0',data=>[]};bless$self,$class;$self->_parse_format($format);return$self}sub _preprocess_row_data($$) {my ($self,$data)=@_;my$cn=0;for my$c (0..($#$data)){$data->[$c]=~ s/^\s+//m;$data->[$c]=~ s/\s+$//m}}sub head($@) {my ($self,@data)=@_;scalar@data==$self->{data_col}or croak "number of columns must be $self->{data_col}";$self->_preprocess_row_data(\@data);$self->{data}[$self->{row}++]=['head',\@data]}sub row($@) {my ($self,@data)=@_;scalar@data==$self->{data_col}or croak "number of columns must be $self->{data_col}";@data=map {defined $_ ? $_ : ""}@data;$self->_preprocess_row_data(\@data);$self->{data}[$self->{row}++]=['data',\@data]}sub rule($$) {my ($self,$char)=@_;$char='-' unless defined$char;$self->{data}[$self->{row}++]=['rule',$char]}sub render($$) {my ($self,$width)=@_;$width=79 unless defined$width;$self->_calculate_widths($width);my$out='';for my$r (@{$self->{data}}){if($r->[0]eq 'rule'){$out .= $self->_render_rule($r->[1])}elsif($r->[0]eq 'head'){$out .= $self->_render_data($r->[1])}elsif($r->[0]eq 'data'){$out .= $self->_render_data($r->[1])}}return$out}1;
+  package Text::FormatTable;use Carp;use strict;use warnings;use vars qw($VERSION);$VERSION='1.03';sub _uncolorized_length($) {my$str=shift;$str =~ s/\e \[ [^m]* m//xmsg;return length$str}sub _min_width($) {my$str=shift;my$min;for my$s (split(/\s+/,$str)){my$l=_uncolorized_length$s;$min=$l if not defined$min or $l > $min}return$min ? $min : 1}sub _max_width($) {my$str=shift;my$len=_uncolorized_length$str;return$len ? $len : 1}sub _max($$) {my ($a,$b)=@_;return$a if defined$a and (not defined$b or $a >= $b);return$b}sub _wrap($$) {my ($width,$text)=@_;my@lines=split(/\n/,$text);my@w=();for my$l (@lines){push@w,@{_wrap_line($width,$l)}}return \@w}sub _wrap_line($$) {my ($width,$text)=@_;my$width_m1=$width-1;my@t=($text);while(1){my$t=pop@t;my$l=_uncolorized_length$t;if($l <= $width){push@t,$t;return \@t}elsif($width_m1 < 32766 && $t =~ /^(.{0,$width_m1}\S)\s+(\S.*?)$/){push@t,$1;push@t,$2}elsif($width_m1 < 32766 && $t =~ /(.{$width,}?\S)\s+(\S.*?)$/){if (_uncolorized_length $1 > $width_m1){my$left=substr($1,0,$width);my$right=substr($1,$width);push@t,$left;push@t,$right;push@t,$2}else {push@t,$1;push@t,$2}}else {my$left=substr($t,0,$width);my$right=substr($t,$width);push@t,$left;push@t,$right;return \@t}}return \@t}sub _l_box($$) {my ($width,$text)=@_;my$lines=_wrap($width,$text);map {$_ .= ' 'x($width-_uncolorized_length($_))}@$lines;return$lines}sub _r_box($$) {my ($width,$text)=@_;my$lines=_wrap($width,$text);map {$_=(' 'x($width-_uncolorized_length($_)).$_)}@$lines;return$lines}sub _distribution_f($) {my$max_width=shift;return log($max_width)}sub _calculate_widths($$) {my ($self,$width)=@_;my@widths=();for my$r (@{$self->{data}}){$r->[0]eq 'data' or $r->[0]eq 'head' or next;my$cn=0;my ($max,$min)=(0,0);for my$c (@{$r->[1]}){if ($self->{fixed_widths}[$cn]){$widths[$cn][0]=$self->{fixed_widths}[$cn];$widths[$cn][1]=$self->{fixed_widths}[$cn]}else {$widths[$cn][0]=_max($widths[$cn][0],_min_width$c);$widths[$cn][1]=_max($widths[$cn][1],_max_width$c)}$cn++}}my ($total_min,$total_max)=(0,0);for my$c (@widths){$total_min += $c->[0];$total_max += $c->[1]}my$extra_width += scalar grep {$_->[0]eq '|' or $_->[0]eq ' '}(@{$self->{format}});$total_min += $extra_width;$total_max += $extra_width;if($total_max <= $width){my$cn=0;for my$c (@widths){$self->{widths}[$cn]=$c->[1];$cn++}$self->{total_width}=$total_max}else {my@dist_width;ITERATION: while(1){my$total_f=0.0;my$fixed_width=0;my$remaining=0;for my$c (@widths){if(defined$c->[2]){$fixed_width += $c->[2]}else {$total_f += _distribution_f($c->[1]);$remaining++}}my$available_width=$width-$extra_width-$fixed_width;if($available_width < $remaining*5){$available_width=$remaining*5;$width=$extra_width+$fixed_width+$available_width}my$cn=-1;COLUMN: for my$c (@widths){$cn++;next COLUMN if defined$c->[2];my$w=_distribution_f($c->[1])* $available_width / $total_f;if($c->[0]> $w){$c->[2]=$c->[0];next ITERATION}if($c->[1]< $w){$c->[2]=$c->[1];next ITERATION}$dist_width[$cn]=int($w)}last}my$cn=0;for my$c (@widths){$self->{widths}[$cn]=defined$c->[2]? $c->[2]: $dist_width[$cn];$cn++}}}sub _render_rule($$) {my ($self,$char)=@_;my$out='';my ($col,$data_col)=(0,0);for my$c (@{$self->{format}}){if($c->[0]eq '|'){if ($char eq '-'){$out .= '+'}elsif($char eq ' '){$out .= '|'}else {$out .= $char}}elsif($c->[0]eq ' '){$out .= $char}elsif($c->[0]eq 'l' or $c->[0]eq 'L' or $c->[0]eq 'r' or $c->[0]eq 'R'){$out .= ($char)x($self->{widths}[$data_col]);$data_col++}$col++}return$out."\n"}sub _render_data($$) {my ($self,$data)=@_;my@rdata;my ($col,$data_col)=(0,0);my$lines=0;my@rows_in_column;for my$c (@{$self->{format}}){if(($c->[0]eq 'l')or ($c->[0]eq 'L')){my$lb=_l_box($self->{widths}[$data_col],$data->[$data_col]);$rdata[$data_col]=$lb;my$l=scalar @$lb ;$lines=$l if$lines < $l;$rows_in_column[$data_col]=$l;$data_col++}elsif(($c->[0]eq 'r')or ($c->[0]eq 'R')){my$rb=_r_box($self->{widths}[$data_col],$data->[$data_col]);$rdata[$data_col]=$rb;my$l=scalar @$rb ;$lines=$l if$lines < $l;$rows_in_column[$data_col]=$l ;$data_col++}$col++}my$out='';for my$l (0..($lines-1)){my ($col,$data_col)=(0,0);for my$c (@{$self->{format}}){if($c->[0]eq '|'){$out .= '|'}elsif($c->[0]eq ' '){$out .= ' '}elsif($c->[0]eq 'L' or $c->[0]eq 'R'){my$start_print=$lines - $rows_in_column[$data_col];if (defined$rdata[$data_col][$l-$start_print]and $l >= $start_print){$out .= $rdata[$data_col][$l-$start_print]}else {$out .= ' 'x($self->{widths}[$data_col])}$data_col++}elsif($c->[0]eq 'l' or $c->[0]eq 'r'){if(defined$rdata[$data_col][$l]){$out .= $rdata[$data_col][$l]}else {$out .= ' 'x($self->{widths}[$data_col])}$data_col++}$col++}$out .= "\n"}return$out}sub _parse_format($$) {my ($self,$format)=@_;my@f=split(//,$format);my@format=();my@width=();my ($col,$data_col)=(0,0);my$wid;for my$f (@f){if ($f =~ /(\d+)/){$wid .= $f;next}if($f eq 'l' or $f eq 'L' or $f eq 'r' or $f eq 'R'){$format[$col]=[$f,$data_col];$width[$data_col]=$wid;$wid=undef;$data_col++}elsif($f eq '|' or $f eq ' '){$format[$col]=[$f]}else {croak "unknown column format: $f"}$col++}$self->{format}=\@format;$self->{fixed_widths}=\@width;$self->{col}=$col;$self->{data_col}=$data_col}sub new($$) {my ($class,$format)=@_;croak "new() requires one argument: format" unless defined$format;my$self={col=>'0',row=>'0',data=>[]};bless$self,$class;$self->_parse_format($format);return$self}sub _preprocess_row_data($$) {my ($self,$data)=@_;my$cn=0;for my$c (0..($#$data)){$data->[$c]=~ s/^\s+//m;$data->[$c]=~ s/\s+$//m}}sub head($@) {my ($self,@data)=@_;scalar@data==$self->{data_col}or croak "number of columns must be $self->{data_col}";$self->_preprocess_row_data(\@data);$self->{data}[$self->{row}++]=['head',\@data]}sub row($@) {my ($self,@data)=@_;scalar@data==$self->{data_col}or croak "number of columns must be $self->{data_col}";@data=map {defined $_ ? $_ : ""}@data;$self->_preprocess_row_data(\@data);$self->{data}[$self->{row}++]=['data',\@data]}sub rule($$) {my ($self,$char)=@_;$char='-' unless defined$char;$self->{data}[$self->{row}++]=['rule',$char]}sub render($$) {my ($self,$width)=@_;$width=79 unless defined$width;$self->_calculate_widths($width);my$out='';for my$r (@{$self->{data}}){if($r->[0]eq 'rule'){$out .= $self->_render_rule($r->[1])}elsif($r->[0]eq 'head'){$out .= $self->_render_data($r->[1])}elsif($r->[0]eq 'data'){$out .= $self->_render_data($r->[1])}}return$out}1;
 TEXT_FORMATTABLE
 
 s/^  //mg for values %fatpacked;

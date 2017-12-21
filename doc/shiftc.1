@@ -1,4 +1,4 @@
-.TH "shiftc" "1" "02 Dec 2015" "" ""
+.TH "shiftc" "1" "21 Dec 2017" "" ""
 ./"################################################################
 .SH "NAME"
 ./"################################################################
@@ -108,6 +108,7 @@ given in following sections.
 \-\-no\-mail            do not send status emails
 \-\-no\-offline         do not migrate DMF\-managed files after transfer
 \-\-no\-preserve        do not preserve times, mode, owner, acls, or xattrs
+\-\-no\-recall          do not recall DMF\-managed files before transfer
 \-\-no\-verify          do not verify/rectify integrity of destination files
 .PP
 \fBMonitoring/management options:\fP
@@ -116,12 +117,18 @@ given in following sections.
 \-\-mgr=HOST           set host of shift manager to HOST
 \-\-mgr\-identity=FILE  access manager host with ssh identity in FILE
 \-\-mgr\-user=USER      access manager host as USER
+\-\-plot[=[BY:]LIST]   plot detailed performance when piped to gnuplot
+                       (BY one of {host,id,user})
+                       (LIST subset of {chattr,cksum,cp,find,io,ln,meta,
+                                        mkdir,sum})
+ 
 \-\-restart            restart transfer with given \-\-id
 \-\-search=REGEX       show only status/history matching REGEX
 \-\-state=STATE        show status of only those operations in STATE
                        (STATE one of {done,error,none,queue,run,warn})
 \-\-stats              show stats across all transfers
-\-\-status[={csv,pad}] show brief status of all transfers
+\-\-status[=FORMAT]    show brief status of all transfers
+                       (FORMAT one of {color,csv,pad})
 \-\-stop               stop transfer with given \-\-id
                        or detailed status of transfer with given \-\-id
 .PP
@@ -147,7 +154,8 @@ given in following sections.
 \-\-split\-tar=SIZE     create tar files of around SIZE bytes
                        (use suffix {k,m,g,t} for {KB,MB,GB,TB}) [500g]
 \-\-streams=NUM        use NUM streams in remote transports [4]
-\-\-stripe=SIZE|NUM    use 1 stripe per SIZE bytes or NUM stripes
+\-\-stripe=[SIZE|NUM]  use 1 stripe per SIZE bytes or NUM stripes
+    [:[SIZE][:POOL]]   optionally use stripe size SIZE and/or pool POOL
                        (use suffix {k,m,g,t} for {KB,MB,GB,TB}) [1g]
 \-\-threads=NUM        use NUM threads in local transports [4]
 \-\-verify\-fast        verify faster but less safely by reusing src buffer
@@ -359,6 +367,12 @@ This option specifies that these items should not be preserved.  Note
 that permissions may be left in various states depending on the invoking
 user's umask and the transport utilized.  In particular, read access at
 the destination may be more permissive than read access at the source.
+.IP "\fB\-\-no\-recall\fP"
+By default, files transferred from DMF-managed file systems will be
+recalled from offline media as soon as the transfer begins and again
+before each batch of files is processed.  This option specifies that
+files should not be recalled.  Note that DMF will still recall files
+as needed even when this option is enabled.
 .IP "\fB\-\-no\-verify\fP"
 By default, files are checksummed at the source and destination to
 verify that they have not been corrupted and if corruption is detected,
@@ -400,6 +414,22 @@ specified, manager communication will be performed as the given user
 so that user must be authorized to run processes locally.  In
 particular, care should be taken on PBS-controlled nodes, where the
 given user should either own the node or be on the user exception list.
+.IP "\fB\-\-plot=[=[BY:]LIST]\fP"
+Produce output suitable for piping into gnuplot (version 5 or above) that shows
+detailed performance over time across all transfers.  The \fB\-\-id\fP and
+\fB\-\-state\fP options may be used to plot only a single transfer or transfers
+in a particular state, respectively.  The default plot will show the aggregate
+performance of each I/O operation (i.e. cp, sum, and cksum) and the aggregate
+performance of each metadata operation (i.e. find, mkdir, ln, and chattr).  I/O
+operations are plotted against the left y-axis while metadata operations are
+plotted against the right y-axis.  The list of plotted items may be changed by
+giving a comma-separated list consisting of one of more of {chattr, cksum, cp,
+find, io, ln, meta, mkdir, sum}.  Note that "io" is a shorthand for
+"cp,sum,cksum" and "meta" is a shorthand for "find,mkdir,ln,chattr".  The list
+of items may be grouped by any of {host, id, user} by prefixing one of these
+terms to the list.  For example, "--plot=id:cp" would show a curve for the copy
+performance of each tranfer id.  When a grouping is given without a specific
+list of metrics (e.g. "--plot=id"), "io" is assumed.
 .IP "\fB\-\-restart\fP"
 Restart the transfer associated with the given \fB\-\-id\fP that was
 stopped due to unrecoverable errors or stopped explicitly via
@@ -407,13 +437,14 @@ stopped due to unrecoverable errors or stopped explicitly via
 client host or one that has equivalent file system access.  A subset of
 the available command-line options may be respecified during a restart
 including \fB\-\-bandwidth\fP, \fB\-\-buffer\fP, \fB\-\-clients\fP,
-\fB\-\-cpu\fP, \fB\-\-disk\fP, \fB\-\-files\fP, \fB\-\-host-file\fP,
-\fB\-\-host-list\fP, \fB\-\-hosts\fP, \fB\-\-io\fP, \fB\-\-ior\fP,
+\fB\-\-cpu\fP, \fB\-\-disk\fP, \fB\-\-files\fP, \fB\-\-host\-file\fP,
+\fB\-\-host\-list\fP, \fB\-\-hosts\fP, \fB\-\-io\fP, \fB\-\-ior\fP,
 \fB\-\-iow\fP, \fB\-\-local\fP, \fB\-\-net\fP, \fB\-\-netr\fP,
 \fB\-\-netw\fP, \fB\-\-no\-cron\fP, \fB\-\-no\-mail\fP,
-\fB\-\-no\-offline\fP, \fB\-\-ports\fP, \fB\-\-preallocate\fP,
-\fB\-\-remote\fP, \fB\-\-retry\fP, \fB\-\-secure\fP, \fB\-\-size\fP,
-\fB\-\-streams\fP, \fB\-\-stripe\fP, \fB\-\-threads\fP, and \fB\-\-window\fP.
+\fB\-\-no\-offline\fP, \fB\-\-no\-recall\fP, \fB\-\-ports\fP,
+\fB\-\-preallocate\fP, \fB\-\-remote\fP, \fB\-\-retry\fP,
+\fB\-\-secure\fP, \fB\-\-size\fP, \fB\-\-streams\fP, \fB\-\-stripe\fP,
+\fB\-\-threads\fP, and \fB\-\-window\fP.
 .IP "\fB\-\-search=REGEX\fP"
 When \fB\-\-status\fP and \fB\-\-id\fP are specified, this option will
 show the full status of file operations in the associated transfer whose
@@ -435,7 +466,7 @@ will show a summary of the given transfer.
 .IP "\fB\-\-stats\fP"
 Show stats across all transfers including transfer counts, rates, tool
 usage, initialization options, error counts, and error messages.
-.IP "\fB\-\-status[={csv,pad}]\fP"
+.IP "\fB\-\-status[=FORMAT]\fP"
 Show a brief status of all transfers including the transfer identifier,
 the current state, the number of directories completed, the number of
 files transferred, the number of files checksummed, the number of
@@ -448,7 +479,9 @@ will be omitted for readability.  These omitted transfers can be shown
 using \fB\-\-status\fP with \fB\-\-state=done\fP.  Status will be
 returned in CSV format when \fB\-\-status=csv\fP is specified.  Duration
 and estimated time will be zero-padded when \fB\-\-status=pad\fP is
-specified.
+specified.  When \fB\-\-status=color\fP is specified, transfers in the
+{done, error, run, stop, throttle, warn} states will be shown with
+{default, red, green, cyan, magenta, yellow} coloring, respectively.
 .IP
 When \fB\-\-id\fP is specified, this option will show the full status of
 every file operation in the associated transfer.  For each operation,
@@ -459,7 +492,10 @@ the time processing started, and the rate of the operation.  Note that
 not all of these items will be applicable at all times (e.g. rate will
 be empty if the state is error).  Also note that operations are
 processed in batches so the rate shown for a single operation will
-depend on the other operations processed in the same batch.
+depend on the other operations processed in the same batch.  When
+\fB\-\-status=color\fP is specified, operations in the {done, error,
+queue, run, warn} states will be shown with {default, red, cyan,
+green, yellow} coloring, respectively.
 .IP "\fB\-\-stop\fP"
 Stop the transfer associated with the given \fB\-\-id\fP.  Note that
 transfer operations currently in progress will run to completion but new
@@ -575,7 +611,7 @@ streams to be set automatically.  Increasing the number of streams can
 increase performance when the maximum window size is set too low or
 there is cross-traffic on the network, but too high a value can decrease
 performance due to increased congestion and packet loss.
-.IP "\fB\-\-stripe=SIZE|NUM\fP"
+.IP "\fB\-\-stripe=[SIZE|NUM][:[SIZE][:POOL]]\fP"
 By default, a file transferred to a Lustre file system will be striped
 according to size (one stripe per GB) unless the source resides on
 Lustre and has non-default striping, in which case striping will be
@@ -586,7 +622,14 @@ size (specified with the suffixes k, m, g, and t for KB, MB, GB, and TB,
 respectively), files will be allocated one stripe per given size while
 directories will be striped according to the default policy.  A value of
 zero disables automatic striping and uses the default policy for all
-files and directories.
+files and directories.  Striping behavior may be further refined by
+specifying a stripe size (using the size suffixes above) and/or Lustre
+pool name.  The stripe count and/or stripe size can be left empty before
+the colon when specifying the stripe size or pool, respectively.  For
+example, "--stripe=:4m" would specify the stripe size to be 4 MB while
+using the default stripe count policy and, similarly, "--stripe=::pool1"
+would use the pool "pool1" while using the default stripe count and
+stripe size.
 .IP "\fB\-\-threads=NUM\fP"
 Use the given number of threads in multi-threaded transports and
 checksum utilities (currently, mcp and msum).  The default number of
@@ -679,11 +722,11 @@ Detaching process (use --status option to monitor progress)
 .RE
 .PP
 Copy local file "file1" in the current directory to the user's home
-directory on host "host2" while preserving file attributes:
+directory on host "host2":
 .PP
 .RS
 .nf
-\fBshiftc -p file1 host2:\fP
+\fBshiftc file1 host2:\fP
 
 Shift id is 2
 Detaching process (use --status option to monitor progress)
@@ -810,7 +853,7 @@ id | origin        | command
 ---+---------------+--------------------------------------
  1 | host1.domain  | shiftc file1 /dir1
    | [/home/user1] |
- 2 | host1.domain  | shiftc -p file1 host2:
+ 2 | host1.domain  | shiftc file1 host2:
    | [/home/user1] |
  3 | host1.domain  | shiftc -r --no-verify /dir1 /dir2
    | [/home/user1] |
@@ -830,7 +873,7 @@ containing "host2":
 
 id | origin        | command
 ---+---------------+----------------------------------
- 2 | host1.domain  | shiftc -p file1 host2:
+ 2 | host1.domain  | shiftc file1 host2:
    | [/home/user1] |
  4 | host1.domain  | shiftc -r --secure host2:/dir2 .
    | [/tmp]        |
