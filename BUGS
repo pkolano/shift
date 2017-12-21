@@ -44,7 +44,7 @@ KNOWN BUGS
    of this tool are only meaningful for tar files created with Shift
    versions 4.0 or 5.0.  Run the tool as follows:
 
-	tarcheck.pl data1.tar data2.tar ... dataN.tar
+    tarcheck.pl data1.tar data2.tar ... dataN.tar
 
    The tool will first attempt to check files using an associated table
    of contents (.toc) file.  If no such file is found (which normally
@@ -67,8 +67,8 @@ KNOWN BUGS
    Files with affected entries that do not have a corresponding .toc
    file will report one of the following messages:
 
-	- Invalid tar record at byte N
-	- Invalid tar header checksum
+    - Invalid tar record at byte N
+    - Invalid tar header checksum
 
    If neither type of message is displayed, the tar file is not
    affected.
