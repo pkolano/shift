@@ -31,7 +31,7 @@ KNOWN BUGS
    messages:
 
     - Invalid tar header checksum
-	- Invalid tar long link/name data
+    - Invalid tar long link/name data
 
    Note, however, that any transfers that were restarted (via --restart)
    after the issue occurred are likely to have completed without further
