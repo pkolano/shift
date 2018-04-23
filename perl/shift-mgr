@@ -65,7 +65,7 @@ use Symbol qw(gensym);
 use Term::ANSIColor;
 use Text::ParseWords;
 
-our $VERSION = 0.94;
+our $VERSION = 0.95;
 
 $Term::ANSIColor::EACHLINE = "\n";
 
@@ -176,7 +176,7 @@ my %opts;
 my $rc = GetOptions(\%opts,
     "alive", "get", "history", "host=s", "id=s", "lock", "meta:1", "mounts",
     "pid=i", "plot:s", "put", "restart", "search=s", "shift-mgr", "state=s",
-    "stats", "status:s", "stop", "sync", "user=s",
+    "stats:s", "status:s", "stop", "sync", "user=s",
 );
 die "Invalid options\n" if (!$rc || scalar(@ARGV) != 0);
 
@@ -203,7 +203,7 @@ die "The user_dir setting must be configured\n" if (!$conf{user_dir});
 $conf{opts_bbftp} =~ s/\\n/\n/g;
 
 # process --stats immediately before setuid or $conf{user_dir} changes
-if ($opts{stats}) {
+if (defined $opts{stats}) {
     stats();
     exit;
 }
@@ -1028,6 +1028,8 @@ sub get {
                     next if ($i == 1 && $cmd eq 'find' && $meta{'create-tar'});
                     $args[$i] = map_remote($opts{host}, $args[$i], $ref);
                     last LOG if (!defined $args[$i]);
+                    # record if cksum arg has flipped from remote to local
+                    $op{"map$i"} = 1 if ($cmd eq 'cksum' && $args[$i] =~ /^\//);
                     my $host = $args[$i] =~ /^([^\/:]+)%3A/ ? $1 : "localhost";
                     if ($host ne 'localhost' && !defined $rtthost{$host}) {
                         # determine if already have round-trip time for domain
@@ -3344,6 +3346,25 @@ sub stats {
     # compute start and end dates
     my $date1 = strftime('%m/%d/%y', localtime($time - $conf{data_expire}));
     my $date2 = strftime('%m/%d/%y', localtime);
+
+    if ($opts{stats} eq 'csv') {
+        my @heads = map {@{$heads{$_}}} @order;
+        print join(",", "user", @heads), "\n";
+        # add row for each user
+        foreach my $user (sort keys(%users)) {
+            my @row = map {$users{$user}->{$_} || ""} @heads;
+            # only print row if there is an actual non-empty value
+            next if (!first {$_} @row);
+            print join(",", $user, @row), "\n";
+        }
+        # add row for each transfer type
+        foreach my $type (qw(local lan wan)) {
+            print join(",", $type, map {$types{$type}->{$_} || ""} @heads), "\n";
+        }
+        # add overall totals
+        print join(",", "all", map {$all->{$_} || ""} @heads), "\n";
+        return;
+    }
 
     # print tables
     require Text::FormatTable;

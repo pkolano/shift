@@ -66,7 +66,7 @@ use Symbol qw(gensym);
 use Sys::Hostname;
 use Text::ParseWords;
 
-our $VERSION = 0.94;
+our $VERSION = 0.95;
 
 # need threads and version of Thread::Queue from perl >= 5.10.1
 my $have_threads = eval 'require 5.010_001; use threads; use Thread::Queue; 1';
@@ -169,7 +169,7 @@ sub chattr {
             $size = 0 if (!$size);
             # stripes > 160 may fail due to max of lustre < 2.4
             $count = 160 if ($count > 160);
-            @copts = ("setstripe", "-c", $count, "-s", $size, $ufile);
+            @copts = ("setstripe", "-c", $count, "-S", $size, $ufile);
             splice(@copts, -1, 0, "-p", $pool) if ($pool);
         } elsif ($cmd eq 'setfacl') {
             $uattrs =~ s/,/\n/g;
@@ -318,6 +318,14 @@ sub find1 {
             $dmf = 0 if (scalar(@files) == 1 && !S_ISDIR($mode));
         }
 
+        # exclude files (must be before dir processing)
+        if (defined $opts{exclude}) {
+            foreach my $re (@{$opts{exclude}}) {
+                my $ure = unescape($re);
+                next FILE if (eval {$file =~ /$ure/});
+            }
+        }
+
         if (scalar(@stat) == 0 || S_ISDIR($mode)) {
             my $err = "";
             if (scalar(@stat) > 0 && (!$opts{dereference} || scalar(@files) == 1) && 
@@ -362,7 +370,7 @@ sub find1 {
             }
         }
 
-        # include files
+        # include files (must be after dir processing)
         if (defined $opts{include}) {
             my $found;
             foreach my $re (@{$opts{include}}) {
@@ -373,14 +381,7 @@ sub find1 {
             }
             next if (!$found);
         }
-        # exclude files
-        if (defined $opts{exclude}) {
-            foreach my $re (@{$opts{exclude}}) {
-                my $ure = unescape($re);
-                next FILE if (eval {$file =~ /$ure/});
-            }
-        }
-        # newer/older files
+        # newer/older files (must be after dir processing)
         next if (defined $opts{newer} && $stat[9] < $opts{newer});
         next if (defined $opts{older} && $stat[9] >= $opts{older});
 

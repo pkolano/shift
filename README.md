@@ -29,10 +29,49 @@ ability to provide advanced reliability and automatic single and multi-file
 parallelization to any stock command-line transfer application while being
 easily deployed by both individual users as well as entire organizations.
 
+Shift includes the following features, among others:
+
+    - support for local, LAN, and WAN transfers
+
+    - drop-in replacement for both cp and scp (basic options only)
+
+    - tracking of individual file operations with on-demand status
+
+    - transfer stop and restart
+
+    - email notification of completion, errors, and warnings
+
+    - local and remote tar creation/extraction
+
+    - rsync-like synchronization based on modification times and checksums
+
+    - integrity verification of transfers with partial retransfer/resum to
+      rectify corruption
+
+    - throttling based on local and remote resource utilization
+
+    - automatic retrieval/release of files residing on DMF-managed file systems
+
+    - automatic striping of files transferred to Lustre file systems
+
+    - fully self-contained besides perl core and ssh
+
+    - automatic detection and selection of higher performance transports and
+      hash utilities when available including bbcp, bbftp, gridftp, mcp, msum,
+      and rsync
+
+    - automatic many-to-many parallelization of single and multi-file
+      transfers with file system equivalence detection and rewriting
+
+Shift is in active production at the NASA Advanced Supercomputing
+Facility (https://www.nas.nasa.gov/hecc/support/kb/entry/300) and has
+facilitated transfers of over 85 PB (as of April 2018) since deployment.
+
 For full details of the Shift architecture, see
-https://pkolano.github.io/papers/resilience12.pdf.  For installation
-details, see "INSTALL".  For usage details, see "doc/shiftc.1" (in man
-page format, viewable with "nroff -man").
+https://pkolano.github.io/papers/resilience12.pdf and
+https://pkolano.github.io/papers/hust15.pdf.  For installation details, see
+"INSTALL".  For usage details, see "doc/shiftc.1" (in man page format, viewable
+with "nroff -man").
 
 Questions, comments, fixes, and/or enhancements welcome.
 

@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 #
-# Copyright (C) 2012-2017 United States Government as represented by the
+# Copyright (C) 2012-2018 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration
 # (NASA).  All Rights Reserved.
 #
@@ -80,7 +80,7 @@ use constant SFTP_TRUNC => 0x10;
 use constant SFTP_WRITE => 0x02;
 use constant SFTP_EXCL => 0x20;
 
-our $VERSION = 0.94;
+our $VERSION = 0.95;
 
 $Data::Dumper::Indent = 0;
 $Data::Dumper::Purity = 1;
@@ -1839,6 +1839,13 @@ sub shift_find {
             $dmf = 0 if (scalar(@files) == 1 && !S_ISDIR($mode));
         }
 
+        # exclude files (must be before dir processing);
+        if (defined $opts{exclude}) {
+            foreach my $re (@{$opts{exclude}}) {
+                next FILE if (eval {$file =~ /$re/});
+            }
+        }
+
         if (scalar(@stat) == 0 || S_ISDIR($mode)) {
             my $err = "";
             if (scalar(@stat) > 0 && (!$opts{dereference} || scalar(@files) == 1) &&
@@ -1890,7 +1897,7 @@ sub shift_find {
             }
         }
 
-        # include files
+        # include files (must be after dir processing)
         if (defined $opts{include}) {
             my $found;
             foreach my $re (@{$opts{include}}) {
@@ -1900,13 +1907,8 @@ sub shift_find {
             }
             next if (!$found);
         }
-        # exclude files
-        if (defined $opts{exclude}) {
-            foreach my $re (@{$opts{exclude}}) {
-                next FILE if (eval {$file =~ /$re/});
-            }
-        }
-        # newer/older files
+
+        # newer/older files (must be after dir processing)
         next if (defined $opts{newer} && $stat[9] < $opts{newer});
         next if (defined $opts{older} && $stat[9] >= $opts{older});
 
@@ -2357,6 +2359,8 @@ sub shift_loop {
                     }
                     # record if local or not for i/o throttling
                     $op{local} = $local;
+                    # must cksum src if src was mapped from remote to local
+                    $rindex = 0 if ($op{map0});
                     # record remote host index to determine offset in tar case
                     $op{rindex} = $rindex;
                     transport($cmd, $rhost[$rindex], undef, $rpath[$rindex], \%op);
@@ -3558,7 +3562,7 @@ sub transport_chattr {
                 # stripe local files immediately
                 my $dir = $op eq 'mkdir' ? $dst : dirname($dst);
                 eval {mkpath($dir)};
-                my @args = ("lfs", "setstripe", "-c", $scount, "-s", $ssize, $dst);
+                my @args = ("lfs", "setstripe", "-c", $scount, "-S", $ssize, $dst);
                 splice(@args, -1, 0, "-p", $opts{'stripe-pool'})
                     if ($opts{'stripe-pool'});
                 system(@args);
