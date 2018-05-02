@@ -63,15 +63,16 @@ Shift includes the following features, among others:
     - automatic many-to-many parallelization of single and multi-file
       transfers with file system equivalence detection and rewriting
 
-Shift is in active production at the NASA Advanced Supercomputing
-Facility (https://www.nas.nasa.gov/hecc/support/kb/entry/300) and has
-facilitated transfers of over 85 PB (as of April 2018) since deployment.
+Shift is in active production at the NASA Advanced Supercomputing Facility
+(https://www.nas.nasa.gov/hecc/support/kb/entry/300) and has facilitated
+approximately 600k transfers over 1.32B files totalling 88.5 PB (as of May
+2018) since deployment in March 2012.
 
 For full details of the Shift architecture, see
 https://pkolano.github.io/papers/resilience12.pdf and
-https://pkolano.github.io/papers/hust15.pdf.  For installation details, see
-"INSTALL".  For usage details, see "doc/shiftc.1" (in man page format, viewable
-with "nroff -man").
+https://pkolano.github.io/papers/hust15.pdf.  For installation details,
+see "INSTALL".  For usage details, see "doc/shiftc.1" (in man page format,
+viewable with "nroff -man").
 
 Questions, comments, fixes, and/or enhancements welcome.
 
