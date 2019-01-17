@@ -2,28 +2,20 @@
 
 # This is a skeleton for a script that can be used in the shiftrc
 # select_hook setting, which chooses a remote host given the local
-# client host, the original remote host, and a Storable file mapping
-# candidate host names to the relevant file system information for
-# each.  The file system information is in hash format, with contents
-# similar to the following:
-#
-#   host => host23.example.com
-#   local => /home1
-#   opts => rw
-#   remote => /mnt/home1
-#   servers => nfsserver1.example.com
-#   type => nfs
+# client host, the original remote host, and a comma-separated list
+# of candidate host names.
 
 use strict;
-use Storable qw(retrieve);
 
 # untaint path
 $ENV{PATH} = "/bin:/usr/bin:/usr/local/bin";
+# untaint insecure environment variables
+delete $ENV{$_} foreach (qw(BASH_ENV CDPATH ENV IFS));
 
-exit if (scalar(@ARGV) != 3 || ! -f $ARGV[2]);
+exit if (scalar(@ARGV) != 3);
 my $lhost = $ARGV[0];
 my $rhost = $ARGV[1];
-my %hosts = %{retrieve($ARGV[2])};
+my %hosts = map {$_ => 1} split(/,/, $ARGV[2]);
 
 # do something to decide which host(s) of keys(%hosts) is best/least loaded,
 # which might involve calls to the local load balancing infrastruture,
@@ -32,4 +24,3 @@ my %hosts = %{retrieve($ARGV[2])};
 
 # print a set of comma-separated host names of the best choices or
 # print nothing to revert to default policy
-

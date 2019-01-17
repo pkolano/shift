@@ -21,6 +21,8 @@
 #   (use %u as substitution for user name)
 #   (parent dir must be world writable with sticky bit for multi-user installs)
 #   (multi-user example: user_dir /var/lib/shift/%u)
+#   (single-user example: user_dir /home/%u/.shift)
+#user_dir nodefault
 user_dir /home/%u/.shift
 
 # time (seconds) to store transfer metadata after last activity
@@ -28,8 +30,8 @@ user_dir /home/%u/.shift
 
 # location of file system information database
 #   (must be world readable for multi-user installs)
-#   (example: db_file /var/lib/shift/db)
-#db_file nodefault
+#   (example: mount_db /var/lib/shift/mounts)
+#mount_db nodefault
 
 # log debugging information for user X in user_dir/X.debug
 #   (may be specified multiple times for different users)
@@ -72,11 +74,6 @@ user_dir /home/%u/.shift
 # supported local transports by decreasing small file performance/preference
 #   (example: mcp,shift,fish,fish-tcp,rsync,bbftp)
 #local_small shift,fish,fish-tcp
-
-# minimum size allowed for --split and --split-tar options
-#   (use suffix {k,m,g,t} for {KB,MB,GB,TB})
-#   (it is not recommended to set this below 1GB)
-#min_split 1g
 
 # command-line options that will be used by bbcp on client hosts
 #   (example: opts_bbcp -s 4 -w 4194304)
@@ -123,6 +120,19 @@ user_dir /home/%u/.shift
 #   (use suffix {k,m,g,t} for {KB,MB,GB,TB})
 #small_size_wan 64m
 
+# size of chunks at which corruption is detected/rectified
+#   (use suffix {k,m,g,t} for {KB,MB,GB,TB})
+#   (it is not recommended to set this below 1GB)
+#   (changing this value voids all existing values in checksum dbs)
+#sum_split 1g
+
+# type of checksum to use for integrity verification
+#   (format is TYPE_BITS, BITS required when TYPE supports multiple lengths)
+#   (for msum, see "msum --help" --hash-type list, "_" will be ignored)
+#   (for built-in perl sums, will use Digest::TYPE->new(BITS))
+#   (example: sum_type sha3_256)
+#sum_type md5
+
 
 ################################
 #### general tuning options ####
@@ -160,15 +170,14 @@ user_dir /home/%u/.shift
 #   (use suffix {k,m,g,t} for {KB,MB,GB,TB})
 #default_split-tar 500g
 
-# amount of data per lustre stripe
-#   (set to 0 to use default striping)
+# expressions by which to select lustre stripe count/size/pool
+#   (format is same as --stripe: [CEXP][::[SEXP][::PEXP]])
+#   (EXP may be NUM, SIZE, or full perl expression)
+#   (EXP may use const {NM,SZ,SC,SS} for src {name,size,scnt,ssz})
+#   (set to 0 to use system default striping)
 #   (note that transports using temporary files are not supported)
 #   (use suffix {k,m,g,t} for {KB,MB,GB,TB})
 #default_stripe 1g
-
-# number of stripes that local lustre file systems use by default
-#   (if file systems use different values, use max default across them)
-#lustre_default_stripe 1
 
 # number of status entries at which some older done transfers may be omitted
 #status_lines 20
@@ -190,6 +199,18 @@ user_dir /home/%u/.shift
 #   (use suffix {k,m,g,t} for {Kb,Mb,Gb,Tb})
 #bandwidth_xge 10g
 
+# latency (seconds) assumed to remote LAN hosts when measurement fails
+#latency_lan 0.001
+
+# latency (seconds) assumed to remote WAN hosts when measurement fails
+#latency_wan 0.05
+
+# maximum number of streams to use in remote LAN transfers
+#max_streams_lan 8
+
+# maximum number of streams to use in remote WAN transfers
+#max_streams_wan 16
+
 # minimum number of streams to use in remote LAN transfers
 #min_streams_lan 1
 
@@ -204,20 +225,27 @@ user_dir /home/%u/.shift
 #   (use suffix {k,m,g,t} for {KB,MB,GB,TB})
 #min_window_wan 4m
 
-# maximum number of streams to use in remote LAN transfers
-#max_streams_lan 8
-
-# maximum number of streams to use in remote WAN transfers
-#max_streams_wan 16
-
-# latency (seconds) assumed to remote LAN hosts when measurement fails
-#latency_lan 0.001
-
-# latency (seconds) assumed to remote WAN hosts when measurement fails
-#latency_wan 0.05
-
 # regular expression for determining if host may have higher bandwidth
 #org_domains com|edu|gov|mil|net|org
+
+
+#######################
+#### cache options ####
+#######################
+
+# estimated amount of i/o needed on clients to evict newly cached data
+#   (use suffix {k,m,g,t} for {KB,MB,GB,TB})
+#cache_size_client nodefault
+
+# estimated amount of i/o needed on file servers to evict newly cached data
+#   (use suffix {k,m,g,t} for {KB,MB,GB,TB})
+#cache_size_server nodefault
+
+# estimated number of seconds needed on clients to evict newly cached data
+#cache_time_client nodefault
+
+# estimated number of seconds needed on file servers to evict newly cached data
+#cache_time_server nodefault
 
 
 #################################

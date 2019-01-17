@@ -3,7 +3,7 @@ Shift Installation and Configuration
 
 1. Deployments
 
-    Shift consists of three executable components:
+    Shift consists of four executable components:
     
         o shiftc    - the Shift client, which is invoked by users and other
                       client instances and must exist on hosts that initiate
@@ -24,6 +24,12 @@ Shift Installation and Configuration
                       built-in fish/fish-tcp protocols, remote acl/xattr
                       preservation, remote lustre striping, and remote
                       verification (if msum from mutil is not installed)
+
+        o shift-bin - the Shift binary helper, which is an optional component
+                      invoked by shiftc and shift-aux to perform file
+                      operations that cannot be implemented directly in pure
+                      perl and/or cannot be executed efficiently in
+                      batches by standard command line utilities.
 
     The main consideration for a Shift deployment is deciding which hosts will
     be the manager hosts.  In the simplest case, all client hosts are manager
@@ -52,6 +58,8 @@ Shift Installation and Configuration
 
     2.2. Optional
 
+        o IO::Socket::SSL - allows fish-tcp encryption with --secure
+            (https://metacpan.org/pod/IO::Socket::SSL)
         o mcp/msum >= 1.76.7 - high speed local copy/sum
             (http://mutil.sf.net)
         o bbcp - high speed remote copy
@@ -86,58 +94,85 @@ Shift Installation and Configuration
         o unbuffer - interleave stdout/stderr when using gridftp
 
 
-3. Installation
+3. Build (optional - linux only)
 
-    Note that the following shows the exact files needed on each type of host.
-    Since the number of files is small, however, there is minimal penalty to
-    simply installing them all on every host.
+    An optional binary component called "shift-bin" can be built on
+    linux systems to significantly improve the efficiency of some file
+    operations.  These operations include equivalents to those provided
+    by posix_fadvise, fallocate, {get,set}facl, {get,set}fattr, and lfs.
+    This utility must be built differently depending on whether the
+    system mount lustre (and has access to the corresponding liblustreapi
+    library) or not.
 
-    3.1. Single-user installation
+    3.1. Systems mounting lustre file systems
+
+        cd c
+        make lustre
+
+    3.2. Systems not mounting lustre file systems
+
+        cd c
+        make nolustre
+
+
+4. Installation
+
+    Note that the following shows the exact files needed on each type
+    of host.  Since the number of files is small, however, there is
+    minimal penalty to simply installing them all on every host.  The
+    installation commands assume that the optional shift-bin component
+    has been built as needed for client and remote hosts.  
+
+    4.1. Single-user installation
 
         Note that the user's home directory is used as the default install
         prefix in all examples, but can be changed to any other desired location
         as long as the corresponding bin directory is in the user's path.
 
-        3.1.1. Client hosts
+        4.1.1. Client hosts
 
-            install -m 700 perl/shiftc ~/bin/shiftc
-            install -m 600 doc/shiftc.1 ~/man/man1/shiftc.1
+            install -m 700 perl/shiftc ~/bin/
+            install -m 700 perl/shift-bin ~/bin/
+            install -m 600 doc/shiftc.1 ~/man/man1/
 
-        3.1.2. Manager hosts
+        4.1.2. Manager hosts
 
-            install -m 700 perl/shift-mgr ~/bin/shift-mgr
+            install -m 700 perl/shift-mgr ~/bin/
             install -m 600 etc/shiftrc ~/.shiftrc
 
-        3.1.3. Remote hosts (optional but recommended when possible)
+        4.1.3. Remote hosts (optional but recommended when possible)
 
-            install -m 700 perl/shift-aux ~/bin/shift-aux
+            install -m 700 perl/shift-aux ~/bin/
+            install -m 700 perl/shift-bin ~/bin/
 
-    3.2. Multi-user installation
+    4.2. Multi-user installation
 
         Note that /usr/local is used as the default install prefix in all
         examples, but can be changed to any other desired location as long
         as the corresponding bin directory is in the default system path.
 
-        3.2.1. Client hosts
+        4.2.1. Client hosts
 
-            install -m 755 perl/shiftc /usr/local/bin/shiftc
-            install -m 644 doc/shiftc.1 /usr/local/man/man1/shiftc.1
+            install -m 755 perl/shiftc /usr/local/bin/
+            install -m 755 perl/shift-bin /usr/local/bin/
+            install -m 644 doc/shiftc.1 /usr/local/man/man1/
 
-        3.2.2. Manager hosts
+        4.2.2. Manager hosts
 
-            install -m 755 perl/shift-mgr /usr/local/bin/shift-mgr
-            install -m 644 etc/shiftrc /etc/shiftrc
+            install -m 755 perl/shift-mgr /usr/local/bin/
+            install -m 644 etc/shiftrc /etc/
 
-        3.2.3. Remote hosts (optional but recommended when possible)
+        4.2.3. Remote hosts (optional but recommended when possible)
 
-            install -m 755 perl/shift-aux /usr/local/bin/shift-aux
+            install -m 755 perl/shift-aux /usr/local/bin/
+            install -m 755 perl/shift-bin /usr/local/bin/
 
 
-4. Configuration
+5. Configuration
 
-    4.1. Client hosts
+    5.1. Client hosts
 
-        4.1.1. ~/.ssh/id_rsa (or similar)
+        5.1.1. ~/.ssh/id_rsa (or similar)
 
             If hostbased authentication is not supported by client hosts,
             manager hosts, and/or remote hosts, pubkey authentication must be
@@ -151,7 +186,7 @@ Shift Installation and Configuration
             but comes with a drop in reliability as any failure of the agent or
             agent host leaves any associated transfers with no way to recover.
 
-        4.1.2. ~/.ssh/authorized_keys
+        5.1.2. ~/.ssh/authorized_keys
 
             If hostbased authentication is not supported to other client hosts
             for parallelization, pubkey authentication must be used.  In this
@@ -160,7 +195,7 @@ Shift Installation and Configuration
             added to the invoking user's authorized_keys file on other client
             hosts.
 
-        4.1.3. ~/bin/shiftc (single-user) or /usr/local/bin/shiftc (multi-user)
+        5.1.3. ~/bin/shiftc (single-user) or /usr/local/bin/shiftc (multi-user)
 
             If the manager hosts differ from the client hosts, the manager
             host(s) can be hardcoded within the shiftc program in the
@@ -179,9 +214,9 @@ Shift Installation and Configuration
             which manager host out of a set of hosts will be used for each
             invocation).
 
-    4.2. Manager hosts
+    5.2. Manager hosts
 
-        4.2.1. ~/.shiftrc (single-user) or /etc/shiftrc (multi-user)
+        5.2.1. ~/.shiftrc (single-user) or /etc/shiftrc (multi-user)
 
             All items in the default config file should be reviewed.
             The only required setting is:
@@ -195,11 +230,7 @@ Shift Installation and Configuration
                 sync_host
 
             must be configured to sync the transfer metadata across two
-            manager hosts.  Note that the existing synchronization
-            mechanism has been found to be a bottleneck when there are
-            many clients in a single transfer or many simultaneous
-            transfers by a single user.  This will be fixed in a future
-            version.
+            manager hosts.
 
             The transport options should definitely be reviewed to
             enable any higher performance transports that may be
@@ -214,7 +245,7 @@ Shift Installation and Configuration
             functionality specific to certain remote file systems (e.g. Lustre
             striping), it is desirable to configure:
 
-                db_file
+                mount_db
 
             with a database of host and file system information from within
             the local environment.  A template for producing this database is
@@ -236,7 +267,7 @@ Shift Installation and Configuration
             infrastructure.  If not configured, hosts will be chosen randomly
             after a successful sshd ping test.
 
-        4.2.2. ~/.ssh/authorized_keys
+        5.2.2. ~/.ssh/authorized_keys
 
             If hostbased authentication is not supported to manager hosts,
             pubkey authentication must be used.  In this case, the public key(s)
@@ -247,9 +278,9 @@ Shift Installation and Configuration
             --mgr-user.
 
 
-    4.3. Remote hosts
+    5.3. Remote hosts
 
-        4.3.1. ~/.ssh/authorized_keys
+        5.3.1. ~/.ssh/authorized_keys
 
             If hostbased authentication is not supported to remote hosts, pubkey
             authentication must be used.  In this case, the public key(s)
@@ -259,9 +290,9 @@ Shift Installation and Configuration
             will either be the invoking user or the one specified by --user.
 
 
-5. Usage
+6. Usage
 
-    5.1. shiftc
+    6.1. shiftc
 
         Client usage is detailed in the man page "doc/shiftc.1", which can be
         viewed with:
@@ -275,7 +306,7 @@ Shift Installation and Configuration
         "user@" portion will be dropped) so --user must be specified instead
         when the remote user differs from the local user.
 
-    5.2. shift-mgr
+    6.2. shift-mgr
 
         Normal users need not invoke shift-mgr directly as all relevant manager
         functionality is accessed indirectly through the client.  Additional

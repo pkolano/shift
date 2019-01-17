@@ -48,6 +48,8 @@ Shift includes the following features, among others:
     - integrity verification of transfers with partial retransfer/resum to
       rectify corruption
 
+    - detection of silent corruption between transfers of the same file
+
     - throttling based on local and remote resource utilization
 
     - automatic retrieval/release of files residing on DMF-managed file systems
@@ -65,7 +67,7 @@ Shift includes the following features, among others:
 
 Shift is in active production at the NASA Advanced Supercomputing Facility
 (https://www.nas.nasa.gov/hecc/support/kb/entry/300) and has facilitated
-approximately 600k transfers over 1.32B files totalling 88.5 PB (as of May
+approximately 780k transfers over 1.7B files totalling 105 PB (as of Dec.
 2018) since deployment in March 2012.
 
 For full details of the Shift architecture, see

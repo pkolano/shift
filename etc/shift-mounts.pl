@@ -8,7 +8,7 @@ use strict;
 use File::Temp;
 use POSIX qw(setuid);
 
-our $VERSION = 0.06;
+our $VERSION = 0.09;
 
 # untaint PATH
 $ENV{PATH} = "/bin:/usr/bin:/usr/local/bin";
@@ -46,26 +46,24 @@ die "Unable to setuid to $user\n"
 # create temporary file (automatically unlinked on exit)
 my $tmp = File::Temp->new;
 my $file = $tmp->filename;
-close $tmp;
 
 # gather info from all hosts
 foreach my $host (@hosts) {
-    open(TMP, ">>$file");
     # use shift-aux to collect mount information and append to file
     open(FILE, "ssh -aqx -oHostBasedAuthentication=yes -oBatchMode=yes -l $user $host shift-aux mount |");
     while (<FILE>) {
         # print once for fully qualified host
-        print TMP $_;
+        print $tmp $_;
         # ignore shell line for plain host
         next if (!/^args=/ || /^args=shell/);
         # replace fully qualified host with plain host
         s/(host=$host)\.\S+/$1/;
         # duplicate line for plain host
-        print TMP $_;
+        print $tmp $_;
     }
     close FILE;
-    close TMP;
 }
+close $tmp;
 
 # call shift-mgr to add collected info to global database
 system("ssh -aqx -oHostBasedAuthentication=yes -oBatchMode=yes -l $user $mgr shift-mgr --mounts < $file");

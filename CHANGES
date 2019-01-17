@@ -194,3 +194,58 @@ CHANGES
     - Fixed lfs setstripe calls to use -S instead of -s (lustre >= 2.3.0)
     - Fixed descent into directories matching --exclude during initialization
     - Fixed hash errors when remote source mapped to local file system
+
+* Shift 6.0 (01/16/19)
+    - Note that this version is not backward compatible with previous versions
+    - Added depth-first file stage processing using --pipeline
+    - Added CSV history output using --history=csv
+    - Added disablement of email status for states given in --no-mail
+    - Added disablement of preservation for attributes given in --no-preserve
+    - Added continuous real-time display of status using --monitor
+    - Added error handling for manager disk exhaustion
+    - Added overwrite of read-only files using --force
+    - Added ability to ignore unrecoverable errors using --restart=ignore
+    - Added faster get/set of external file attributes using shift-bin
+    - Added plotting by client using --plot=client
+    - Added alert state for items that must be externally checked/fixed
+    - Added encrypted data streams to fish-tcp transport using --secure
+    - Added better support for scp-style "user@" syntax
+    - Added silent corruption detection for previously completed transfers
+    - Added --last-sum option to query silent corruption database
+    - Added fadvise of source after transfer when shift-bin available
+    - Added per file dynamic striping via perl-based expressions
+    - Added manager config for hash algorithm and hash leaf size
+    - Added advanced --older/--newer expressions using atime/ctime/mtime
+    - Added --doing manager option to see past/present doing logs
+    - Added abort during tar creation if first split file already exists
+    - Added same file detection across remote hosts
+    - Changed --no-check option to --no-sanity
+    - Changed manager --meta output to handle deeper data structures
+    - Changed manager db_file config setting to mount_db
+    - Changed dmget handling to use -a during tar creation to keep files online
+    - Changed manager meta file format from base64 to yEnc
+    - Changed manager log structured files to seekable compressed format
+    - Changed manager doing logs to log structured format
+    - Changed HMAC authentication from SHA1 to SHA512 in fish-tcp
+    - Changed manager sync mechanism to better support multiple failovers
+    - Changed estimated completion to use running avgs instead of elapsed time
+    - Fixed mount detection for DMF file systems reported as dmapi
+    - Fixed mount detection for lustre file systems with multiple MDS's
+    - Fixed overwrite of symlinks when exist at destination
+    - Fixed deprecated File::Glob usage on newer perls
+    - Fixed Net::Ping invocations during latency measurements on redhat/centos
+    - Fixed detection of automounted file systems
+    - Fixed hang on PBS-controlled hosts during file system detection
+    - Fixed --sync on DMF to copy file instead of summing when time/size match
+    - Fixed DMF recalls during file overwrite when using built-in transports
+    - Fixed incorrect striping when --stripe=0 given and transport is mcp
+    - Fixed warning output in some --status=color scenarios
+    - Fixed exception in detailed status when very large file with small files
+    - Fixed race condition between check and creation of user metadata dir
+    - Fixed tracking of corruption stats during --sync
+    - Fixed stalls after host/process failures due to bad metadata recovery
+    - Fixed throttling deadlock due to file not counting own preallocation
+    - Fixed error detection in some gridftp scenarios
+    - Removed manager lustre_default_stripe config setting
+    - Removed manager min_split config setting
+    - Removed previously allowed inverse options --preserve and --verify

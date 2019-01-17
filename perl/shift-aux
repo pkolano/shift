@@ -1,6 +1,6 @@
 #!/usr/bin/perl -T
 #
-# Copyright (C) 2012-2016 United States Government as represented by the
+# Copyright (C) 2012-2019 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration
 # (NASA).  All Rights Reserved.
 #
@@ -47,7 +47,6 @@
 require 5.007_003;
 use strict;
 use Cwd qw(abs_path);
-use Digest::MD5 qw(md5);
 use Fcntl qw(:DEFAULT :mode);
 use File::Basename;
 use File::Path;
@@ -59,31 +58,34 @@ use IO::Handle;
 use IO::Socket::INET;
 # use embedded IPC::Open3 since versions prior to perl 5.14.0 are buggy
 require IPC::Open3;
-use List::Util qw(min);
+use List::Util qw(first min);
+use MIME::Base64;
 use POSIX;
 use Socket;
 use Symbol qw(gensym);
 use Sys::Hostname;
 use Text::ParseWords;
 
-our $VERSION = 0.95;
-
-# need threads and version of Thread::Queue from perl >= 5.10.1
-my $have_threads = eval 'require 5.010_001; use threads; use Thread::Queue; 1';
+our $VERSION = 0.96;
 
 # do not die when receiving sigpipe
 $SIG{PIPE} = 'IGNORE';
 # untaint path
 $ENV{PATH} = "/bin:/usr/bin:/usr/local/bin:/sbin:/usr/sbin:/usr/local/sbin";
-# untaint env
-delete $ENV{ENV};
-
-my %opts;
-my $cmd = shift @ARGV;
+# untaint insecure environment variables
+delete $ENV{$_} foreach (qw(BASH_ENV CDPATH ENV IFS));
 
 # make sure user can read, write, execute/traverse files/dirs
 # make sure root transfers do not inadvertently expose files
 umask ($< == 0 ? 077 : 077 & umask);
+
+my %perl;
+$perl{ssl} = eval 'use IO::Socket::SSL; 1';
+# need threads and version of Thread::Queue from perl >= 5.10.1
+$perl{threads} = eval 'require 5.010_001; use threads; use Thread::Queue; 1';
+
+my %opts;
+my $cmd = shift @ARGV;
 
 # parse options and perform corresponding command
 if (!$cmd) {
@@ -91,11 +93,14 @@ if (!$cmd) {
 } elsif ($cmd eq 'chattr') {
     die "Invalid options\n" if (scalar(@ARGV) > 0);
     chattr();
+} elsif ($cmd eq 'escape') {
+    die "Invalid options\n" if (scalar(@ARGV) != 1);
+    print escape($ARGV[0]);
 } elsif ($cmd eq 'find') {
     die "Invalid options\n" if (!GetOptions(\%opts,
         "create-tar", "dereference|L", "exclude=s@", "extract-tar",
-        "find-files=i", "ignore-times", "include=s@", "newer=i", "older=i",
-        "preserve", "sync",
+        "find-files=i", "ignore-times", "include=s@", "newer=s", "older=s",
+        "preserve=s", "sync",
     ));
     die "Invalid options\n" if (scalar(@ARGV) > 0);
     find();
@@ -107,7 +112,8 @@ if (!$cmd) {
         'window' => 4194304,
     );
     die "Invalid options\n" if (!GetOptions(\%opts,
-        "buffer-size=i", "ports=s", "streams=i", "tcp", "verify", "window=i",
+        "buffer-size=i", "ports=s", "secure", "streams=i", "tcp", "verify",
+        "window=i",
     ));
     die "Invalid options\n" if (scalar(@ARGV) > 0);
     $opts{'buffer-size'} <<= 20;
@@ -118,14 +124,28 @@ if (!$cmd) {
 } elsif ($cmd eq 'sum') {
     %opts = (
         'buffer-size' => 4,
+        'hash-type' => "md5",
         'split-size' => 1024,
         'threads' => 4,
     );
     die "Invalid options\n" if (!GetOptions(\%opts,
-        "buffer-size=i", "c", "split-size=i", "threads=i",
+        "buffer-size=i", "c", "hash-type=s", "split-size=i", "threads=i",
     ));
     die "Invalid options\n" if (!$opts{c});
+    my ($type, $bits) = split(/_/, $opts{'hash-type'});
+    # untaint arguments
+    $type = $1 if ($type =~ /(.*)/);
+    $bits = $1 if ($bits =~ /(.*)/s);
+    my $mod = "Digest::" . uc($type);
+    $opts{hash_ctx} = eval "require $mod; $mod->new($bits)";
+    $opts{hash_size} = length $opts{hash_ctx}->hexdigest;
     sum();
+} elsif ($cmd eq 'unescape') {
+    if (scalar(@ARGV)) {
+        print unescape($_) foreach (@ARGV);
+    } else {
+        print unescape($_) while (<STDIN>);
+    }
 }
 
 ################
@@ -135,14 +155,11 @@ if (!$cmd) {
 sub chattr {
     # check for existence of commands
     my %have;
-    foreach my $bin (qw(fallocate lfs setfacl setfattr)) {
-        foreach my $path (split(/:/, $ENV{PATH})) {
-            if (-x "$path/$bin") {
-                $have{$bin} = 1;
-                last;
-            }
-        }
+    foreach my $bin (qw(fallocate lfs setfacl setfattr shift-bin)) {
+        $have{$bin} = first {-x "$_/$bin"} (split(/:/, $ENV{PATH}));
     }
+    # offload to shift-bin for more efficient processing if possible
+    exec("shift-bin") if ($have{'shift-bin'});
  
     while (my $line = <STDIN>) {
         chomp $line;
@@ -154,7 +171,6 @@ sub chattr {
         $file = $1 if ($file =~ /(.*)/s);
         $attrs = $1 if ($attrs =~ /(.*)/);
         my $ufile = unescape($file);
-        my $uattrs = unescape($attrs);
 
         # make sure parent directory exists
         my $dir = $ufile =~ s/\/$// ? $ufile : dirname($ufile);
@@ -162,22 +178,21 @@ sub chattr {
 
         my ($cin, @copts, $in, $out);
         if ($cmd eq 'fallocate') {
-            @copts = ("-n", "-l", $uattrs, $ufile);
-        } elsif ($cmd eq 'lfs') {
+            @copts = ("-n", "-l", unescape($attrs), $ufile);
+        } elsif ($cmd eq 'setstripe') {
+            $cmd = "lfs";
             my ($count, $size, $pool) = split(/\s+/, unescape($attrs));
             $count = 0 if (!$count);
             $size = 0 if (!$size);
-            # stripes > 160 may fail due to max of lustre < 2.4
-            $count = 160 if ($count > 160);
             @copts = ("setstripe", "-c", $count, "-S", $size, $ufile);
             splice(@copts, -1, 0, "-p", $pool) if ($pool);
         } elsif ($cmd eq 'setfacl') {
-            $uattrs =~ s/,/\n/g;
-            $cin = $uattrs;
-            @copts = ("-PM-", $ufile);
+            $attrs =~ s/,/\n/g;
+            $cin = unescape($attrs);
+            @copts = ("-M-", $ufile);
         } elsif ($cmd eq 'setfattr') {
-            $uattrs =~ s/,/\n/g;
-            $cin = "# file: $ufile\n$uattrs";
+            $attrs =~ s/,/\n/g;
+            $cin = "# file: $ufile\n" . unescape($attrs);
             @copts = ("-h", "--restore=-");
         }
         my $pid = IPC::Open3::open3($in, $out, $out, $cmd, @copts);
@@ -222,8 +237,15 @@ sub find {
             my $opt = pop @args;
             $opts{$1} = $2 if ($opt =~ /(\w+)=(\S+)/);
         }
-        find1(map {unescape($_)} @args);
+        my @uargs = map {unescape($_)} @args;
+        if ($opts{'extract-tar'}) {
+            # process local tar files
+            find_tar(@uargs);
+        } else {
+            find1(@uargs);
+        }
     }
+    open3_wait($opts{fhpid}) if (defined $opts{fhpid});
 
     if ($opts{dmtmp}) {
         close $opts{dmfh};
@@ -234,8 +256,9 @@ sub find {
             delete $opts{dmfh};
             delete $opts{dmtmp};
         } else {
+            my $extra = $opts{'create-tar'} ? " -a" : "";
             # ignore errors since files will be automatically retrieved anyway
-            open3_get([$opts{dmtmp}, -1, -1], "dmget -nq");
+            open3_get([$opts{dmtmp}, -1, -1], "dmget -nq$extra");
             unlink $opts{dmtmp};
             POSIX::_exit(0);
         }
@@ -248,25 +271,17 @@ sub find {
 # output list of files/dirs beneath given paths with stat info
 sub find1 {
     my ($shost, $spath, $dst) = @_;
-
-    # process local tar files
-    if ($opts{'extract-tar'}) {
-        find_tar($shost, $spath, $dst);
-        return;
-    }
-
-    # check for existence of various commands
-    my %have;
-    foreach my $bin (qw(dmget lfs getfacl getfattr)) {
-        foreach my $path (split(/:/, $ENV{PATH})) {
-            if (-x "$path/$bin") {
-                $have{$bin} = 1;
-                last;
-            }
+    if (!defined $opts{have}) {
+        # check for existence of various commands
+        $opts{have} = {};
+        foreach my $bin (qw(dmget lfs getfacl getfattr shift-bin)) {
+            $opts{have}->{$bin} = first {-x "$_/$bin"} (split(/:/, $ENV{PATH}));
         }
+        $opts{fhpid} = open3_run([undef, undef, -1], "shift-bin")
+            if ($opts{have}->{'shift-bin'});
     }
 
-    my $dmf = $have{dmget} && $opts{srcfs} =~ /,dmi/ ? 1 : 0;
+    my $dmf = $opts{have}->{dmget} && $opts{srcfs} =~ /,dmf/ ? 1 : 0;
 
     my $sdir = dirname($spath);
     $sdir = "" if ($sdir eq '/');
@@ -381,9 +396,33 @@ sub find1 {
             }
             next if (!$found);
         }
+
         # newer/older files (must be after dir processing)
-        next if (defined $opts{newer} && $stat[9] < $opts{newer});
-        next if (defined $opts{older} && $stat[9] >= $opts{older});
+        my %ti = ('a' => 8, 'm' => 9, 'c' => 10);
+        if (defined $opts{newer}) {
+            if ($opts{newer} =~ /^([^:]+):(\S+)/) {
+                my ($type, $time) = ($1, $2);
+                $type =~ s/\|/1||/g;
+                $type =~ s/([amc])/$stat[$ti{$1}]>=$time&&/g;
+                $type =~ s/([AMC])/$stat[$ti{lc($1)}]<$time&&/g;
+                $type .= "1";
+                next if (!eval $type);
+            } elsif ($stat[9] < $opts{newer}) {
+                next;
+            }
+        }
+        if (defined $opts{older}) {
+            if ($opts{older} =~ /^([^:]+):(\S+)/) {
+                my ($type, $time) = ($1, $2);
+                $type =~ s/\|/1||/g;
+                $type =~ s/([amc])/$stat[$ti{$1}]<$time&&/g;
+                $type =~ s/([AMC])/$stat[$ti{lc($1)}]>=$time&&/g;
+                $type .= "1";
+                next if (!eval $type);
+            } elsif ($stat[9] >= $opts{older}) {
+                next;
+            }
+        }
 
         # dereference before stat
         # resolve uid/gid if possible
@@ -398,39 +437,68 @@ sub find1 {
         my @lattrs;
         my @xattrs;
         # try to get acls
-        if ($have{getacl} && !$opts{'create-tar'} && $opts{preserve} &&
+        if (($opts{have}->{'shift-bin'} || $opts{have}->{getfacl}) &&
+                !$opts{'create-tar'} &&
+                ($opts{preserve} == 1 || $opts{preserve} =~ /acl/) && 
                 (!$opts{srcfs} || $opts{srcfs} =~ /,acl/)) {
-            open(FILE, '-|', "getfacl", "-cPps", "--", $file);
-            while (<FILE>) {
-                chomp;
-                next if (!$_);
-                push(@acls, escape($_));
+            if (defined $opts{fhpid}) {
+                $opts{fhpid}->[0]->print("getfacl $file\n");
+                my $text = $opts{fhpid}->[1]->getline;
+                my @cols = split(/\s+/, $text);
+                push(@acls, $cols[2]) if ($file eq $cols[1] && $cols[-1] eq '0');
+            } else {
+                my $fhpid = open3_run([-1, undef, -1],
+                    "getfacl", "-cps",  "--", $file);
+                while (defined $fhpid && defined ($_ = $fhpid->[1]->getline)) {
+                    chomp;
+                    next if (!$_);
+                    push(@acls, escape($_));
+                }
+                open3_wait($fhpid);
             }
-            close FILE;
         }
 
         # try to get xattrs
-        if ($have{getfattr} && !$opts{'create-tar'} && $opts{preserve} &&
+        if (($opts{have}->{'shift-bin'} || $opts{have}->{getfattr}) &&
+                !$opts{'create-tar'} &&
+                ($opts{preserve} == 1 || $opts{preserve} =~ /xattr/) && 
                 (!$opts{srcfs} || $opts{srcfs} =~ /,xattr/)) {
-            open(FILE, '-|', "getfattr", "-dhe", "base64", $file);
-            while (<FILE>) {
-                chomp;
-                next if (!$_ || /^\s*#/);
-                push(@xattrs, escape($_));
+            if (defined $opts{fhpid}) {
+                $opts{fhpid}->[0]->print("getfattr $file\n");
+                my $text = $opts{fhpid}->[1]->getline;
+                my @cols = split(/\s+/, $text);
+                push(@xattrs, $cols[2]) if ($file eq $cols[1] && $cols[-1] eq '0');
+            } else {
+                my $fhpid = open3_run([-1, undef, -1],
+                    "getfattr", "-dhe", "base64", $file);
+                while (defined $fhpid && defined ($_ = $fhpid->[1]->getline)) {
+                    chomp;
+                    next if (!$_ || /^\s*#/);
+                    push(@xattrs, escape(decode_base64($_)));
+                }
+                open3_wait($fhpid);
             }
-            close FILE;
         }
 
         # try to get lustre striping
-        if ($have{lfs} && !S_ISLNK($mode) && !$opts{'create-tar'} &&
-                $opts{preserve} && $opts{srcfs} =~ /^lustre/) {
+        if (($opts{have}->{'shift-bin'} || $opts{have}->{lfs}) &&
+                !S_ISLNK($mode) && !$opts{'create-tar'} &&
+                ($opts{preserve} == 1 || $opts{preserve} =~ /stripe/) && 
+                $opts{srcfs} =~ /^lustre/) {
             # ignore symlinks as link to fifo can hang forever
-            open(FILE, '-|', "lfs", "getstripe", "-d", $file);
-            while (<FILE>) {
-                $lattrs[0] = $1 if (/stripe_count:\s*(-?\d+)/);
-                $lattrs[1] = $1 if (/stripe_size:\s*(-?\d+)/);
+            if (defined $opts{fhpid}) {
+                $opts{fhpid}->[0]->print("getstripe $file\n");
+                my $text = $opts{fhpid}->[1]->getline;
+                my @cols = split(/\s+/, $text);
+                @lattrs = split(/,/, $cols[2]) if ($file eq $cols[1] && $cols[-1] eq '0');
+            } else {
+                open(FILE, '-|', "lfs", "getstripe", "-d", $file);
+                while (<FILE>) {
+                    $lattrs[0] = $1 if (/stripe_count:\s*(-?\d+)/);
+                    $lattrs[1] = $1 if (/stripe_size:\s*(-?\d+)/);
+                }
+                close FILE;
             }
-            close FILE;
         }
         $lattrs[0] = 0 if (!defined $lattrs[0] && defined $lattrs[1]);
         $lattrs[1] = 0 if (!defined $lattrs[1] && defined $lattrs[0]);
@@ -665,7 +733,8 @@ sub find_tar {
         print " size=$attrs[4] attrs=", join(",", @attrs[1,2,3,5,5],
             escape($attrs[11]), escape($attrs[12]), @attrs[4,4]);
         my $bytes = $offset . "-" . ($offset + $attrs[4]);
-        print " bytes=$bytes tar_bytes=$bytes\n";
+        print " bytes=$bytes tar_bytes=$bytes";
+        print " tar_name=", escape(tar_canonpath($attrs[0])), "\n";
         $nfiles++;
     }
     if (length($head) < 512) {
@@ -692,10 +761,14 @@ sub fish {
 
     # default is to indicate running
     my $rc = "### 200";
-    my ($port, $sock, $key);
-    if (!$have_threads && $opts{tcp}) {
+    my ($cert, $key, $port, $sock);
+    if ($opts{tcp} && !$perl{threads}) {
         # indicate that threads are not supported
         $rc = "### 500 nothread";
+        $opts{tcp} = 0;
+    } elsif ($opts{tcp} && $opts{secure} && !$perl{ssl}) {
+        # indicate that ssl is not supported
+        $rc = "### 500 nossl";
         $opts{tcp} = 0;
     } elsif ($opts{tcp}) {
         my ($port1, $port2) = split(/:/, $opts{ports});
@@ -719,7 +792,20 @@ sub fish {
             #TODO: de-hardcode 60 second timeout
             $sock->sockopt(SO_RCVTIMEO, pack('L!L!', +60, 0));
             $key = "" . rand();
-            $rc = "$port $key\n$rc";
+            my $scert;
+            if ($opts{secure}) {
+                require IO::Socket::SSL::Utils;
+                ($scert, my $skey) = IO::Socket::SSL::Utils::CERT_create(
+                    CA => 1,
+                    subject => {CN => $key},
+                );
+                $scert = PEM_cert2string($scert) . PEM_key2string($skey);
+                (my $fh, $cert) = tempfile();
+                print $fh $scert;
+                close $fh;
+                $scert = " " . escape($scert);
+            }
+            $rc = "$port $key$scert\n$rc";
         }
     }
     $out->write($rc . "\n");
@@ -743,28 +829,45 @@ sub fish {
         }
     }
     return if (!$opts{tcp});
-    require Digest::HMAC_SHA1;
+    require Digest::HMAC;
+    require Digest::SHA::PurePerl;
 
     my @threads = map {threads->create(sub {
         my ($tsock, $trc0);
         $tsock = $sock->accept;
+        if ($opts{secure}) {
+            # this can only be reached if ssl is available
+            IO::Socket::SSL->start_SSL($tsock,
+                SSL_server => 1,
+                SSL_use_cert => 1,
+                SSL_verify_mode => IO::Socket::SSL::SSL_VERIFY_PEER(),
+                SSL_verifycn_name => $key,
+                SSL_hostname => $key,
+                SSL_ca_file => $cert,
+                SSL_cert_file => $cert,
+                SSL_key_file => $cert,
+            );
+        }
         my $trc = fish_return($tsock, "rinit");
         my ($nonce, $hmac) = split(/\s+/, $trc);
-        my $my_hmac = Digest::HMAC_SHA1::hmac_sha1_hex($nonce, $key);
+        my $my_hmac = Digest::HMAC::hmac_hex($nonce, $key,
+            \&Digest::SHA::PurePerl::sha512);
+
         if ($hmac ne $my_hmac) {
             # remote side cannot be authenticated
             close $tsock;
             return;
         }
         my $nonce2 = "" . rand();
-        my $hmac2 = Digest::HMAC_SHA1::hmac_sha1_hex($nonce . $nonce2, $key);
+        my $hmac2 = Digest::HMAC::hmac_hex($nonce . $nonce2, $key,
+            \&Digest::SHA::PurePerl::sha512);
         $tsock->print($nonce2 . " " . $hmac2 . "\n### 100\n");
 
         while (1) {
             my $trc = fish_return($tsock, "rauth");
             my ($fi, $fi_hmac) = split(/\s+/, $trc);
-            my $my_fi_hmac = Digest::HMAC_SHA1::hmac_sha1_hex(
-                $fi . $nonce2++, $key);
+            my $my_fi_hmac = Digest::HMAC::hmac_hex($fi . $nonce2++, $key,
+                \&Digest::SHA::PurePerl::sha512);
             if ($fi_hmac ne $my_fi_hmac) {
                 # remote side cannot be authenticated
                 close $tsock;
@@ -776,6 +879,7 @@ sub fish {
         close $tsock;
     })} (1 .. $opts{streams});
     $_->join foreach (@threads);
+    unlink $cert if ($cert);
     close $sock;
 }
 
@@ -931,31 +1035,43 @@ sub fqdn {
 # output the set of remotely mounted file systems
 sub mount {
     my $host = fqdn(hostname);
-    my %mnt;
-    $mnt{host} = $host;
-    $mnt{args} = "mount";
+    my %mnt = (
+        host => $host,
+        args => "mount",
+    );
+ 
+    my %fstab;
+    if (open(FILE, "/etc/fstab")) {
+        while (<FILE>) {
+            s/^\s+|\s+$//g;
+            next if (/^#/);
+            my ($dev, $local, $type) = split(/\s+/);
+            next if (!$type);
+            $fstab{$local} = [$dev, $type];
+        }
+        close FILE;
+    }
 
     # check for existence of getfacl
-    my $acl;
-    foreach my $path (split(/:/, $ENV{PATH})) {
-        if (-x "$path/getfacl") {
-            $acl = 1;
-            last;
-        }
-    }
- 
+    my $acl = first {-x "$_/getfacl"} (split(/:/, $ENV{PATH}));
     # gather file system information from mount
     my $fhpid = open3_run([-1, undef, -1], "mount");
     while (defined $fhpid && defined ($_ = $fhpid->[1]->getline)) {
         $mnt{opts} = /[\(,]ro[\),]/ ? "ro" : "rw";
         # acl support is the default unless explicitly disabled
         $mnt{opts} .= ",acl" if (/[\(,]acl[\),]/ || $acl && !/[\(,]noacl[\),]/);
-        $mnt{opts} .= ",dmi" if (/[\(,]dmi[\),]/);
+        $mnt{opts} .= ",dmf" if (/[\(,]dm(ap)?i[\),]/);
         $mnt{opts} .= ",xattr" if (/[\(,]user_xattr[\),]/);
         #TODO: need to escape local and remote?
-        (my $dev, $mnt{local}, $mnt{type}) = ($1, $2, $3)
+        (my $dev, $mnt{local}, my $type) = ($1, $2, $3)
             if (/(\S+)\s+on\s+(\S+)\s+type\s+(\S+)/);
         if ($mnt{local}) {
+            if ($dev eq 'systemd-1') {
+                # systemd mounts must be read from fstab
+                my $fstab = $fstab{$mnt{local}};
+                ($dev, $type) = ($fstab->[0], $fstab->[1]);
+                next if (!$type);
+            }
             # try to avoid NFS hangs by resolving dir but not base
             my ($base, $dir) = fileparse($mnt{local});
             $dir = abs_path($dir);
@@ -964,16 +1080,17 @@ sub mount {
         }
         if (/server_list=\(([^\)]+)\)/) {
             # cxfs appears as xfs but with server_list set
-            $mnt{servers} = join(",", map {$_ = fqdn($_)} split(/,/, $1));
-            $mnt{type} = "cxfs";
+            $mnt{servers} = join("|", map {$_ = fqdn($_)} split(/,/, $1));
             $mnt{remote} = $mnt{local};
-        } elsif (/^(\S+):(\S+)/) {
+            $type = "cxfs";
+        } elsif ($dev =~ /^(\S+):([^:]+)$/) {
             # typical form for nfs
             $mnt{remote} = $2;
             $mnt{servers} = $1;
-            $mnt{servers} =~ s/@.*//;
-            $mnt{servers} = fqdn($mnt{servers});
-        } elsif ($mnt{type} eq 'gpfs') {
+            # lustre may have extra @id and multiple colon-separated servers
+            $mnt{servers} =~ s/@\w*//g;
+            $mnt{servers} = join("|", map {$_ = fqdn($_)} split(/:/, $mnt{servers}));
+        } elsif ($type eq 'gpfs') {
             # gpfs servers do not appear in mount output so call mmlsmgr
             my $srv = open3_get([-1, undef, -1], "mmlsmgr $dev");
             # try a default location if not in path
@@ -985,14 +1102,17 @@ sub mount {
                 $mnt{remote} = "/$1";
                 $mnt{servers} = fqdn($2);
             }
-        } elsif ($mnt{opts} =~ /,dmi/) {
-            # always report dmi file systems even if local
+        } elsif ($mnt{opts} =~ /,dmf/) {
+            # always report dmf file systems even if local
             $mnt{servers} = $mnt{host};
             $mnt{remote} = $mnt{local};
         } else {
             # ignore local file systems
             next;
         }
+        $mnt{opts} = "$type,$mnt{opts}";
+        # ensure servers are in same order across all hosts
+        $mnt{servers} = join("|", sort(split(/\|/, $mnt{servers})));
         # print hash in single line with space-separated key=val form
         print join(" ", map {"$_=$mnt{$_}"} sort(keys(%mnt))), "\n";
     }
@@ -1109,8 +1229,7 @@ sub sum {
         if ($opts{'split-size'} < $opts{'buffer-size'});
 
     my ($qi, $q, $qret, @sums);
-    if ($have_threads && $opts{threads} > 1) {
-        require Thread::Queue;
+    if ($perl{threads} && $opts{threads} > 1) {
         $q = Thread::Queue->new;
         $qret = Thread::Queue->new;
         $qi = 0;
@@ -1139,7 +1258,7 @@ sub sum {
             $start = 0 if (!defined $start);
             # use file end if no end given
             $stop = (stat($file))[7] if (!defined $stop);
-            if (!$have_threads || $opts{threads} <= 1) {
+            if (!$perl{threads} || $opts{threads} <= 1) {
                 my $hash = sum1($file, $start, $stop);
                 sum_check($file, $hash0, $hash, $start, $stop, $partial);
                 next;
@@ -1155,7 +1274,7 @@ sub sum {
         }
     }
 
-    return if (!$have_threads || $opts{threads} <= 1);
+    return if (!$perl{threads} || $opts{threads} <= 1);
     # choose min of specified threads and amount of work
     my $nthr = min($opts{threads}, $q->pending);
     my @threads = map {threads->create(sub {
@@ -1189,14 +1308,14 @@ sub sum1 {
     if (open($fh, '<', $file)) {
         if ($start == $stop) {
             # compute empty hex hash
-            $hash .= unpack("H*", md5(""));
+            $hash .= unpack("H*", $opts{hash_ctx}->digest);
         } else {
             # compute concatenated list of hex hashes for each split
             for (my $x1 = $start; $x1 < $stop; $x1 += $opts{'split-size'}) {
                 my $x2 = min($x1 + $opts{'split-size'}, $stop);
                 sysseek($fh, $x1, 0) or
                     print STDERR "Unable to seek '$file': $!\n";
-                my ($buf, $md5, $total) = ("", Digest::MD5->new, 0);
+                my ($buf, $ctx, $total) = ("", $opts{hash_ctx}->clone, 0);
                 while ($total < $x2 - $x1) {
                     # read data into buffer
                     my $n = sysread($fh, $buf,
@@ -1205,10 +1324,10 @@ sub sum1 {
                     last if (!$n);
                     last if (!$n);
                     # add data to hash
-                    $md5->add($buf);
+                    $ctx->add($buf);
                     $total += $n;
                 }
-                $hash .= unpack("H*", $md5->digest);
+                $hash .= unpack("H*", $ctx->digest);
             }
         }
         close $fh;
@@ -1238,7 +1357,8 @@ sub sum_check {
             my $i = 0;
             for (my $x1 = $start; $x1 < $stop; $x1 += $opts{'split-size'}) {
                 my $x2 = min($x1 + $opts{'split-size'}, $stop);
-                if (substr($hash, $i * 32, 32) ne substr($hash0, $i * 32, 32)) {
+                if (substr($hash, $i * $opts{hash_size}, $opts{hash_size}) ne
+                        substr($hash0, $i * $opts{hash_size}, $opts{hash_size})) {
                     print ",", $x1, "-", $x2;
                 }
                 $i++;
@@ -1352,9 +1472,9 @@ sub verify_buffer_leaf {
 #####################
 sub verify_init {
     my %sopts = (
-        buffer_size => $opts{buffer} ? $opts{buffer} >> 20 : 4,
+        buffer_size => $opts{buffer},
         hash_ctx => Digest::MD5->new,
-        split_size => 1024,
+        split_size => $opts{'split-size'},
         stack => [],
         @_,
     );
@@ -1386,16 +1506,8 @@ $fatpacked{"Digest/HMAC.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'DIG
   package Digest::HMAC;$VERSION="1.03";use strict;sub new {my($class,$key,$hasher,$block_size)=@_;$block_size ||=64;$key=$hasher->new->add($key)->digest if length($key)> $block_size;my$self=bless {},$class;$self->{k_ipad}=$key ^ (chr(0x36)x $block_size);$self->{k_opad}=$key ^ (chr(0x5c)x $block_size);$self->{hasher}=$hasher->new->add($self->{k_ipad});$self}sub reset {my$self=shift;$self->{hasher}->reset->add($self->{k_ipad});$self}sub add {my$self=shift;$self->{hasher}->add(@_);$self}sub addfile {my$self=shift;$self->{hasher}->addfile(@_);$self}sub _digest {my$self=shift;my$inner_digest=$self->{hasher}->digest;$self->{hasher}->reset->add($self->{k_opad},$inner_digest)}sub digest {shift->_digest->digest}sub hexdigest {shift->_digest->hexdigest}sub b64digest {shift->_digest->b64digest}require Exporter;*import=\&Exporter::import;use vars qw(@EXPORT_OK);@EXPORT_OK=qw(hmac hmac_hex);sub hmac {my($data,$key,$hash_func,$block_size)=@_;$block_size ||=64;$key=&$hash_func($key)if length($key)> $block_size;my$k_ipad=$key ^ (chr(0x36)x $block_size);my$k_opad=$key ^ (chr(0x5c)x $block_size);&$hash_func($k_opad,&$hash_func($k_ipad,$data))}sub hmac_hex {unpack("H*",&hmac)}1;
 DIGEST_HMAC
 
-$fatpacked{"Digest/HMAC_MD5.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'DIGEST_HMAC_MD5';
-  package Digest::HMAC_MD5;$VERSION="1.01";use strict;use Digest::MD5 qw(md5);use Digest::HMAC qw(hmac);use vars qw(@ISA);@ISA=qw(Digest::HMAC);sub new {my$class=shift;$class->SUPER::new($_[0],"Digest::MD5",64)}require Exporter;*import=\&Exporter::import;use vars qw(@EXPORT_OK);@EXPORT_OK=qw(hmac_md5 hmac_md5_hex);sub hmac_md5 {hmac($_[0],$_[1],\&md5,64)}sub hmac_md5_hex {unpack("H*",&hmac_md5)}1;
-DIGEST_HMAC_MD5
-
-$fatpacked{"Digest/HMAC_SHA1.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'DIGEST_HMAC_SHA1';
-  package Digest::HMAC_SHA1;$VERSION="1.03";use strict;use Digest::SHA::PurePerl qw(sha1);use Digest::HMAC qw(hmac);use vars qw(@ISA);@ISA=qw(Digest::HMAC);sub new {my$class=shift;$class->SUPER::new($_[0],"Digest::SHA",64)}require Exporter;*import=\&Exporter::import;use vars qw(@EXPORT_OK);@EXPORT_OK=qw(hmac_sha1 hmac_sha1_hex);sub hmac_sha1 {hmac($_[0],$_[1],\&sha1,64)}sub hmac_sha1_hex {unpack("H*",&hmac_sha1)}1;
-DIGEST_HMAC_SHA1
-
 $fatpacked{"Digest/SHA/PurePerl.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'DIGEST_SHA_PUREPERL';
-  package Digest::SHA::PurePerl;require 5.003000;use strict;use warnings;use vars qw($VERSION @ISA @EXPORT @EXPORT_OK);use Fcntl;use integer;use Carp qw(croak);$VERSION='5.95';require Exporter;@ISA=qw(Exporter);@EXPORT_OK=();eval {require Digest::base;push(@ISA,'Digest::base')};my$MAX32=0xffffffff;my$uses64bit=(((1 << 16)<< 16)<< 16)<< 15;my@H01=(0x67452301,0xefcdab89,0x98badcfe,0x10325476,0xc3d2e1f0);my@H0224=(0xc1059ed8,0x367cd507,0x3070dd17,0xf70e5939,0xffc00b31,0x68581511,0x64f98fa7,0xbefa4fa4);my@H0256=(0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19);my(@H0384,@H0512,@H0512224,@H0512256);sub _c_SL32 {my($x,$n)=@_;"($x << $n)"}sub _c_SR32 {my($x,$n)=@_;my$mask=(1 << (32 - $n))- 1;"(($x >> $n) & $mask)"}sub _c_Ch {my($x,$y,$z)=@_;"($z ^ ($x & ($y ^ $z)))"}sub _c_Pa {my($x,$y,$z)=@_;"($x ^ $y ^ $z)"}sub _c_Ma {my($x,$y,$z)=@_;"(($x & $y) | ($z & ($x | $y)))"}sub _c_ROTR {my($x,$n)=@_;"(" ._c_SR32($x,$n)." | " ._c_SL32($x,32 - $n).")"}sub _c_ROTL {my($x,$n)=@_;"(" ._c_SL32($x,$n)." | " ._c_SR32($x,32 - $n).")"}sub _c_SIGMA0 {my($x)=@_;"(" ._c_ROTR($x,2)." ^ " ._c_ROTR($x,13)." ^ " ._c_ROTR($x,22).")"}sub _c_SIGMA1 {my($x)=@_;"(" ._c_ROTR($x,6)." ^ " ._c_ROTR($x,11)." ^ " ._c_ROTR($x,25).")"}sub _c_sigma0 {my($x)=@_;"(" ._c_ROTR($x,7)." ^ " ._c_ROTR($x,18)." ^ " ._c_SR32($x,3).")"}sub _c_sigma1 {my($x)=@_;"(" ._c_ROTR($x,17)." ^ " ._c_ROTR($x,19)." ^ " ._c_SR32($x,10).")"}sub _c_M1Ch {my($a,$b,$c,$d,$e,$k,$w)=@_;"$e += " ._c_ROTL($a,5)." + " ._c_Ch($b,$c,$d)." + $k + $w; $b = " ._c_ROTL($b,30).";\n"}sub _c_M1Pa {my($a,$b,$c,$d,$e,$k,$w)=@_;"$e += " ._c_ROTL($a,5)." + " ._c_Pa($b,$c,$d)." + $k + $w; $b = " ._c_ROTL($b,30).";\n"}sub _c_M1Ma {my($a,$b,$c,$d,$e,$k,$w)=@_;"$e += " ._c_ROTL($a,5)." + " ._c_Ma($b,$c,$d)." + $k + $w; $b = " ._c_ROTL($b,30).";\n"}sub _c_M11Ch {my($k,$w)=@_;_c_M1Ch('$a','$b','$c','$d','$e',$k,$w)}sub _c_M11Pa {my($k,$w)=@_;_c_M1Pa('$a','$b','$c','$d','$e',$k,$w)}sub _c_M11Ma {my($k,$w)=@_;_c_M1Ma('$a','$b','$c','$d','$e',$k,$w)}sub _c_M12Ch {my($k,$w)=@_;_c_M1Ch('$e','$a','$b','$c','$d',$k,$w)}sub _c_M12Pa {my($k,$w)=@_;_c_M1Pa('$e','$a','$b','$c','$d',$k,$w)}sub _c_M12Ma {my($k,$w)=@_;_c_M1Ma('$e','$a','$b','$c','$d',$k,$w)}sub _c_M13Ch {my($k,$w)=@_;_c_M1Ch('$d','$e','$a','$b','$c',$k,$w)}sub _c_M13Pa {my($k,$w)=@_;_c_M1Pa('$d','$e','$a','$b','$c',$k,$w)}sub _c_M13Ma {my($k,$w)=@_;_c_M1Ma('$d','$e','$a','$b','$c',$k,$w)}sub _c_M14Ch {my($k,$w)=@_;_c_M1Ch('$c','$d','$e','$a','$b',$k,$w)}sub _c_M14Pa {my($k,$w)=@_;_c_M1Pa('$c','$d','$e','$a','$b',$k,$w)}sub _c_M14Ma {my($k,$w)=@_;_c_M1Ma('$c','$d','$e','$a','$b',$k,$w)}sub _c_M15Ch {my($k,$w)=@_;_c_M1Ch('$b','$c','$d','$e','$a',$k,$w)}sub _c_M15Pa {my($k,$w)=@_;_c_M1Pa('$b','$c','$d','$e','$a',$k,$w)}sub _c_M15Ma {my($k,$w)=@_;_c_M1Ma('$b','$c','$d','$e','$a',$k,$w)}sub _c_W11 {my($s)=@_;'$W[' .(($s + 0)& 0xf).']'}sub _c_W12 {my($s)=@_;'$W[' .(($s + 13)& 0xf).']'}sub _c_W13 {my($s)=@_;'$W[' .(($s + 8)& 0xf).']'}sub _c_W14 {my($s)=@_;'$W[' .(($s + 2)& 0xf).']'}sub _c_A1 {my($s)=@_;my$tmp=_c_W11($s)." ^ " ._c_W12($s)." ^ " ._c_W13($s)." ^ " ._c_W14($s);"((\$tmp = $tmp), (" ._c_W11($s)." = " ._c_ROTL('$tmp',1)."))"}my$sha1_code='
+  package Digest::SHA::PurePerl;require 5.003000;use strict;use warnings;use vars qw($VERSION @ISA @EXPORT_OK $errmsg);use Fcntl qw(O_RDONLY);use integer;use Carp qw(croak);$VERSION='6.01';require Exporter;@ISA=qw(Exporter);@EXPORT_OK=('$errmsg');eval {require Digest::base;push(@ISA,'Digest::base')};my$MAX32=0xffffffff;my$uses64bit=(((1 << 16)<< 16)<< 16)<< 15;my@H01=(0x67452301,0xefcdab89,0x98badcfe,0x10325476,0xc3d2e1f0);my@H0224=(0xc1059ed8,0x367cd507,0x3070dd17,0xf70e5939,0xffc00b31,0x68581511,0x64f98fa7,0xbefa4fa4);my@H0256=(0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19);my(@H0384,@H0512,@H0512224,@H0512256);sub _c_SL32 {my($x,$n)=@_;"($x << $n)"}sub _c_SR32 {my($x,$n)=@_;my$mask=(1 << (32 - $n))- 1;"(($x >> $n) & $mask)"}sub _c_Ch {my($x,$y,$z)=@_;"($z ^ ($x & ($y ^ $z)))"}sub _c_Pa {my($x,$y,$z)=@_;"($x ^ $y ^ $z)"}sub _c_Ma {my($x,$y,$z)=@_;"(($x & $y) | ($z & ($x | $y)))"}sub _c_ROTR {my($x,$n)=@_;"(" ._c_SR32($x,$n)." | " ._c_SL32($x,32 - $n).")"}sub _c_ROTL {my($x,$n)=@_;"(" ._c_SL32($x,$n)." | " ._c_SR32($x,32 - $n).")"}sub _c_SIGMA0 {my($x)=@_;"(" ._c_ROTR($x,2)." ^ " ._c_ROTR($x,13)." ^ " ._c_ROTR($x,22).")"}sub _c_SIGMA1 {my($x)=@_;"(" ._c_ROTR($x,6)." ^ " ._c_ROTR($x,11)." ^ " ._c_ROTR($x,25).")"}sub _c_sigma0 {my($x)=@_;"(" ._c_ROTR($x,7)." ^ " ._c_ROTR($x,18)." ^ " ._c_SR32($x,3).")"}sub _c_sigma1 {my($x)=@_;"(" ._c_ROTR($x,17)." ^ " ._c_ROTR($x,19)." ^ " ._c_SR32($x,10).")"}sub _c_M1Ch {my($a,$b,$c,$d,$e,$k,$w)=@_;"$e += " ._c_ROTL($a,5)." + " ._c_Ch($b,$c,$d)." + $k + $w; $b = " ._c_ROTL($b,30).";\n"}sub _c_M1Pa {my($a,$b,$c,$d,$e,$k,$w)=@_;"$e += " ._c_ROTL($a,5)." + " ._c_Pa($b,$c,$d)." + $k + $w; $b = " ._c_ROTL($b,30).";\n"}sub _c_M1Ma {my($a,$b,$c,$d,$e,$k,$w)=@_;"$e += " ._c_ROTL($a,5)." + " ._c_Ma($b,$c,$d)." + $k + $w; $b = " ._c_ROTL($b,30).";\n"}sub _c_M11Ch {my($k,$w)=@_;_c_M1Ch('$a','$b','$c','$d','$e',$k,$w)}sub _c_M11Pa {my($k,$w)=@_;_c_M1Pa('$a','$b','$c','$d','$e',$k,$w)}sub _c_M11Ma {my($k,$w)=@_;_c_M1Ma('$a','$b','$c','$d','$e',$k,$w)}sub _c_M12Ch {my($k,$w)=@_;_c_M1Ch('$e','$a','$b','$c','$d',$k,$w)}sub _c_M12Pa {my($k,$w)=@_;_c_M1Pa('$e','$a','$b','$c','$d',$k,$w)}sub _c_M12Ma {my($k,$w)=@_;_c_M1Ma('$e','$a','$b','$c','$d',$k,$w)}sub _c_M13Ch {my($k,$w)=@_;_c_M1Ch('$d','$e','$a','$b','$c',$k,$w)}sub _c_M13Pa {my($k,$w)=@_;_c_M1Pa('$d','$e','$a','$b','$c',$k,$w)}sub _c_M13Ma {my($k,$w)=@_;_c_M1Ma('$d','$e','$a','$b','$c',$k,$w)}sub _c_M14Ch {my($k,$w)=@_;_c_M1Ch('$c','$d','$e','$a','$b',$k,$w)}sub _c_M14Pa {my($k,$w)=@_;_c_M1Pa('$c','$d','$e','$a','$b',$k,$w)}sub _c_M14Ma {my($k,$w)=@_;_c_M1Ma('$c','$d','$e','$a','$b',$k,$w)}sub _c_M15Ch {my($k,$w)=@_;_c_M1Ch('$b','$c','$d','$e','$a',$k,$w)}sub _c_M15Pa {my($k,$w)=@_;_c_M1Pa('$b','$c','$d','$e','$a',$k,$w)}sub _c_M15Ma {my($k,$w)=@_;_c_M1Ma('$b','$c','$d','$e','$a',$k,$w)}sub _c_W11 {my($s)=@_;'$W[' .(($s + 0)& 0xf).']'}sub _c_W12 {my($s)=@_;'$W[' .(($s + 13)& 0xf).']'}sub _c_W13 {my($s)=@_;'$W[' .(($s + 8)& 0xf).']'}sub _c_W14 {my($s)=@_;'$W[' .(($s + 2)& 0xf).']'}sub _c_A1 {my($s)=@_;my$tmp=_c_W11($s)." ^ " ._c_W12($s)." ^ " ._c_W13($s)." ^ " ._c_W14($s);"((\$tmp = $tmp), (" ._c_W11($s)." = " ._c_ROTL('$tmp',1)."))"}my$sha1_code='
   
   my($K1, $K2, $K3, $K4) = (	# SHA-1 constants
   	0x5a827999, 0x6ed9eba1, 0x8f1bbcdc, 0xca62c1d6
@@ -1587,11 +1699,11 @@ $fatpacked{"Digest/SHA/PurePerl.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n
   			for (@_) { _hmacWrite(\$_, length($_), $state) }
   			_hmacfinish($state);
   			_hmac' .$suffix_intern[$i].'($state);
-  		}';eval($fcn);push(@EXPORT_OK,'hmac_sha' .$alg .$suffix_extern[$i])}}sub hashsize {my$self=shift;_shadsize($self)<< 3}sub algorithm {my$self=shift;$self->{alg}}sub add {my$self=shift;for (@_){_shaWrite(\$_,length($_),$self)}$self}sub digest {my$self=shift;_shafinish($self);my$rsp=_shadigest($self);_sharewind($self);$rsp}sub hexdigest {my$self=shift;_shafinish($self);my$rsp=_shahex($self);_sharewind($self);$rsp}sub b64digest {my$self=shift;_shafinish($self);my$rsp=_shabase64($self);_sharewind($self);$rsp}sub new {my($class,$alg)=@_;$alg =~ s/\D+//g if defined$alg;if (ref($class)){if (!defined($alg)|| ($alg==$class->algorithm)){_sharewind($class);return($class)}my$self=_shaopen($alg)or return;return(_shacpy($class,$self))}$alg=1 unless defined$alg;my$self=_shaopen($alg)or return;bless($self,$class);$self}sub clone {my$self=shift;my$copy=_shadup($self)or return;bless($copy,ref($self))}BEGIN {*reset=\&new}sub add_bits {my($self,$data,$nbits)=@_;unless (defined$nbits){$nbits=length($data);$data=pack("B*",$data)}$nbits=length($data)* 8 if$nbits > length($data)* 8;_shawrite($data,$nbits,$self);return($self)}sub _bail {my$msg=shift;$msg .= ": $!";croak$msg}sub _addfile {my ($self,$handle)=@_;my$n;my$buf="";while (($n=read($handle,$buf,4096))){$self->add($buf)}_bail("Read failed")unless defined$n;$self}{my$_can_T_filehandle;sub _istext {local*FH=shift;my$file=shift;if (!defined$_can_T_filehandle){local $^W=0;my$istext=eval {-T FH};$_can_T_filehandle=$@ ? 0 : 1;return$_can_T_filehandle ? $istext : -T $file}return$_can_T_filehandle ? -T FH : -T $file}}sub addfile {my ($self,$file,$mode)=@_;return(_addfile($self,$file))unless ref(\$file)eq 'SCALAR';$mode=defined($mode)? $mode : "";my ($binary,$UNIVERSAL,$BITS,$portable)=map {$_ eq $mode}("b","U","0","p");local*FH;$file eq '-' and open(FH,'< -')or sysopen(FH,$file,O_RDONLY)or _bail('Open failed');if ($BITS){my ($n,$buf)=(0,"");while (($n=read(FH,$buf,4096))){$buf =~ s/[^01]//g;$self->add_bits($buf)}_bail("Read failed")unless defined$n;close(FH);return($self)}binmode(FH)if$binary || $portable || $UNIVERSAL;if ($UNIVERSAL && _istext(*FH,$file)){while (<FH>){s/\015\012/\012/g;s/\015/\012/g;$self->add($_)}}elsif ($portable && _istext(*FH,$file)){while (<FH>){s/\015?\015\012/\012/g;s/\015/\012/g;$self->add($_)}}else {$self->_addfile(*FH)}close(FH);$self}sub getstate {my$self=shift;return _shadump($self)}sub putstate {my$class=shift;my$state=shift;if (ref($class)){my$self=_shaload($state)or return;return(_shacpy($class,$self))}my$self=_shaload($state)or return;bless($self,$class);return($self)}sub dump {my$self=shift;my$file=shift;my$state=$self->getstate or return;$file="-" if (!defined($file)|| $file eq "");local*FH;open(FH,"> $file")or return;print FH$state;close(FH);return($self)}sub load {my$class=shift;my$file=shift;$file="-" if (!defined($file)|| $file eq "");local*FH;open(FH,"< $file")or return;my$str=join('',<FH>);close(FH);$class->putstate($str)}1;
+  		}';eval($fcn);push(@EXPORT_OK,'hmac_sha' .$alg .$suffix_extern[$i])}}sub hashsize {my$self=shift;_shadsize($self)<< 3}sub algorithm {my$self=shift;$self->{alg}}sub add {my$self=shift;for (@_){_shaWrite(\$_,length($_),$self)}$self}sub digest {my$self=shift;_shafinish($self);my$rsp=_shadigest($self);_sharewind($self);$rsp}sub hexdigest {my$self=shift;_shafinish($self);my$rsp=_shahex($self);_sharewind($self);$rsp}sub b64digest {my$self=shift;_shafinish($self);my$rsp=_shabase64($self);_sharewind($self);$rsp}sub new {my($class,$alg)=@_;$alg =~ s/\D+//g if defined$alg;if (ref($class)){if (!defined($alg)|| ($alg==$class->algorithm)){_sharewind($class);return($class)}my$self=_shaopen($alg)or return;return(_shacpy($class,$self))}$alg=1 unless defined$alg;my$self=_shaopen($alg)or return;bless($self,$class);$self}sub clone {my$self=shift;my$copy=_shadup($self)or return;bless($copy,ref($self))}BEGIN {*reset=\&new}sub add_bits {my($self,$data,$nbits)=@_;unless (defined$nbits){$nbits=length($data);$data=pack("B*",$data)}$nbits=length($data)* 8 if$nbits > length($data)* 8;_shawrite($data,$nbits,$self);return($self)}sub _bail {my$msg=shift;$errmsg=$!;$msg .= ": $!";croak$msg}sub _addfile {my ($self,$handle)=@_;my$n;my$buf="";while (($n=read($handle,$buf,4096))){$self->add($buf)}_bail("Read failed")unless defined$n;$self}{my$_can_T_filehandle;sub _istext {local*FH=shift;my$file=shift;if (!defined$_can_T_filehandle){local $^W=0;my$istext=eval {-T FH};$_can_T_filehandle=$@ ? 0 : 1;return$_can_T_filehandle ? $istext : -T $file}return$_can_T_filehandle ? -T FH : -T $file}}sub addfile {my ($self,$file,$mode)=@_;return(_addfile($self,$file))unless ref(\$file)eq 'SCALAR';$mode=defined($mode)? $mode : "";my ($binary,$UNIVERSAL,$BITS)=map {$_ eq $mode}("b","U","0");local*FH;$file eq '-' and open(FH,'< -')or sysopen(FH,$file,O_RDONLY)or _bail('Open failed');if ($BITS){my ($n,$buf)=(0,"");while (($n=read(FH,$buf,4096))){$buf =~ tr/01//cd;$self->add_bits($buf)}_bail("Read failed")unless defined$n;close(FH);return($self)}binmode(FH)if$binary || $UNIVERSAL;if ($UNIVERSAL && _istext(*FH,$file)){while (<FH>){s/\015\012/\012/g;s/\015/\012/g;$self->add($_)}}else {$self->_addfile(*FH)}close(FH);$self}sub getstate {my$self=shift;return _shadump($self)}sub putstate {my$class=shift;my$state=shift;if (ref($class)){my$self=_shaload($state)or return;return(_shacpy($class,$self))}my$self=_shaload($state)or return;bless($self,$class);return($self)}sub dump {my$self=shift;my$file=shift;my$state=$self->getstate or return;$file="-" if (!defined($file)|| $file eq "");local*FH;open(FH,"> $file")or return;print FH$state;close(FH);return($self)}sub load {my$class=shift;my$file=shift;$file="-" if (!defined($file)|| $file eq "");local*FH;open(FH,"< $file")or return;my$str=join('',<FH>);close(FH);$class->putstate($str)}1;
 DIGEST_SHA_PUREPERL
 
 $fatpacked{"IPC/Open3.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'IPC_OPEN3';
-  package IPC::Open3;use strict;no strict 'refs';our ($VERSION,@ISA,@EXPORT);require Exporter;use Carp;use Symbol qw(gensym qualify);$VERSION='1.18';@ISA=qw(Exporter);@EXPORT=qw(open3);our$Me='open3 (bug)';sub xpipe {pipe $_[0],$_[1]or croak "$Me: pipe($_[0], $_[1]) failed: $!"}sub xopen {open $_[0],$_[1],@_[2..$#_]and return;local $"=', ';carp "$Me: open(@_) failed: $!"}sub xclose {$_[0]=~ /\A=?(\d+)\z/ ? do {my$fh;open($fh,$_[1].'&=' .$1)and close($fh)}: close $_[0]or croak "$Me: close($_[0]) failed: $!"}sub xfileno {return $1 if $_[0]=~ /\A=?(\d+)\z/;return fileno $_[0]}use constant FORCE_DEBUG_SPAWN=>0;use constant DO_SPAWN=>$^O eq 'os2' || $^O eq 'MSWin32' || FORCE_DEBUG_SPAWN;sub _open3 {local$Me=shift;splice @_,0,1,undef if \$_[0]==\undef;splice @_,1,1,undef if \$_[1]==\undef;unless (eval {$_[0]=gensym unless defined $_[0]&& length $_[0];$_[1]=gensym unless defined $_[1]&& length $_[1];1}){$@ =~ s/(?<=value attempted) at .*//s;croak "$Me: $@"}my@handles=({mode=>'<',handle=>\*STDIN },{mode=>'>',handle=>\*STDOUT },{mode=>'>',handle=>\*STDERR },);for (@handles){$_->{parent}=shift;$_->{open_as}=gensym}if (@_ > 1 and $_[0]eq '-'){croak "Arguments don't make sense when the command is '-'"}$handles[2]{parent}||=$handles[1]{parent};$handles[2]{dup_of_out}=$handles[1]{parent}eq $handles[2]{parent};my$package;for (@handles){$_->{dup}=($_->{parent}=~ s/^[<>]&//);if ($_->{parent}!~ /\A=?(\d+)\z/){$package=caller 1 if (!defined$package);$_->{parent}=qualify $_->{parent},$package}next if $_->{dup}or $_->{dup_of_out};if ($_->{mode}eq '<'){xpipe $_->{open_as},$_->{parent}}else {xpipe $_->{parent},$_->{open_as}}}my$kidpid;if (!DO_SPAWN){xpipe my$stat_r,my$stat_w;$kidpid=fork;croak "$Me: fork failed: $!" unless defined$kidpid;if ($kidpid==0){eval {untie*STDIN;untie*STDOUT;untie*STDERR;close$stat_r;require Fcntl;my$flags=fcntl$stat_w,&Fcntl::F_GETFD,0;croak "$Me: fcntl failed: $!" unless$flags;fcntl$stat_w,&Fcntl::F_SETFD,$flags|&Fcntl::FD_CLOEXEC or croak "$Me: fcntl failed: $!";if (!$handles[2]{dup_of_out}&& $handles[2]{dup}&& xfileno($handles[2]{parent})==fileno \*STDOUT){my$tmp=gensym;xopen($tmp,'>&',$handles[2]{parent});$handles[2]{parent}=$tmp}for (@handles){if ($_->{dup_of_out}){xopen \*STDERR,">&STDOUT" if defined fileno STDERR && fileno STDERR!=fileno STDOUT}elsif ($_->{dup}){xopen $_->{handle},$_->{mode}.'&',$_->{parent}if fileno $_->{handle}!=xfileno($_->{parent})}else {xclose $_->{parent},$_->{mode};xopen $_->{handle},$_->{mode}.'&=',fileno $_->{open_as}}}return 1 if ($_[0]eq '-');exec @_ or do {local($")=(" ");croak "$Me: exec of @_ failed"}}and do {close$stat_w;return 0};my$bang=0+$!;my$err=$@;utf8::encode$err if $] >= 5.008;print$stat_w pack('IIa*',$bang,length($err),$err);close$stat_w;eval {require POSIX;POSIX::_exit(255)};exit 255}else {close$stat_w;my$to_read=length(pack('I',0))* 2;my$bytes_read=read($stat_r,my$buf='',$to_read);if ($bytes_read){(my$bang,$to_read)=unpack('II',$buf);read($stat_r,my$err='',$to_read);waitpid$kidpid,0;if ($err){utf8::decode$err if $] >= 5.008}else {$err="$Me: " .($!=$bang)}$!=$bang;die($err)}}}else {my@close;for (@handles){if ($_->{dup_of_out}){$_->{open_as}=$handles[1]{open_as}}elsif ($_->{dup}){$_->{open_as}=$_->{parent}=~ /\A[0-9]+\z/ ? $_->{parent}: \*{$_->{parent}};push@close,$_->{open_as}}else {push@close,\*{$_->{parent}},$_->{open_as}}}require IO::Pipe;$kidpid=eval {spawn_with_handles(\@handles,\@close,@_)};die "$Me: $@" if $@}for (@handles){next if $_->{dup}or $_->{dup_of_out};xclose $_->{open_as},$_->{mode}}xclose$handles[0]{parent},$handles[0]{mode}if$handles[0]{dup};select((select($handles[0]{parent}),$|=1)[0]);$kidpid}sub open3 {if (@_ < 4){local $"=', ';croak "open3(@_): not enough arguments"}return _open3 'open3',@_}sub spawn_with_handles {my$fds=shift;my$close_in_child=shift;my ($fd,%saved,@errs);for$fd (@$fds){$fd->{tmp_copy}=IO::Handle->new_from_fd($fd->{handle},$fd->{mode});$saved{fileno$fd->{handle}}=$fd->{tmp_copy}if$fd->{tmp_copy}}for$fd (@$fds){bless$fd->{handle},'IO::Handle' unless eval {$fd->{handle}->isa('IO::Handle')};my$open_as=$fd->{open_as};my$fileno=fileno($open_as);$fd->{handle}->fdopen(defined($fileno)? $saved{$fileno}|| $open_as : $open_as,$fd->{mode})}unless ($^O eq 'MSWin32'){require Fcntl;for$fd (@$close_in_child){next unless fileno$fd;fcntl($fd,Fcntl::F_SETFD(),1)or push@errs,"fcntl $fd: $!" unless$saved{fileno$fd}}}my$pid;unless (@errs){if (FORCE_DEBUG_SPAWN){pipe my$r,my$w or die "Pipe failed: $!";$pid=fork;die "Fork failed: $!" unless defined$pid;if (!$pid){{no warnings;exec @_}print$w 0 + $!;close$w;require POSIX;POSIX::_exit(255)}close$w;my$bad=<$r>;if (defined$bad){$!=$bad;undef$pid}}else {$pid=eval {system 1,@_}}push@errs,"IO::Pipe: Can't spawn-NOWAIT: $!" if!$pid || $pid < 0}for$fd (reverse @$fds){$fd->{handle}->fdopen($fd->{tmp_copy},$fd->{mode})}for (values%saved){$_->close or croak "Can't close: $!"}croak join "\n",@errs if@errs;return$pid}1;
+  package IPC::Open3;use strict;no strict 'refs';our ($VERSION,@ISA,@EXPORT);require Exporter;use Carp;use Symbol qw(gensym qualify);$VERSION='1.20';@ISA=qw(Exporter);@EXPORT=qw(open3);our$Me='open3 (bug)';sub xpipe {pipe $_[0],$_[1]or croak "$Me: pipe($_[0], $_[1]) failed: $!"}sub xopen {open $_[0],$_[1],@_[2..$#_]and return;local $"=', ';carp "$Me: open(@_) failed: $!"}sub xclose {$_[0]=~ /\A=?(\d+)\z/ ? do {my$fh;open($fh,$_[1].'&=' .$1)and close($fh)}: close $_[0]or croak "$Me: close($_[0]) failed: $!"}sub xfileno {return $1 if $_[0]=~ /\A=?(\d+)\z/;return fileno $_[0]}use constant FORCE_DEBUG_SPAWN=>0;use constant DO_SPAWN=>$^O eq 'os2' || $^O eq 'MSWin32' || FORCE_DEBUG_SPAWN;sub _open3 {local$Me=shift;splice @_,0,1,undef if \$_[0]==\undef;splice @_,1,1,undef if \$_[1]==\undef;unless (eval {$_[0]=gensym unless defined $_[0]&& length $_[0];$_[1]=gensym unless defined $_[1]&& length $_[1];1}){$@ =~ s/(?<=value attempted) at .*//s;croak "$Me: $@"}my@handles=({mode=>'<',handle=>\*STDIN },{mode=>'>',handle=>\*STDOUT },{mode=>'>',handle=>\*STDERR },);for (@handles){$_->{parent}=shift;$_->{open_as}=gensym}if (@_ > 1 and $_[0]eq '-'){croak "Arguments don't make sense when the command is '-'"}$handles[2]{parent}||=$handles[1]{parent};$handles[2]{dup_of_out}=$handles[1]{parent}eq $handles[2]{parent};my$package;for (@handles){$_->{dup}=($_->{parent}=~ s/^[<>]&//);if ($_->{parent}!~ /\A=?(\d+)\z/){$package=caller 1 if (!defined$package);$_->{parent}=qualify $_->{parent},$package}next if $_->{dup}or $_->{dup_of_out};if ($_->{mode}eq '<'){xpipe $_->{open_as},$_->{parent}}else {xpipe $_->{parent},$_->{open_as}}}my$kidpid;if (!DO_SPAWN){xpipe my$stat_r,my$stat_w;$kidpid=fork;croak "$Me: fork failed: $!" unless defined$kidpid;if ($kidpid==0){eval {untie*STDIN;untie*STDOUT;untie*STDERR;close$stat_r;require Fcntl;my$flags=fcntl$stat_w,&Fcntl::F_GETFD,0;croak "$Me: fcntl failed: $!" unless$flags;fcntl$stat_w,&Fcntl::F_SETFD,$flags|&Fcntl::FD_CLOEXEC or croak "$Me: fcntl failed: $!";if (!$handles[2]{dup_of_out}&& $handles[2]{dup}&& xfileno($handles[2]{parent})==fileno \*STDOUT){my$tmp=gensym;xopen($tmp,'>&',$handles[2]{parent});$handles[2]{parent}=$tmp}for (@handles){if ($_->{dup_of_out}){xopen \*STDERR,">&STDOUT" if defined fileno STDERR && fileno STDERR!=fileno STDOUT}elsif ($_->{dup}){xopen $_->{handle},$_->{mode}.'&',$_->{parent}if fileno $_->{handle}!=xfileno($_->{parent})}else {xclose $_->{parent},$_->{mode};xopen $_->{handle},$_->{mode}.'&=',fileno $_->{open_as}}}return 1 if ($_[0]eq '-');exec @_ or do {local($")=(" ");croak "$Me: exec of @_ failed: $!"}}and do {close$stat_w;return 0};my$bang=0+$!;my$err=$@;utf8::encode$err if $] >= 5.008;print$stat_w pack('IIa*',$bang,length($err),$err);close$stat_w;eval {require POSIX;POSIX::_exit(255)};exit 255}else {close$stat_w;my$to_read=length(pack('I',0))* 2;my$bytes_read=read($stat_r,my$buf='',$to_read);if ($bytes_read){(my$bang,$to_read)=unpack('II',$buf);read($stat_r,my$err='',$to_read);waitpid$kidpid,0;if ($err){utf8::decode$err if $] >= 5.008}else {$err="$Me: " .($!=$bang)}$!=$bang;die($err)}}}else {my@close;for (@handles){if ($_->{dup_of_out}){$_->{open_as}=$handles[1]{open_as}}elsif ($_->{dup}){$_->{open_as}=$_->{parent}=~ /\A[0-9]+\z/ ? $_->{parent}: \*{$_->{parent}};push@close,$_->{open_as}}else {push@close,\*{$_->{parent}},$_->{open_as}}}require IO::Pipe;$kidpid=eval {spawn_with_handles(\@handles,\@close,@_)};die "$Me: $@" if $@}for (@handles){next if $_->{dup}or $_->{dup_of_out};xclose $_->{open_as},$_->{mode}}xclose$handles[0]{parent},$handles[0]{mode}if$handles[0]{dup};select((select($handles[0]{parent}),$|=1)[0]);$kidpid}sub open3 {if (@_ < 4){local $"=', ';croak "open3(@_): not enough arguments"}return _open3 'open3',@_}sub spawn_with_handles {my$fds=shift;my$close_in_child=shift;my ($fd,%saved,@errs);for$fd (@$fds){$fd->{tmp_copy}=IO::Handle->new_from_fd($fd->{handle},$fd->{mode});$saved{fileno$fd->{handle}}=$fd->{tmp_copy}if$fd->{tmp_copy}}for$fd (@$fds){bless$fd->{handle},'IO::Handle' unless eval {$fd->{handle}->isa('IO::Handle')};my$open_as=$fd->{open_as};my$fileno=fileno($open_as);$fd->{handle}->fdopen(defined($fileno)? $saved{$fileno}|| $open_as : $open_as,$fd->{mode})}unless ($^O eq 'MSWin32'){require Fcntl;for$fd (@$close_in_child){next unless fileno$fd;fcntl($fd,Fcntl::F_SETFD(),1)or push@errs,"fcntl $fd: $!" unless$saved{fileno$fd}}}my$pid;unless (@errs){if (FORCE_DEBUG_SPAWN){pipe my$r,my$w or die "Pipe failed: $!";$pid=fork;die "Fork failed: $!" unless defined$pid;if (!$pid){{no warnings;exec @_}print$w 0 + $!;close$w;require POSIX;POSIX::_exit(255)}close$w;my$bad=<$r>;if (defined$bad){$!=$bad;undef$pid}}else {$pid=eval {system 1,@_}}if($@){push@errs,"IO::Pipe: Can't spawn-NOWAIT: $@"}elsif(!$pid || $pid < 0){push@errs,"IO::Pipe: Can't spawn-NOWAIT: $!"}}for$fd (reverse @$fds){$fd->{handle}->fdopen($fd->{tmp_copy},$fd->{mode})}for (values%saved){$_->close or croak "Can't close: $!"}croak join "\n",@errs if@errs;return$pid}1;
 IPC_OPEN3
 
 s/^  //mg for values %fatpacked;
