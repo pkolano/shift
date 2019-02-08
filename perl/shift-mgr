@@ -71,7 +71,7 @@ use Text::ParseWords;
 require Tie::DB_FileLock;
 require Text::FormatTable;
 
-our $VERSION = 0.96;
+our $VERSION = 0.97;
 
 $Data::Dumper::Pair = " = ";
 $Data::Dumper::Sortkeys = 1;
@@ -117,6 +117,7 @@ my %conf = (
     data_expire => 604800,
     default_buffer => "4m",
     default_clients => 1,
+    default_cron => 1,
     default_files => "1k",
     'default_find-files' => "2k",
     default_hosts => 1,
@@ -1164,6 +1165,9 @@ sub get {
     } else {
         delete $meta{"throttled_$opts{host}$opts{cid}"};
     }
+
+    # ignore client cron value when globally disabled
+    $meta{cron} = 0 if (!$conf{default_cron});
 
     # send static options first
     debug_print('GET', "args=getopt,get_host text=$self\n");
@@ -3018,9 +3022,8 @@ sub put {
                             if ($x1 >= $end) {
                                 # remove range if min beyond end offset
                                 $range = undef;
-                            } elsif ($x2 > $end || $x2 - $x1 <= $conf{sum_split}) {
+                            } elsif ($x2 > $end) {
                                 # truncate dst if max beyond end offset
-                                # process whole src range if fits in one split
                                 $range = $x1 . "-" . $end
                             }
                         }
@@ -3993,8 +3996,7 @@ sub sync_local {
     open(SYNCQ, '<', "${sbase}_$$") or return;
 
     my $fhpid = open3_run([undef, undef, -1],
-#        "ssh $conf{sync_host} shift-mgr --sync");
-        "ssh $conf{sync_host} shift-mgr.test --sync");
+        "ssh $conf{sync_host} shift-mgr --sync");
     my ($out, $in) = ($fhpid->[0], $fhpid->[1]);
     my $rc0 = sync_return($in);
 

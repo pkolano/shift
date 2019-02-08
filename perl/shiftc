@@ -83,7 +83,7 @@ use constant SFTP_TRUNC => 0x10;
 use constant SFTP_WRITE => 0x02;
 use constant SFTP_EXCL => 0x20;
 
-our $VERSION = 0.96;
+our $VERSION = 0.97;
 
 $Data::Dumper::Indent = 0;
 $Data::Dumper::Purity = 1;
@@ -1520,64 +1520,15 @@ sub shift_ {
     }
 
     # this will either start a child or do nothing if one already started
-    shift_loop();
+    my $pid = shift_loop();
 
     # prevent cleanup
     $opts{sftp_d} = undef;
     $opts{k} = undef;
 
-    # do not use crontab when extra clients
+    # extra clients do not wait
     POSIX::_exit(0) if ($opts{id} =~ /\D/);
 
-#TODO: cron job will never exit if doesn't pass first checks (e.g. invalid key)
-    if ($opts{cron}) {
-        # install crontab
-        my $tab;
-        my $fhpid = open3_run([-1, undef, -1], "crontab -l");
-        while (defined $fhpid && defined ($_ = $fhpid->[1]->getline)) {
-            # ignore garbage added by crontab
-            next if (/^#.*(?:edit the master|installed on|Cron(ie)? version)/);
-            $tab .= $_;
-        }
-        open3_wait($fhpid);
-        # replace pid if entry already exists in crontab
-        if ($tab !~ s/(--id=$opts{id}\s+--pid=)\d+/$1$opts{child_pid}/) {
-            # construct new crontab entry
-            $tab .= "\n*/10 * * * * $opts{abs0}";
-            if (basename($opts{abs0}) !~ /^shift/) {
-                $tab .= " -u $opts{u}" if ($opts{u});
-                $tab .= " -b -p $opts{p} shift";
-            }
-            if ($opts{mgr}) {
-                my $mgr = escape($opts{mgr});
-                # percent needs to be escaped in crontab
-                $mgr =~ s/%/\\%/g;
-                $tab .= " --mgr=$mgr";
-            }
-            if ($opts{'mgr-user'}) {
-                my $user = escape($opts{'mgr-user'});
-                # percent needs to be escaped in crontab
-                $user =~ s/%/\\%/g;
-                $tab .= " --mgr-user=$user";
-            }
-            $tab .= " --mgr-identity=" . $opts{'mgr-identity'}
-                if ($opts{'mgr-identity'});
-            $tab .= " --identity=$opts{identity}" if ($opts{identity});
-            $tab .= " --user=$opts{user}" if ($opts{user});
-            # use >& so will be portable across csh/bash
-            $tab .= " --id=$opts{id} --pid=$opts{child_pid} >&/dev/null\n";
-        }
-        my ($fh, $file) = tempfile();
-        print $fh $tab;
-        close $fh;
-        open3_get([-1, -1, -1], "crontab $file");
-        $opts{cron} = 0 if ($?);
-        unlink $file;
-    }
-    if (!$opts{cron}) {
-        print STDERR "WARNING: Unable to install crontab or --no-cron option specified.\n";
-        print STDERR "         Automated recovery across host/process failures is disabled.\n";
-    }
     if ($opts{wait}) {
         print "Waiting for transfer to complete...";
         STDOUT->flush;
@@ -1589,7 +1540,7 @@ sub shift_ {
             my $monitor = $opts{monitor} ? "=$opts{monitor}" : "";
             shift_mgr("--monitor$monitor --id=$opts{id}");
         }
-        waitpid($opts{child_pid}, 0);
+        waitpid($pid, 0);
 =for mesh
         # use agent key directly since agent will have been killed by child
         $opts{sshmp} =~ s/^(ssh)/$1 -i $agent_key/;
@@ -1863,6 +1814,57 @@ sub shift_args {
         $nfiles++;
     }
     return $nfiles;
+}
+
+####################
+#### shift_cron ####
+####################
+sub shift_cron {
+    #TODO: cron job will never exit if doesn't pass first checks (e.g. invalid key)
+    # install crontab
+    my $tab;
+    my $fhpid = open3_run([-1, undef, -1], "crontab -l");
+    while (defined $fhpid && defined ($_ = $fhpid->[1]->getline)) {
+        # ignore garbage added by crontab
+        next if (/^#.*(?:edit the master|installed on|Cron(ie)? version)/);
+        $tab .= $_;
+    }
+    open3_wait($fhpid);
+    # replace pid if entry already exists in crontab
+    if ($tab !~ s/(--id=$opts{id}\s+--pid=)\d+/$1$$/) {
+        # construct new crontab entry
+        $tab .= "\n*/10 * * * * $opts{abs0}";
+        if (basename($opts{abs0}) !~ /^shift/) {
+            $tab .= " -u $opts{u}" if ($opts{u});
+            $tab .= " -b -p $opts{p} shift";
+        }
+        if ($opts{mgr}) {
+            my $mgr = escape($opts{mgr});
+            # percent needs to be escaped in crontab
+            $mgr =~ s/%/\\%/g;
+            $tab .= " --mgr=$mgr";
+        }
+        if ($opts{'mgr-user'}) {
+            my $user = escape($opts{'mgr-user'});
+            # percent needs to be escaped in crontab
+            $user =~ s/%/\\%/g;
+            $tab .= " --mgr-user=$user";
+        }
+        $tab .= " --mgr-identity=" . $opts{'mgr-identity'}
+            if ($opts{'mgr-identity'});
+        $tab .= " --identity=$opts{identity}" if ($opts{identity});
+        $tab .= " --user=$opts{user}" if ($opts{user});
+        # use >& so will be portable across csh/bash
+        $tab .= " --id=$opts{id} --pid=$$ >&/dev/null\n";
+    }
+    my ($fh, $file) = tempfile();
+    print $fh $tab;
+    close $fh;
+    open3_get([-1, -1, -1], "crontab $file");
+    $opts{cron} = 0 if ($?);
+    unlink $file;
+    # record that crontab now exists
+    $opts{crontab} = 1;
 }
 
 ####################
@@ -2292,8 +2294,8 @@ sub shift_load {
 # perform various interactions with shift manager to transfer files
 sub shift_loop {
     # detach process
-    $opts{child_pid} = fork if (!$opts{child_pid});
-    return if ($opts{child_pid});
+    my $pid = fork;
+    return $pid if ($pid);
 
     # detach process
     close STDIN;
@@ -2632,6 +2634,9 @@ sub shift_loop {
                 }
             }
         }
+
+        # handle cron after opts have been received from manager
+        shift_cron() if (!$opts{crontab} && $opts{cron});
 
         $size = transport('end');
         my $time = time - $run;

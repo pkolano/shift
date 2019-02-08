@@ -249,3 +249,9 @@ CHANGES
     - Removed manager lustre_default_stripe config setting
     - Removed manager min_split config setting
     - Removed previously allowed inverse options --preserve and --verify
+
+* Shift 6.1 (02/07/19)
+    - Added manager config to globally disable use of cron for restarts
+    - Fixed corruption tracking causing negative sizes/rates in --status
+    - Fixed inadvertent call of test shift-mgr during mgr synchronization
+    - Removed warning message when --no-cron specified

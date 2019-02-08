@@ -38,6 +38,9 @@ user_dir /home/%u/.shift
 #   (example: debug_alice 1)
 #debug_X 1
 
+# use cron to automatically restart transfers after host or process failures
+#default_cron 1
+
 # domain to which user accounts belong for email notifications
 #   (assumes user X can receive email at X@email_domain)
 #   (assumes localhost:25 SMTP server running on manager host)
