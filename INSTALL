@@ -101,7 +101,7 @@ Shift Installation and Configuration
     operations.  These operations include equivalents to those provided
     by posix_fadvise, fallocate, {get,set}facl, {get,set}fattr, and lfs.
     This utility must be built differently depending on whether the
-    system mount lustre (and has access to the corresponding liblustreapi
+    system mounts lustre (and has access to the corresponding liblustreapi
     library) or not.
 
     3.1. Systems mounting lustre file systems
