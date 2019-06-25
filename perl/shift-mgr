@@ -53,7 +53,7 @@ use Fcntl qw(:DEFAULT :flock :mode);
 use File::Basename;
 use File::Path;
 use File::Spec;
-use Getopt::Long qw(:config bundling no_ignore_case require_order);
+use Getopt::Long qw(:config bundling no_auto_abbrev no_ignore_case require_order);
 use IO::File;
 use IO::Handle;
 # use embedded IPC::Open3 since versions prior to perl 5.14.0 are buggy
@@ -71,7 +71,7 @@ use Text::ParseWords;
 require Tie::DB_FileLock;
 require Text::FormatTable;
 
-our $VERSION = 0.97;
+our $VERSION = 0.98;
 
 $Data::Dumper::Pair = " = ";
 $Data::Dumper::Sortkeys = 1;
@@ -121,6 +121,7 @@ my %conf = (
     default_files => "1k",
     'default_find-files' => "2k",
     default_hosts => 1,
+    default_interval => 30,
     default_local => "shift,fish,fish-tcp",
     default_preallocate => 0,
     default_remote => "shift",
@@ -557,10 +558,12 @@ if ($opts{alive}) {
 
     # move all running operations out of doing_* back into queues
     foreach my $file (glob "$opts{base}/doing_*") {
+        next if ($file =~ /\.gzi$/);
         # untaint file
         $file = $1 if ($file =~ /^(.*)$/);
         my $fdoing = get_doing($file);
         while (my ($key, $line) = each %{$fdoing}) {
+            $line =~ s/\s*\r?\n$//;
             # put operation in do/tree
             my %op = split(/[= ]+/, $line);
             my @args = split(/,/, $op{args});
@@ -578,6 +581,8 @@ if ($opts{alive}) {
         log_print($file, $gzs, escape(nfreeze({})) . "\n");
     }
     log_close($_, $gzs) foreach (keys %{$gzs});
+    # transfer may have finished after --restart=ignore
+    $meta{time1} = $time if (($meta{last} || $meta{e_find}) && !run());
 } elsif ($opts{stop}) {
     $meta{stop} = 1;
     $meta{time1} = $time;
@@ -611,11 +616,16 @@ if ($opts{get} || defined $opts{put}) {
     my $gzs = {};
     log_print($opts{doing}, $gzs, escape(nfreeze($doing)) . "\n");
     log_close($opts{doing}, $gzs);
+
+    # update running time average for manager get/put invocations
+    $meta{rc_mgr}++;
+    $meta{ra_mgr} *= ($meta{rc_mgr} - 1) / $meta{rc_mgr};
+    $meta{ra_mgr} += (time - $time) / $meta{rc_mgr};
 }
 
 # update log sizes
 foreach my $file (glob "$opts{base}/*") {
-    next if ($file =~ /\/(?:find|lock)$/);
+    next if ($file =~ /\/(?:find|lock|\S+\.gzi)$/);
     my $log = $file;
     $log =~ s/.*\///;
     $meta{"$log\_size"} = (stat $file)[7];
@@ -745,7 +755,17 @@ sub debug_print {
         # open user-specific debug file if not already open
         open($dbgfh, '>>', "$conf{user_dir}/$opts{user}.debug") if (!$dbgfh);
         print $dbgfh "$localtime $opts{host} $opts{id}$opts{cid} $type ";
+        if ($type eq 'DBG') {
+            # print stack trace when DBG lines added in code
+            my $i = 1;
+            my @stack;
+            while ((my @cd = (caller($i++)))) {
+                unshift(@stack, "$cd[3]:$cd[2]");
+            }
+            print $dbgfh "(", join(" -> ", @stack), ") ";
+        }
         print $dbgfh $_ foreach (@_);
+        $dbgfh->flush;
     }
     if ($type eq 'GET') {
         print $_ foreach (@_);
@@ -945,7 +965,10 @@ sub doing {
     %meta = %{get_meta("$dir/$opts{user}.$opts{id}/meta")};
     $opts{host} = "*" if (!$opts{host});
     foreach my $file (glob("$dir/$opts{user}.$opts{id}/doing_$opts{host}")) {
-        my $doing = get_doing($file);
+        next if ($file =~ /\.gzi$/);
+        # untaint file
+        $file = $1 if ($file =~ /^(.*)$/);
+        my $doing = get_doing($file, $opts{doing});
         $file =~ s/.*\///;
         print "$file = ", Dumper($doing);
     }
@@ -1222,11 +1245,15 @@ sub get {
 
     # keep copy of original doing so changes don't affect its own processing
     my $doing0 = dclone($doing);
-    my $ndoing = "0." . $meta{"$opts{doing}_size"};
+    # reverse size so won't end in 0 (so .N0 not reduced to .N after ++)
+    my $ndoing = "0." . reverse($meta{"$opts{doing}_size"});
     my $gzs = {};
-    my ($ldoing, $kdoing, $size, $files, $ops, $all, $skip);
+    my ($ldoing, $kdoing, $size, $files, $ops, $all, $secs, $skip);
     my (%diskfs, %localfs, %rtthost);
     my %cli_load = split(/[= ]+/, $meta{"load_$opts{host}$opts{cid}"});
+    my $ncli = grep(/^doing_/, keys %meta);
+    # adjust interval so average waiting clients is no more than 1
+    $opts{interval} = max($meta{interval}, $ncli * $meta{ra_mgr});
     LOG: foreach my $log (@logs) {
         # process dir attrs last by themselves
         last if ($log eq 'rtree' && (!$meta{last} || $meta{t_run} || $ops ||
@@ -1245,7 +1272,8 @@ sub get {
             $gzs->{$log}->seek($meta{$log}, $whence);
         }
 
-        while ($size < $meta{size} && $all < $meta{files} &&
+        while (($size < $meta{size} && $all < $meta{files} ||
+                $secs < $opts{interval}) &&
                 ($log =~ /^doing_/ && (($kdoing, $line) = each %{$ldoing}) ||
                 $log eq 'rtree' && defined($line = last_line($gzs->{rtree})) ||
                 $log !~ /^(?:doing_|rtree)/ &&
@@ -1296,7 +1324,7 @@ sub get {
                 if ($args[$i] !~ /^\//) {
                     # do not map remote tar dst to prevent size/split corruption
                     next if ($i == 1 && $cmd eq 'find' && $meta{'create-tar'});
-                    # allow map_remote to avoid last host's caching
+                    # help map_remote avoid last host's caching
                     if ($cmd eq 'cksum' && $op{cache_rclient}) {
                         $ref->{last} = $op{cache_rclient};
                     } elsif ($op{cache_client}) {
@@ -1450,6 +1478,13 @@ sub get {
             $size += $op{size} if ($cmd =~ /^(?:cp|sum|cksum)/);
             $ops++ if ($log ne 'rtree');
             $all++;
+            if ($meta{"ra_$cmd"} > 0) {
+                $secs += ($cmd =~ /^(?:cp|sum|cksum)/ ?
+                    $op{size} : 1) / $meta{"ra_$cmd"};
+            } else {
+                # default to files/size setting until rates available
+                $secs += $opts{interval};
+            }
             $meta{s_run} += $op{size} if ($op{size});
             $meta{t_run}++;
             $meta{w_run}-- if ($op{state} eq 'warn');
@@ -1705,15 +1740,21 @@ sub get {
 ###################
 #### get_doing ####
 ###################
-# return last list of operations in progress on given host
+# return past list of operations in progress on given host
 sub get_doing {
     my $arg = shift;
+    my $past = shift;
+    $past = 1 if (!defined $past);
+    # untaint file
+    $arg = $1 if ($arg =~ /^(.*)$/);
     return {} if (! -e $arg);
     my $gz = Compress::BGZF::Reader->new_filehandle($arg);
     return {} if (!$gz);
     $gz->seek(-1, 2);
-    my $line = last_line($gz);
-    close $gz;
+    my $line;
+    $line = last_line($gz) while ($past-- > 0);
+    my $log = basename($arg);
+    log_close($log, {$log => $gz});
     return thaw(unescape($line)) if ($line);
     return {};
 }
@@ -1755,7 +1796,7 @@ sub get_meta {
     if ($meta && defined $mtell && $mtell > 0) {
         # metadata corrupted so revert to last known good state
         foreach my $file (glob "$opts{base}/*") {
-            next if ($file =~ /\/(?:find|lock|meta)$/);
+            next if ($file =~ /\/(?:find|lock|meta|\S+\.gzi)$/);
             my $log = $file;
             $log =~ s/.*\///;
             my $size = defined $meta->{"$log\_size"} ? $meta->{"$log\_size"} : 0;
@@ -1763,6 +1804,8 @@ sub get_meta {
             $file = $1 if ($file =~ /^(.*)$/);
             # truncate all logs to last known good size
             truncate($file, $size);
+            # remove associated index file
+            unlink("$file.gzi");
         }
         # rebuild find db since it may contain reverted operations
         build_find() if ($meta{dereference} && !$meta{'extract-tar'});
@@ -1789,8 +1832,11 @@ sub history {
     my @metas;
     my $dir = $> != 0 ? $conf{user_dir} : $opts{user_dir};
     my $user = $> != 0 ? $opts{user} : "*";
+    my $idglob = defined $opts{id} ? $opts{id} : "[0-9]*";
     do {
-        push(@metas, glob "$dir/$user.[0-9]*/meta");
+        push(@metas, glob "$dir/$user.$idglob/meta");
+        # glob still returns pattern when no wildcards and no files match
+        pop(@metas) if (defined $opts{id} && ! -f $metas[-1]);
         $dir .= "/*.more";
     } while (scalar(glob $dir));
     foreach my $file (sort {$> != 0 ?
@@ -1886,6 +1932,7 @@ sub id_status {
             my ($host, $ldoing, $kdoing);
             my $gzs = {};
             if ($state0 eq 'run') {
+                next if ($log =~ /\.gzi$/);
                 $host = $log;
                 $host =~ s/^doing_//;
                 $ldoing = get_doing("$opts{base}/$log");
@@ -1983,7 +2030,7 @@ sub init_id {
     }
 
     # initialize options with default values
-    foreach (qw(clients cpu hosts io ior iow net netr netw ports retry
+    foreach (qw(clients cpu hosts interval io ior iow net netr netw ports retry
             stripe threads)) {
         $meta{$_} = $conf{"default_$_"}
             if (!defined $meta{$_} && $conf{"default_$_"});
@@ -2040,11 +2087,11 @@ sub last_line {
     my $tell = $tell0;
     my ($buf, $line, $len, $pos);
     do {
-        $tell = $tell0 - 1024;
+        $tell = $tell0 - 4194304;
         $tell = 0 if ($tell < 0);
         # seek to earlier position in file
         $fh->seek($tell, 0);
-        my $len = 1024;
+        my $len = 4194304;
         $len = $tell0 - $tell if ($len > $tell0);
         # read up to initial location or that of last round
         $fh->read($line, $len);
@@ -2088,6 +2135,16 @@ sub log_close {
     # find/ln/mkdir are stored in cp
     $log = "cp" if ($log =~ /^(?:find|ln|mkdir)$/);
     if (defined $gzs->{$log}) {
+        my $bgr = tied *{$gzs->{$log}};
+        if (ref $bgr eq 'Compress::BGZF::Reader' &&
+                defined $bgr->{idx}->[-1]) {
+            my ($coff, $uoff) = @{$bgr->{idx}->[-1]};
+            # rtree is just tree in reverse
+	        my $f = $log eq 'rtree' ? 'tree' : $log;
+            $f = "$opts{base}/$f.gzi";
+            local $SIG{__WARN__} = sub {};
+            $bgr->write_index($f) if ($uoff && -s $f < int($uoff / 4096));
+        }
         close $gzs->{$log};
         delete $gzs->{$log};
     }
@@ -2129,6 +2186,7 @@ sub log_print {
     eval {
         if (!defined $line) {
             log_close($log, $gzs);
+            unlink("$opts{base}/$log.gzi");
             # force new file
             my $fh = Compress::BGZF::Writer->new_filehandle("$opts{base}/$log");
             close $fh;
@@ -2248,59 +2306,61 @@ sub map_remote {
         my $mnt1 = fs_mount($rhost, $rpath);
         # return original if no mount found
         return $path1 if (!$mnt1);
-        my $mnt2;
-        # find hosts that mount file system based on global/user db
-        my $key = "mounth_" . $mnt1->{remote};
-        my %hosts = map {$_->{$key} ? %{$_->{$key}} : ()}
-            (\%meta, \%mounts, \%umounts);
-        my %shells = map {$_->{shells} ? %{$_->{shells}} : ()}
-            (\%meta, \%mounts, \%umounts);
-        # determine potential hosts
-        foreach my $host (keys %hosts) {
-            delete $hosts{$host}
-                if (!map_fs_mount($mnt1, $host, $ref->{rw}) || !$shells{$host});
-        }
+        my $pick = $opts{"pick_$mnt1->{remote}"};
+        if (!defined $pick) {
+            # find hosts that mount file system based on global/user db
+            my $key = "mounth_" . $mnt1->{remote};
+            my %hosts = map {$_->{$key} ? %{$_->{$key}} : ()}
+                (\%meta, \%mounts, \%umounts);
+            my %shells = map {$_->{shells} ? %{$_->{shells}} : ()}
+                (\%meta, \%mounts, \%umounts);
+            # determine potential hosts
+            foreach my $host (keys %hosts) {
+                delete $hosts{$host}
+                    if (!map_fs_mount($mnt1, $host, $ref->{rw}) || !$shells{$host});
+            }
 
-        # prune last remote host to avoid checksum caching effects
-        delete $hosts{$ref->{last}}
-            if ($ref->{last} && scalar(keys %hosts) > 1);
+            # prune last remote host to avoid checksum caching effects
+            delete $hosts{$ref->{last}}
+                if ($ref->{last} && scalar(keys %hosts) > 1);
 
-        # prune potential hosts based on number currently assigned
-        my $min = 1E9;
-        my %min_hosts;
-        foreach my $host (keys %hosts) {
-            my $npicks = scalar(keys %{$meta{"picks_$host"}});
-            # don't count previous selection for this host
-            $npicks-- if ($meta{"picks_$host"}->{$lhost});
-            next if ($npicks > $min);
-            $min = $npicks;
-            $min_hosts{$npicks} = [] if (!defined $min_hosts{$npicks});
-            push(@{$min_hosts{$npicks}}, $host);
-        }
-        my %picks = map {$_ => 1} @{$min_hosts{$min}};
+            # prune potential hosts based on number currently assigned
+            my $min = 1E9;
+            my %min_hosts;
+            foreach my $host (keys %hosts) {
+                my $npicks = scalar(keys %{$meta{"picks_$host"}});
+                # don't count previous selection for this host
+                $npicks-- if ($meta{"picks_$host"}->{$lhost});
+                next if ($npicks > $min);
+                $min = $npicks;
+                $min_hosts{$npicks} = [] if (!defined $min_hosts{$npicks});
+                push(@{$min_hosts{$npicks}}, $host);
+            }
+            my %picks = map {$_ => 1} @{$min_hosts{$min}};
 
-        my $pick;
-        if (defined $conf{select_hook}) {
-            # select host using configured selection hook
-            $pick = open3_get([-1, undef, -1],
-                "$conf{select_hook} $lhost $rhost " . join(",", keys %picks));
+            if (defined $conf{select_hook}) {
+                # select host using configured selection hook
+                $pick = open3_get([-1, undef, -1],
+                    "$conf{select_hook} $lhost $rhost " . join(",", keys %picks));
+            }
+            # revert to default selection policy when no selection
+            $pick = default_select($rhost, keys %picks) if (!$pick);
+            $pick =~ s/\s*\r?\n$//;
+            if (!$pick) {
+                # store original mount info
+                $ref->{$_} = $mnt1->{$_} foreach (keys %{$mnt1});
+                # return original path if can't find suitable mount
+                return $path1 
+            }
+            # clear previously picked hosts
+            foreach (grep(/^picks_/, keys %meta)) {
+                delete $meta{$_}->{$lhost};
+                delete $meta{$_} if (scalar(keys %{$meta{$_}}) == 0);
+            }
+            # store that host has already been selected
+            $meta{"picks_$pick"}->{$lhost} = 1;
+            $opts{"pick_$mnt1->{remote}"} = $pick;
         }
-        # revert to default selection policy when no selection
-        $pick = default_select($rhost, keys %picks) if (!$pick);
-        $pick =~ s/\s*\r?\n$//;
-        if (!$pick) {
-            # store original mount info
-            $ref->{$_} = $mnt1->{$_} foreach (keys %{$mnt1});
-            # return original path if can't find suitable mount
-            return $path1 
-        }
-        # clear previously picked hosts
-        foreach (grep(/^picks_/, keys %meta)) {
-            delete $meta{$_}->{$lhost};
-            delete $meta{$_} if (scalar(keys %{$meta{$_}}) == 0);
-        }
-        # store that host has already been selected
-        $meta{"picks_$pick"}->{$lhost} = 1;
         my $mnt2 = map_fs_mount($mnt1, $pick, $ref->{rw});
         # mnt2 is known to be defined due to previous %hosts map_fs_mount calls
         # replace original mount point with new mount point
@@ -2732,7 +2792,11 @@ sub put {
         my %op = split(/[= ]+/, $line);
         # ignore malformed lines with undefined op values
         next if (grep(!/./, values %op));
-        delete $doing->{$op{doing}} if (defined $op{doing});
+        if (defined $op{doing}) {
+            # ignore operations that have been processed by another client
+            next if (!defined $doing->{$op{doing}});
+            delete $doing->{$op{doing}};
+        }
 
         my @args = split(/,/, $op{args});
         my $cmd = shift @args;
@@ -2829,7 +2893,7 @@ sub put {
             # initialize transfer settings once all getopt lines received
             init_id() if ($args[0] eq 'end');
             # check validity of option
-            next if ($args[0] !~ /^(?:bandwidth|buffer|clients|command|cpu|create-tar|cron|cwd|dereference|disk|exception|exclude|extract-tar|files|force|host-list|hosts|ignore-times|include|index-tar|io[rw]?|local|mail|net[rw]?|newer|offline|older|pipeline|ports|preallocate|preserve|recall|remote|retry|sanity|secure|size|split|split-tar|streams|stripe|sync|threads|verify|verify-fast|window)$/);
+            next if ($args[0] !~ /^(?:bandwidth|buffer|clients|command|cpu|create-tar|cron|cwd|dereference|disk|exception|exclude|extract-tar|files|force|host-list|hosts|ignore-times|include|index-tar|interval|io[rw]?|local|mail|net[rw]?|newer|offline|older|pipeline|ports|preallocate|preserve|recall|remote|retry|sanity|secure|silent|size|split|split-tar|streams|stripe|sync|threads|verify|verify-fast|window)$/);
             $meta{$args[0]} = defined $op{text} ? unescape($op{text}) : 1;
         } elsif ($cmd eq 'host') {
             # host error so remove host from outstanding hosts
@@ -2893,7 +2957,8 @@ sub put {
                     ($cmd =~ /^(?:cksum|cp|ln)/ ||
                     # tar mkdirs are not put in tree so are not handled by rtree
                     $cmd eq 'mkdir' && $meta{'create-tar'})) {
-                if ($cmd eq 'cksum' && detect_silent(\%op, $args[0], $args[1])) {
+                if ($meta{silent} && $cmd eq 'cksum' &&
+                        detect_silent(\%op, $args[0], $args[1])) {
                     $line =~ s/(?:text|tool)=\S+//g;
                     log_print('alert', $gzs, "$line tool=shift-mgr text=$op{text}\n");
                     $meta{e_silent}++;
@@ -2913,7 +2978,8 @@ sub put {
                     next;
                 }
             } else {
-                if ($cmd eq 'cksum' && detect_silent(\%op, $args[0], $args[1])) {
+                if ($meta{silent} && $cmd eq 'cksum' &&
+                        detect_silent(\%op, $args[0], $args[1])) {
                     $line =~ s/(?:text|tool)=\S+//g;
                     log_print('alert', $gzs, "$line tool=shift-mgr text=$op{text}\n");
                     $meta{e_silent}++;
@@ -3477,13 +3543,13 @@ sub stats {
         [qw(bbcp bbftp fish fish-tcp gridftp mcp msum rsync shiftc shift-aux)];
     $heads{Options_1} =
         [qw(bandwidth buffer clients cpu create-tar exclude extract-tar files
-            force host-list hosts include index-tar io ior)];
+            force host-list hosts include index-tar interval)];
     $heads{Options_2} =
-        [qw(iow local net netr netw newer no-cron no-mail no-offline
-            no-preserve no-recall no-sanity no-verify older pipeline)];
+        [qw(io ior iow local net netr netw newer no-cron no-mail no-offline
+            no-preserve no-recall no-sanity no-silent no-verify)];
     $heads{Options_3} =
-        [qw(ports preallocate remote retry secure size split split-tar streams
-            stripe sync threads verify-fast window)];
+        [qw(older pipeline ports preallocate remote retry secure size split
+            split-tar streams stripe sync threads verify-fast window)];
     $heads{Errors} =
         [qw(corruption exception silent throttle chattr cksum cp host ln mkdir sum)];
 
@@ -3566,9 +3632,9 @@ sub stats {
 
         # option totals
         # options that must differ from configured default
-        foreach my $key (qw(buffer clients cpu files hosts io ior iow net netr
-                            netw ports retry size split split-tar streams stripe
-                            threads window)) {
+        foreach my $key (qw(buffer clients cpu files hosts interval io ior iow
+                            net netr netw ports retry size split split-tar
+                            streams stripe threads window)) {
             # parse some values in binary bytes instead of decimal bytes
             my $bin = $key =~ /^(?:buffer|split)$/ ? 2 : 0;
             $bin = 1 if ($key eq 'stripe');
@@ -3579,7 +3645,7 @@ sub stats {
         # options that must be inverted
         $totals{"o_no-offline"} = !$meta{offline} && !$meta{'create-tar'} &&
                 !$meta{'extract-tar'} ? 1 : 0;
-        foreach (qw(cron mail preserve recall sanity verify)) {
+        foreach (qw(cron mail preserve recall sanity silent verify)) {
             $totals{"o_no-$_"} = !$meta{$_} ? 1 : 0;
         }
         # normal options
@@ -3723,6 +3789,8 @@ sub stats {
     foreach my $file
             # sort by user.id
             (sort {(split(/\//, $a))[-2] cmp (split(/\//, $b))[-2]} @metas) {
+        # untaint file
+        $file = $1 if ($file =~ /^(.*)$/);
         # skip transfers that have expired
         my $mtime = (stat($file))[9];
         next if ($mtime + $conf{data_expire} < $time);
@@ -3775,7 +3843,8 @@ sub stats {
             $count++;
             $ulast = $user;
         }
-        close $gz;
+        my $log = basename($file);
+        log_close($log, {$log => $gz});
     }
     # output final table
     print $t->render;
@@ -3881,9 +3950,7 @@ sub status {
         my $left;
         if ($rate && $meta{last} && !$meta{time1}) {
             # add estimated time to completion
-            my $ncli = sum(map {$meta{$_}} (grep(/^clients_/, keys %meta)));
-            $ncli = grep(/^env_/, keys %meta) * $meta{clients} - $ncli;
-            $ncli = 1 if ($ncli <= 0);
+            my $ncli = max(1, scalar(grep(/^doing_/, keys %meta)));
             my $rate1 = $meta{ra_cp} ? $meta{ra_cp} : $rate * $ncli;
             # add time for cps, sums, cksums
             foreach my $cmd (qw(cp sum cksum)) {
@@ -3899,10 +3966,12 @@ sub status {
                 $rate1 = $meta{"ra_$cmd"} ? $meta{"ra_$cmd"} : 100;
                 $left += ($meta{"t_$cmd"} - $meta{"d_$cmd"}) / $rate1 / $ncli;
             }
-            # add time for non-cp manager calls assuming 1/s rate
+            # add time for non-cp manager calls
+            # use previous rate for mgr calls (or 1/s when not available)
+            $rate1 = $meta{ra_mgr} ? 1 / $meta{ra_mgr} : 1;
             foreach (qw(chattr cksum sum)) {
                 $left += ($meta{"t_$_"} - $meta{"d_$_"} - $meta{"e_$_"}) /
-                    $meta{files} / $ncli;
+                    $meta{files} / $rate1 / $ncli;
             }
             $left = format_seconds($left);
         }

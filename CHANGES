@@ -255,3 +255,31 @@ CHANGES
     - Fixed corruption tracking causing negative sizes/rates in --status
     - Fixed inadvertent call of test shift-mgr during mgr synchronization
     - Removed warning message when --no-cron specified
+
+* Shift 6.2 (06/24/19)
+    - Added multi-threading of directory traversal
+    - Added multi-threading of attr preservation when external programs invoked
+    - Added --interval to dynamically adjust batch size around fixed frequency
+    - Added use of gzip index files to increase metadata read performance
+    - Added --no-silent to disable silent corruption detection
+    - Added ability to escape multiple lines over stdin in shift-aux
+    - Added syntax checking of numeric options that can take units
+    - Changed --files and --size to be minimums instead of absolutes
+    - Changed time remaining to more accurately reflect manager overhead
+    - Fixed remote host selection that was running per file instead of per batch
+    - Fixed detection of operations already performed by another client
+    - Fixed slow processing of doing logs due to small backward read size
+    - Fixed local/remote fadvise that had old initial implementation
+    - Fixed --no-recall handling of remote files
+    - Fixed possible exceptions during some thread joins
+    - Fixed Net::Ping exceptions when Time::HiRes not available
+    - Fixed exception when stat of remote file fails
+    - Fixed use of setfacl when shift-bin available
+    - Fixed run state when --restart=ignore ignores final operations
+    - Fixed manager --doing=n so it retrieves nth doing in past
+    - Fixed output of error table in stats due to tainted file names
+    - Fixed option abbreviation so deprecated options don't invoke other options
+    - Fixed double lustre striping during attribute preservation stage
+    - Fixed high memory utilization during traversal of very large directories
+    - Fixed stalls due to inadvertent newlines left in logs after restarts
+    - Fixed preservation of lustre striping due to bad conditional

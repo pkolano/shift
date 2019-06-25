@@ -1,15 +1,7 @@
 KNOWN BUGS
 ==========
 
-1. Setting the TCP window size from perl does not seem to work
-   correctly.  This can affect the performance of the fish-tcp
-   transport.  The window size appears to reach a maximum of 8MB even
-   when the system limit is much higher.  It is not known if this is due
-   to the perl version and/or the specific build of perl on the system
-   on which this was discovered.  The only current workaround is to
-   increase the number of streams (--streams) when using fish-tcp.
-
-2. A bug exists in the Shift 4.0 and 5.0 tar creation function that
+1. A bug exists in the Shift 4.0 and 5.0 tar creation function that
    could leave some entries in tar files in a partially corrupted state.
    The conditions under which this could occur are very specific, so the
    overall percentage of affected tar files is expected to be very low.

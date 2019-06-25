@@ -145,7 +145,7 @@ user_dir /home/%u/.shift
 #   (use suffix {k,m,g,t} for {KB,MB,GB,TB})
 #default_buffer 4m
 
-# maximum number of files to transfer in each batch
+# minimum number of files to transfer in each batch
 #   (use suffix {k,m,b/g,t} for 10E{3,6,9,12})
 #default_files 1k
 
@@ -153,6 +153,10 @@ user_dir /home/%u/.shift
 #   (note use of dash instead of underscore)
 #   (use suffix {k,m,b/g,t} for 10E{3,6,9,12})
 #default_find-files 2k
+
+# approximate number of seconds that each batch should run
+#   (note this will be adjusted upward with more clients/greater mgr overhead)
+#default_interval 30
 
 # source sparsity percentage at which to preallocate destination file
 #   (sparsity defined as 1 - (512 * allocated_blocks / size))
@@ -164,7 +168,7 @@ user_dir /home/%u/.shift
 #   (must be at least 1 for --sync to function)
 #default_retry 2
 
-# approximate maximum amount of data to transfer in each batch
+# approximate minimum amount of data to transfer in each batch
 #   (use suffix {k,m,g,t} for {KB,MB,GB,TB})
 #default_size 4g
 

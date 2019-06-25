@@ -60,7 +60,7 @@ use File::Path;
 use File::Spec;
 use File::Spec::Unix;
 use File::Temp qw(tempdir tempfile);
-use Getopt::Long qw(:config bundling no_ignore_case require_order);
+use Getopt::Long qw(:config bundling no_auto_abbrev no_ignore_case require_order);
 use IO::File;
 use IO::Handle;
 use IO::Socket::INET;
@@ -70,7 +70,7 @@ require IPC::Open3;
 use List::Util qw(first max min sum);
 use MIME::Base64;
 use POSIX;
-use Socket;
+use Socket qw(IPPROTO_TCP TCP_NODELAY);
 use Storable qw(nfreeze thaw);
 use Symbol qw(gensym);
 use Sys::Hostname;
@@ -83,7 +83,7 @@ use constant SFTP_TRUNC => 0x10;
 use constant SFTP_WRITE => 0x02;
 use constant SFTP_EXCL => 0x20;
 
-our $VERSION = 0.97;
+our $VERSION = 0.98;
 
 $Data::Dumper::Indent = 0;
 $Data::Dumper::Purity = 1;
@@ -100,7 +100,7 @@ delete $ENV{DISPLAY};
 my %perl;
 $perl{ssl} = eval 'use IO::Socket::SSL; 1';
 # need threads and version of Thread::Queue from perl >= 5.10.1
-$perl{threads} = eval 'require 5.010_001; use threads; use Thread::Queue; 1';
+$perl{threads} = eval 'require 5.010_001; use threads; use Thread::Queue; use Thread::Semaphore; 1';
 
 #########################
 #### default options ####
@@ -1088,16 +1088,16 @@ sub shift_ {
         "directory|d", "disk=s", "exclude=s@", "extract-tar", "files=s",
         "force|f", "help|h", "history:s", "host-file=s", "host-list=s",
         "hosts=i", "id=s", "identity=s", "ignore-times|I", "include=s@",
-        "index-tar", "io=i", "ior=i", "iow=i", "dereference|L", "last-sum",
-        "local=s", "mgr=s", "mgr-identity=s", "mgr-user=s", "monitor:s",
-        "net=i", "netr=i", "netw=i", "newer=s", "no-cron", "no-dereference|P",
-        "no-mail:s", "no-offline", "no-preserve:s", "no-recall", "no-sanity",
-        "no-target-directory|T", "no-verify", "older=s", "pid=i", "pipeline",
-        "plot:s", "ports=s", "preallocate=i", "recursive|R|r", "remote=s",
-        "restart:s", "retry=i", "search=s", "secure", "size=s", "split=s",
-        "split-tar=s", "state=s", "stats:s", "status:s", "stop", "streams=i",
-        "stripe=s", "sync", "threads=i", "user=s", "verify-fast", "wait",
-        "window=s",
+        "index-tar", "interval=i", "io=i", "ior=i", "iow=i", "dereference|L",
+        "last-sum", "local=s", "mgr=s", "mgr-identity=s", "mgr-user=s",
+        "monitor:s", "net=i", "netr=i", "netw=i", "newer=s", "no-cron",
+        "no-dereference|P", "no-mail:s", "no-offline", "no-preserve:s",
+        "no-recall", "no-sanity", "no-silent", "no-target-directory|T",
+        "no-verify", "older=s", "pid=i", "pipeline", "plot:s", "ports=s",
+        "preallocate=i", "recursive|R|r", "remote=s", "restart:s", "retry=i",
+        "search=s", "secure", "size=s", "split=s", "split-tar=s", "state=s",
+        "stats:s", "status:s", "stop", "streams=i", "stripe=s", "sync",
+        "threads=i", "user=s", "verify-fast", "wait", "window=s",
     ));
     $opts{mgr} = $save_mgr if ($save_mgr ne 'none');
     my %in_opts = map {$_ => 1} keys %opts;
@@ -1116,17 +1116,6 @@ sub shift_ {
             close FILE;
         } else {
             die "Unable to read host file " . $opts{'host-file'} . ": $!\n";
-        }
-    }
-    foreach my $opt (qw(newer older)) {
-        if ($opts{$opt} && $opts{$opt} !~ /^\d+$/) {
-            my $spec;
-            ($spec, $opts{$opt}) = ($1, $2)
-                if ($opts{$opt} =~ /^([acmACM\|]+:)(.*)/);
-            require Date::Parse;
-            my $time = Date::Parse::str2time($opts{$opt});
-            die "Unable to parse date string '$opts{$opt}'\n" if (!$time);
-            $opts{$opt} = (!$opts{'extract-tar'} && $spec ? $spec : "") . $time;
         }
     }
     if (scalar(keys %hosts) != 0) {
@@ -1187,7 +1176,7 @@ sub shift_ {
         $opts{monitor} = "";
     }
 
-    foreach (qw(cron offline recall sanity verify)) {
+    foreach (qw(cron offline recall sanity silent verify)) {
         $opts{$_} = $opts{"no-$_"} ? 0 : 1;
         $in_opts{$_} = 1 if ($in_opts{"no-$_"});
     }
@@ -1303,6 +1292,8 @@ sub shift_ {
         die "--restart requires the --id option\n";
     } elsif ($opts{stop} && !$opts{id}) {
         die "--stop requires the --id option\n";
+    } elsif ($opts{files} && $opts{files} !~ /^([1-9]\d*)([bkmgt])?$/i) {
+        die "Invalid count '$opts{files}' for option --files\n";
     } elsif ($opts{ports} && $opts{ports} !~ /^\d+:\d+/) {
         die "Invalid port range '$opts{ports}' in --ports\n";
     } elsif ($opts{help}) {
@@ -1355,6 +1346,7 @@ sub shift_ {
         print "                              (LIST subset of {acl,mode,owner,stripe,time,xattr})\n";
         print "      --no-recall           do not recall DMF-managed files before transfer\n";
         print "      --no-sanity           do not check file existence/size (benchmarking only)\n";
+        print "      --no-silent           do not detect silent corruption or store checksums\n";
         print "      --no-verify           do not verify/rectify integrity of destination files\n";
         print "\n";
         print "Monitoring and management options:\n";
@@ -1385,8 +1377,9 @@ sub shift_ {
         print "                              (use suffix {k,m,g,t} for {Kb,Mb,Gb,Tb})\n";
         print "      --buffer=SIZE         use SIZE bytes for buffer in transports\n";
         print "                              (use suffix {k,m,g,t} for {KiB,MiB,GiB,TiB}) [4m]\n";
-        print "      --files=COUNT         process transfer in batches of COUNT files\n";
+        print "      --files=COUNT         process transfer in batches of at least COUNT files\n";
         print "                              (use suffix {k,m,b/g,t} for 1E{3,6,9,12}) [1k]\n";
+        print "      --interval=NUM        adjust batches to run for around NUM seconds [30]\n";
         print "      --local=LIST          set local transport mechanism to one of LIST\n";
         print "                              (LIST subset of {bbcp,bbftp,fish,fish-tcp,gridftp,\n";
         print "                                               mcp,rsync,shift})\n";
@@ -1395,7 +1388,7 @@ sub shift_ {
         print "                              (LIST subset of {bbcp,bbftp,fish,fish-tcp,gridftp,\n";
         print "                                               rsync,shift})\n";
         print "      --retry=NUM           retry failed operations up to NUM times [2]\n";
-        print "      --size=SIZE           process transfer in batches of SIZE bytes\n";
+        print "      --size=SIZE           process transfer in batches of at least SIZE bytes\n";
         print "                              (use suffix {k,m,g,t} for {KB,MB,GB,TB}) [4g]\n";
         print "      --split=SIZE          parallelize single files using chunks of SIZE bytes\n";
         print "                              (use suffix {k,m,g,t} for {KiB,MiB,GiB,TiB}) [0]\n";
@@ -1421,6 +1414,23 @@ sub shift_ {
         print "      --netr=NUM            throttle local network reads at NUM MB/s\n";
         print "      --netw=NUM            throttle local network writes at NUM MB/s\n";
         exit;
+    }
+
+    foreach my $opt (qw(bandwidth buffer size split split-tar window)) {
+        if ($opts{$opt} && $opts{$opt} !~ /^([1-9]\d*)([kmgt])?$/i) {
+            die "Invalid size '$opts{$opt}' for option --$opt\n";
+        }
+    }
+    foreach my $opt (qw(newer older)) {
+        if ($opts{$opt} && $opts{$opt} !~ /^\d+$/) {
+            my $spec;
+            ($spec, $opts{$opt}) = ($1, $2)
+                if ($opts{$opt} =~ /^([acmACM\|]+:)(.*)/);
+            require Date::Parse;
+            my $time = Date::Parse::str2time($opts{$opt});
+            die "Unable to parse date string '$opts{$opt}'\n" if (!$time);
+            $opts{$opt} = (!$opts{'extract-tar'} && $spec ? $spec : "") . $time;
+        }
     }
     if (defined $opts{include}) {
         foreach (@{$opts{include}}) {
@@ -1453,14 +1463,16 @@ sub shift_ {
     # process arguments
     if (!$opts{id}) {
         my ($logfh, $log) = sftp_tmp();
+        $opts{logfh} = $logfh;
 
         # send options
         foreach (qw(bandwidth buffer clients command cpu create-tar cron
                     dereference disk extract-tar files force host-list hosts
-                    ignore-times index-tar io ior iow local mail net netr netw
-                    newer offline older pipeline ports preallocate preserve
-                    recall remote retry sanity secure size split split-tar
-                    streams stripe sync threads verify verify-fast wait window)) {
+                    ignore-times index-tar interval io ior iow local mail net
+                    netr netw newer offline older pipeline ports preallocate
+                    preserve recall remote retry sanity secure silent size split
+                    split-tar streams stripe sync threads verify verify-fast
+                    wait window)) {
             print $logfh "args=getopt,$_ text=", escape($opts{$_}), "\n"
                 if (defined $opts{$_});
         }
@@ -1476,12 +1488,12 @@ sub shift_ {
         print "Reading argument lines from stdin...\n" if (scalar(@ARGV) == 0);
         my $nfiles;
         if (scalar(@ARGV) > 0) {
-            $nfiles += shift_args(\$logfh, $log, $host, \@ARGV);
+            $nfiles += shift_args($host, \@ARGV);
         } else {
             while (my $line = <STDIN>) {
                 $line =~ s/^\s+|\s+$//g;
                 my @args = quotewords('\s+', 0, $line);
-                $nfiles += shift_args(\$logfh, $log, $host, \@args);
+                $nfiles += shift_args($host, \@args);
             }
         }
         close $logfh;
@@ -1501,14 +1513,15 @@ sub shift_ {
         # send options that can be respecified
         my ($logfh, $log) = sftp_tmp();
         foreach (qw(bandwidth buffer clients cpu cron disk files force host-list
-                    hosts io ior iow local mail net netr netw offline pipeline
-                    ports preallocate recall remote retry secure size streams
-                    stripe threads window)) {
+                    hosts interval io ior iow local mail net netr netw offline
+                    pipeline ports preallocate recall remote retry secure silent
+                    size streams stripe threads window)) {
             print $logfh "args=getopt,$_ text=", escape($opts{$_}), "\n"
                 if ($in_opts{$_});
         }
         # indicate all options sent
         print $logfh "args=getopt,end\n";
+        close $logfh;
         my $extra = $opts{restart} ? "=$opts{restart}" : "";
         my $out = shift_mgr(
             "--restart$extra --id=$opts{id} --host=$host --put", $log);
@@ -1563,8 +1576,8 @@ sub shift_ {
 #### shift_args ####
 ####################
 sub shift_args {
-    my ($logfh_ref, $log, $host, $args) = @_;
-    my $logfh = $$logfh_ref;
+    my ($host, $args) = @_;
+    my $logfh = $opts{logfh};
     my @args = @{$args};
 
     my $dst = pop(@args);
@@ -1867,304 +1880,6 @@ sub shift_cron {
     $opts{crontab} = 1;
 }
 
-####################
-#### shift_find ####
-####################
-sub shift_find {
-    my ($shost, $spath, $dst, $ref) = @_;
-    my $logfh = $ref->{logfh};
-    my $host = fqdn(hostname);
-
-    # process tar files
-    if ($opts{'extract-tar'}) {
-        tar_extract($shost, $spath, $dst, $ref);
-        return;
-    }
-
-    # check for existence of various commands
-    if ((!defined $opts{have} || !$opts{have}->{GET}) && $shost eq 'localhost') {
-        $opts{have}->{GET} = 1;
-        foreach my $bin (qw(dmget lfs getfacl getfattr shift-bin)) {
-            $opts{have}->{$bin} = first {-x "$_/$bin"} (split(/:/, $ENV{PATH}));
-        }
-        $opts{fhpid} = open3_run([undef, undef, -1], "shift-bin")
-            if ($opts{have}->{'shift-bin'});
-    }
-
-    $ref->{tool} = "shiftc";
-    my $dmf = $opts{recall} && $opts{have}->{dmget} && $ref->{srcfs} =~ /,dmf/ ? 1 : 0;
-
-    # compute local (or remote if shift-aux fails) files and sizes
-    my $sdir = dirname($spath);
-    $sdir = "" if ($sdir eq '/');
-    my $ddir = dirname($dst);
-    $ddir = "" if ($ddir eq '/');
-    my $tdir = $opts{'create-tar'} ? dirname(unescape($ref->{tar_name})) : undef;
-    $tdir = "" if ($tdir eq '.');
-    $tdir .= "/" if ($tdir && $tdir !~ /\/$/);
-    my $dname = basename($dst);
-    my @files = (basename($spath));
-    FILE: foreach my $file0 (@files) {
-        if (ref $file0) {
-            # processing subdir so update prefix
-            $sdir = $file0->[0];
-            $ddir = $file0->[1];
-            $tdir = $file0->[2] . "/" if ($opts{'create-tar'});
-            # dname only needed on first iteration where src/dst name may differ
-            $dname = undef;
-            next;
-        }
-        next if ($file0 eq '.' || $file0 eq '..');
-        my $file = "$sdir/$file0";
-        my $dfile0 = $dname ? $dname : $file0;
-
-        # dereference before stat
-        if ($opts{dereference}) {
-            $file = $shost eq 'localhost' ?
-                abs_path($file) : sftp($shost)->realpath($file);
-        }
-        # always get stat info of real file
-        my @stat;
-        if ($shost eq 'localhost') {
-            @stat = lstat($file);
-        } else {
-            my $fattrs = sftp($shost)->lstat($file);
-            if ($fattrs) {
-                # approximate local stat
-                @stat = (0, 0, $fattrs->perm , 0, $fattrs->uid, $fattrs->gid,
-                    0, $fattrs->size, $fattrs->atime, $fattrs->mtime,
-                    $fattrs->mtime, 0, int($fattrs->size / 512));
-            }
-        }
-        my $mode;
-        if (scalar(@stat) == 0) {
-            $file = "$sdir/$file0" if ($opts{dereference});
-            if (scalar(@files) == 1) {
-                # return error if original file
-                sftp_error($ref, "Cannot stat $file");
-                next;
-            }
-            # lower level files cannot return errors because there is no way
-            # to back out of previously added operations, so instead a find
-            # op is added, which will succeed/fail on its own when processed
-        } else {
-            $mode = $stat[2];
-            $stat[2] &= 07777;
-
-            # only directories, regular files, and symlinks are supported
-            next if (!S_ISDIR($mode) && !S_ISREG($mode) && !S_ISLNK($mode));
-            # dmf handling for individual files is carried out by transport_dmf
-            $dmf = 0 if (scalar(@files) == 1 && !S_ISDIR($mode));
-        }
-
-        # exclude files (must be before dir processing)
-        if (defined $opts{exclude}) {
-            foreach my $re (@{$opts{exclude}}) {
-                next FILE if (eval {$file =~ /$re/});
-            }
-        }
-
-        if (scalar(@stat) == 0 || S_ISDIR($mode)) {
-            my $err = "";
-            if (scalar(@stat) > 0 && (!$opts{dereference} || scalar(@files) == 1) &&
-                    (!defined $opts{'find-files'} ||
-                    scalar(@files) < $opts{'find-files'})) {
-                # add subdirs of this directory for processing when below limit
-                my $rc = $shost eq 'localhost' ? opendir(DIR, $file) :
-                    sftp($shost)->opendir($file);
-                if ($rc) {
-                    my @sub_files;
-                    if ($shost eq 'localhost') {
-                        $! = undef;
-                        @sub_files = readdir DIR;
-                        # there is currently no good way to detect readdir errors 
-                        @sub_files = () if ($!);
-                        closedir DIR;
-                    } else {
-                        @sub_files = map {$_->{filename}} sftp($shost)->readdir($rc);
-                        sftp($shost)->closedir($rc);
-                    }
-                    if (scalar(@sub_files) > 0) {
-                        my $dirs = [$file, "$ddir/$dfile0"];
-                        push(@{$dirs}, "$tdir$file0") if ($opts{'create-tar'});
-                        push(@files, $dirs, @sub_files);
-                        $err = undef;
-                    } else {
-                        # dirs should always contain . and .. at a minimum
-                        $err = "Error reading directory $file";
-                    }
-                } else {
-                    $err = "Error opening directory $file";
-                }
-                if ($err && scalar(@files) == 1) {
-                    # return error if original file
-                    sftp_error($ref, $err);
-                    next;
-                }
-            }
-            if (defined $err) {
-                # this handles directories as well as lower level failures
-                print $logfh "args=find,", escape(hostpath($shost, $file)), ",";
-                if ($opts{'create-tar'}) {
-                    print $logfh escape($dst), " tar_name=" . escape("$tdir$file0");
-                } else {
-                    print $logfh escape("$ddir/$dfile0");
-                }
-                print $logfh " host=$host\n";
-                next;
-            }
-        }
-
-        # include files (must be after dir processing)
-        if (defined $opts{include}) {
-            my $found;
-            foreach my $re (@{$opts{include}}) {
-                next if (eval {$file !~ /$re/});
-                $found = 1;
-                last;
-            }
-            next if (!$found);
-        }
-
-        # newer/older files (must be after dir processing)
-        my %ti = ('a' => 8, 'm' => 9, 'c' => 10);
-        if (defined $opts{newer}) {
-            if ($opts{newer} =~ /^([^:]+):(\S+)/) {
-                my ($type, $time) = ($1, $2);
-                $type =~ s/\|/1||/g;
-                $type =~ s/([amc])/$stat[$ti{$1}]>=$time&&/g;
-                $type =~ s/([AMC])/$stat[$ti{lc($1)}]<$time&&/g;
-                $type .= "1";
-                next if (!eval $type);
-            } elsif ($stat[9] < $opts{newer}) {
-                next;
-            }
-        }
-        if (defined $opts{older}) {
-            if ($opts{older} =~ /^([^:]+):(\S+)/) {
-                my ($type, $time) = ($1, $2);
-                $type =~ s/\|/1||/g;
-                $type =~ s/([amc])/$stat[$ti{$1}]<$time&&/g;
-                $type =~ s/([AMC])/$stat[$ti{lc($1)}]>=$time&&/g;
-                $type .= "1";
-                next if (!eval $type);
-            } elsif ($stat[9] >= $opts{older}) {
-                next;
-            }
-        }
-
-        # resolve uid/gid if possible
-        my $user = getpwuid($stat[4]);
-        my $group = getgrgid($stat[5]);
-        $user = "uid_$stat[4]" if (!$user);
-        $group = "gid_$stat[5]" if (!$group);
-        my $attrs = join(",", @stat[2,4,5,8,9],
-            escape($user), escape($group), $stat[7], 512 * $stat[12]);
-
-        my @acls;
-        my @lattrs;
-        my @xattrs;
-        if ($shost eq 'localhost') {
-            # if shift-aux failed, there is no backup to get this info remotely
-            # try to get acls
-            if (($opts{have}->{'shift-bin'} || $opts{have}->{getfacl}) &&
-                    !$opts{'create-tar'} &&
-                    ($opts{preserve} == 1 || $opts{preserve} =~ /acl/) &&
-                    (!$ref->{srcfs} || $ref->{srcfs} =~ /,acl/)) {
-                if (defined $opts{fhpid}) {
-                    $opts{fhpid}->[0]->print("getfacl $file\n");
-                    my $text = $opts{fhpid}->[1]->getline;
-                    my @cols = split(/\s+/, $text);
-                    push(@acls, $cols[2]) if ($file eq $cols[1] && $cols[-1] eq '0');
-                } else {
-                    my $fhpid = open3_run([-1, undef, -1],
-                        "getfacl", "-cps",  "--", $file);
-                    while (defined $fhpid && defined ($_ = $fhpid->[1]->getline)) {
-                        chomp;
-                        next if (!$_);
-                        push(@acls, escape($_));
-                    }
-                    open3_wait($fhpid);
-                }
-            }
-
-            # try to get xattrs
-            if (($opts{have}->{'shift-bin'} || $opts{have}->{getfattr}) &&
-                    !$opts{'create-tar'} &&
-                    ($opts{preserve} == 1 || $opts{preserve} =~ /xattr/) &&
-                    (!$ref->{srcfs} || $ref->{srcfs} =~ /,xattr/)) {
-                if (defined $opts{fhpid}) {
-                    $opts{fhpid}->[0]->print("getfattr $file\n");
-                    my $text = $opts{fhpid}->[1]->getline;
-                    my @cols = split(/\s+/, $text);
-                    push(@xattrs, $cols[2]) if ($file eq $cols[1] && $cols[-1] eq '0');
-                } else {
-                    my $fhpid = open3_run([-1, undef, -1],
-                        "getfattr", "-dhe", "base64", $file);
-                    while (defined $fhpid && defined ($_ = $fhpid->[1]->getline)) {
-                        chomp;
-                        next if (!$_ || /^\s*#/);
-                        push(@xattrs, escape(decode_base64($_)));
-                    }
-                    open3_wait($fhpid);
-                }
-            }
-
-            # try to get lustre striping
-            if (($opts{have}->{'shift-bin'} || $opts{have}->{lfs}) &&
-                    !S_ISLNK($mode) && !$opts{'create-tar'} &&
-                    ($opts{preserve} == 1 || $opts{preserve} =~ /stripe/) &&
-                    $ref->{srcfs} =~ /^lustre/) {
-                # ignore symlinks as link to fifo can hang forever
-                if (defined $opts{fhpid}) {
-                    $opts{fhpid}->[0]->print("getstripe $file\n");
-                    my $text = $opts{fhpid}->[1]->getline;
-                    my @cols = split(/\s+/, $text);
-                    @lattrs = split(/,/, $cols[2]) if ($file eq $cols[1] && $cols[-1] eq '0');
-                } else {
-                    my $fhpid = open3_run([-1, undef, -1],
-                        "lfs", "getstripe", "-d", $file);
-                    while (defined $fhpid && defined ($_ = $fhpid->[1]->getline)) {
-                        $lattrs[0] = $1 if (/stripe_count:\s*(-?\d+)/);
-                        $lattrs[1] = $1 if (/stripe_size:\s*(-?\d+)/);
-                    }
-                    open3_wait($fhpid);
-                }
-            }
-            $lattrs[0] = 0 if (!defined $lattrs[0] && defined $lattrs[1]);
-            $lattrs[1] = 0 if (!defined $lattrs[1] && defined $lattrs[0]);
-        }
-
-        # begin log entry
-        my $index_len = !$opts{'index-tar'} ? 0 : 28 + length("$tdir$file0") +
-            length(sprintf("%7s%7s%9d", $user, $group, $stat[7]));
-        if (S_ISLNK($mode)) {
-            my $ln = $shost eq 'localhost' ? readlink($file) :
-                sftp($shost)->readlink($file);
-            print $logfh "args=ln,", escape($ln);
-            $index_len += 4 + length($ln);
-        } elsif (S_ISDIR($mode)) {
-            print $logfh "args=mkdir";
-        } elsif ($opts{sync}) {
-            print $logfh "args=ckattr", $opts{'ignore-times'} ? "0" : "",
-                ",", escape(hostpath($shost, $file));
-        } else {
-            print $logfh "args=cp,", escape(hostpath($shost, $file));
-        }
-        print $logfh ",", escape($opts{'create-tar'} ? $dst : "$ddir/$dfile0");
-        print $logfh " acls=" . join(",", @acls) if (scalar(@acls) > 0);
-        print $logfh " xattrs=" . join(",", @xattrs) if (scalar(@xattrs) > 0);
-        print $logfh " lustre_attrs=" . join(",", @lattrs) if (scalar(@lattrs) > 0);
-        print $logfh " tar_index=$index_len" if ($opts{'index-tar'});
-        print $logfh " tar_name=" . escape("$tdir$file0") if ($opts{'create-tar'});
-        print $logfh " host=$host size=$stat[7] attrs=$attrs\n";
-        if ($dmf && !S_ISLNK($mode) && !S_ISDIR($mode)) {
-            ($opts{dmfh}, $opts{dmtmp}) = sftp_tmp() if (!$opts{dmtmp});
-            print {$opts{dmfh}} $file, "\n";
-        }
-    }
-}
-
 #######################
 #### shift_latency ####
 #######################
@@ -2202,7 +1917,10 @@ sub shift_latency {
                 next if (!$np);
             }
             my $rc;
-            ($rc, $time) = $np->ping($host);
+            eval {
+                # there may still be an exception from undefined subroutine
+                ($rc, $time) = $np->ping($host);
+            };
 
             if (!$rc) {
                 # use ssh syn ping as backup to tcp echo port
@@ -2216,8 +1934,11 @@ sub shift_latency {
                     };
                     next if (!$nps);
                 }
-                $nps->ping($host);
-                ($rc, $time) = $nps->ack;
+                eval {
+                    # there may still be an exception from undefined subroutine
+                    $nps->ping($host);
+                    ($rc, $time) = $nps->ack;
+                };
                 $time /= 2;
             }
         }
@@ -2324,6 +2045,7 @@ sub shift_loop {
     push(@host_agents, $agent_sock) if (scalar(@host_agents) == 0);
 
     my ($logfh, $log) = sftp_tmp();
+    $opts{logfh} = $logfh;
     my ($taskfh, $task) = sftp_tmp();
     close $taskfh;
 
@@ -2345,6 +2067,7 @@ sub shift_loop {
             my $text = localtime(time) . ": @exception";
             chomp $text;
             print $logfh "args=exception text=", escape($text);
+            close $logfh;
             shift_mgr("--id=$opts{id} --host=$host --put $opts{get_host}",
                 $log, undef, 1440);
         }
@@ -2384,8 +2107,8 @@ sub shift_loop {
                     my $etime = $1;
                     my $time = $etime - time;
                     last if ($time < 60);
-                    my $out = open3_get([-1, undef, -1], "ssh-keygen -l -f $key.pub");
-                    next if ($out =~ /not a public key file/);
+                    my $out = open3_get([-1, undef], "ssh-keygen -l -f $key.pub");
+                    next if ($out =~ /not a public key file|no such file/i);
                     # ensure key has correct permissions
                     chmod(0600, $key);
                     open3_get([-1, undef], "ssh-add -t $time $key");
@@ -2405,6 +2128,7 @@ sub shift_loop {
         die "$$out\n" if (ref $out);
         #TODO: error checking if id doesn't exist
         open($logfh, '>', $log);
+        $opts{logfh} = $logfh;
 
         my $run = time;
         my %ops;
@@ -2580,6 +2304,7 @@ sub shift_loop {
                             } else {
                                 # must approximate without shift-aux
                                 my $fattrs = sftp($rhost[1])->lstat($rpath[1]);
+                                next if (!defined $fattrs);
                                 $du = $fattrs->size;
                             }
                         }
@@ -2594,7 +2319,6 @@ sub shift_loop {
                     }
                 } elsif ($cmd eq 'find') {
                     my ($rhost, $rpath) = hostpath(unescape($args[0]));
-                    $op{logfh} = $logfh;
                     transport($cmd, $rhost, $rpath, unescape($args[1]), \%op);
                 } elsif ($cmd eq 'ln') {
                     my ($rhost, $rpath) = hostpath(unescape($args[1]));
@@ -2733,8 +2457,8 @@ sub shift_mgr {
                     my $etime = $1;
                     my $time = $etime - time;
                     last if ($time < 60);
-                    my $out = open3_get([-1, undef, -1], "ssh-keygen -l -f $key.pub");
-                    next if ($out =~ /not a public key file/);
+                    my $out = open3_get([-1, undef], "ssh-keygen -l -f $key.pub");
+                    next if ($out =~ /not a public key file|no such file/);
                     # ensure key has correct permissions
                     chmod(0600, $key);
                     open3_get([-1, undef], "ssh-add -t $time $key");
@@ -2768,22 +2492,11 @@ sub shift_mgr {
 ######################
 sub shift_mounts {
     my $host = shift;
+    my %fstab;
     my %mnt = (
         host => $host,
         args => "mount",
     );
-
-    my %fstab;
-    if (open(FILE, "/etc/fstab")) {
-        while (<FILE>) {
-            s/^\s+|\s+$//g;
-            next if (/^#/);
-            my ($dev, $local, $type) = split(/\s+/);
-            next if (!$type);
-            $fstab{$local} = [$dev, $type];
-        }
-        close FILE;
-    }
 
     # check for existence of getfacl
     my $acl = first {-x "$_/getfacl"} (split(/:/, $ENV{PATH}));
@@ -2801,6 +2514,17 @@ sub shift_mounts {
             if (/(\S+)\s+on\s+(\S+)\s+type\s+(\S+)/);
         if ($mnt{local}) {
             if ($dev eq 'systemd-1') {
+                if (!$fstab{"."} && open(FILE, "/etc/fstab")) {
+                    $fstab{"."} = 1;
+                    while (<FILE>) {
+                        s/^\s+|\s+$//g;
+                        next if (/^#/);
+                        my ($dev, $local, $type) = split(/\s+/);
+                        next if (!$type);
+                        $fstab{$local} = [$dev, $type];
+                    }
+                    close FILE;
+                }
                 # systemd mounts must be read from fstab
                 my $fstab = $fstab{$mnt{local}};
                 ($dev, $type) = ($fstab->[0], $fstab->[1]);
@@ -2953,7 +2677,7 @@ sub tar_canonpath {
 # based on Tar/Archive::Tar 0.07 by Calle Dybedahl (no license specified)
 sub tar_extract {
     my ($shost, $spath, $dst, $ref) = @_;
-    my $logfh = $ref->{logfh};
+    my $logfh = $opts{logfh};
     my $src = hostpath($shost, $spath);
     my $host = fqdn(hostname);
 
@@ -3150,6 +2874,7 @@ sub tar_extract {
 # checks for ustar limitations have already been done by this point
 sub tar_record {
     my ($fh, $type, $src, $ref, $ifh) = @_;
+    my $logfh = $opts{logfh};
     my @attrs = split(/,/, $ref->{attrs});
     my $file = $ref->{tar_name};
 
@@ -3770,7 +3495,6 @@ sub transport_bbftp {
 ##########################
 sub transport_chattr {
     my ($host, $tcmds) = @_;
-    my ($fh, $fhpid, $tmp);
 
     # check for existence of commands
     if ((!defined $opts{have} || !$opts{have}->{SET}) && $host eq 'localhost') {
@@ -3779,25 +3503,22 @@ sub transport_chattr {
             $opts{have}->{$bin} = first {-x "$_/$bin"} (split(/:/, $ENV{PATH}));
         }
     }
-    $fhpid = open3_run([undef, undef, -1], "shift-bin")
-        if ($opts{have}->{'shift-bin'});
+
+    my (@chattrs, @allocs);
 
     # lfs setstripe (must be done before fallocate)
-    if ($opts{have}->{'shift-bin'} || $opts{have}->{lfs} ||
-            $host ne 'localhost') {
-        foreach my $cmd (@{$tcmds}) {
-            my ($op, $src, $dst, $ref) = @{$cmd};
-            next if ($opts{'create-tar'} && ($op ne 'chattr' ||
-                    !$ref->{tar_creat}));
-            next if ($op !~ /^(?:chattr|get|mkdir|put)$/ || !$ref->{dstfs} ||
-                    $ref->{dstfs} !~ /^lustre/ || $ref->{ln} ||
-                    $opts{stripe} eq '0' && !defined $opts{'stripe-size'} &&
-                    !defined $opts{'stripe-pool'});
+    foreach my $cmd (@{$tcmds}) {
+        my ($op, $src, $dst, $ref) = @{$cmd};
+        # lfs setstripe (must be done before fallocate)
+        if ((!$opts{'create-tar'} && $op =~ /^(?:get|mkdir|put)$/ ||
+                $op eq 'chattr' && $ref->{tar_creat}) &&
+                $ref->{dstfs} && $ref->{dstfs} =~ /^lustre/ && !$ref->{ln} &&
+                ($opts{stripe} ne '0' || defined $opts{'stripe-size'} ||
+                defined $opts{'stripe-pool'})) {
             # set striping
             my @stripe = (0, 0);
-            # preserve existing striping when not excluded
-            @stripe = split(/,/, $ref->{lustre_attrs})
-                if ($opts{preserve} =~ /stripe/ && $ref->{lustre_attrs});
+            # preserve existing striping when available
+            @stripe = split(/,/, $ref->{lustre_attrs}) if ($ref->{lustre_attrs});
             my @attrs = split(/,/, $ref->{attrs});
             # define variables that are allowed in striping expressions
             my ($nm, $sz, $sc, $ss) = ($dst, $attrs[7], @stripe);
@@ -3815,45 +3536,18 @@ sub transport_chattr {
             }
             # count >= 64k indicates a size per stripe
             $stripe[0] = int($sz / $stripe[0]) if ($stripe[0] >= 65536);
-            if ($host ne 'localhost' && $op ne 'get') {
-                $ref->{tool} = "shift-aux";
-                # stripe remote files in batch
-                ($fh, $tmp) = sftp_tmp() if (!$tmp);
-                # use trailing / to indicate directories
-                print $fh "setstripe ", escape($dst), $op eq 'mkdir' ? "/" : "",
-                    " ", join(" ", @stripe), "\n";
-                next;
-            }
-            # stripe local files immediately
-            my $dir = $op eq 'mkdir' ? $dst : dirname($dst);
-            eval {mkpath($dir)};
-            if (defined $fhpid) {
-                $ref->{tool} = "shift-bin";
-                $fhpid->[0]->print(
-                    "setstripe ", escape($dst), $op eq 'mkdir' ? "/" : "",
-                    " ", join(" ", @stripe), "\n");
-                $fhpid->[1]->getline;
-            } else {
-                $ref->{tool} = "shiftc";
-                my @args = ("lfs", "setstripe", "-c", $stripe[0],
-                    "-S", $stripe[1], $dst);
-                splice(@args, -1, 0, "-p", $stripe[2]) if ($stripe[2]);
-                system(@args);
-            }
+            my @args = ("setstripe", escape($dst) . ($op eq 'mkdir' ? "/" : ""),
+                join(" ", @stripe));
+            push(@chattrs, \@args);
             # ignore errors since files automatically striped anyway
         }
-    }
 
-    # fallocate
-    if ($opts{preallocate} &&($opts{have}->{'shift-bin'} ||
-            $opts{have}->{fallocate} || $host ne 'localhost')) {
-        foreach my $cmd (@{$tcmds}) {
-            my ($op, $src, $dst, $ref) = @{$cmd};
-            next if ($op !~ /^(?:get|put)$/ &&
-                    ($op !~ /^(?:ln|mkdir)$/ || !$ref->{tar_creat}));
-            # lustre/nfs do not seem to support fallocate at the moment
-            next if ($ref->{dstfs} =~ /^(?:lustre|nfs)$/);
-            next if ($opts{'create-tar'} && !$ref->{tar_creat});
+        # fallocate
+        if ($opts{preallocate} && ($op =~ /^(?:get|put)$/ ||
+                $op =~ /^(?:ln|mkdir)$/ && $ref->{tar_creat}) &&
+                # lustre/nfs do not seem to support fallocate at the moment
+                $ref->{dstfs} !~ /^(?:lustre|nfs)$/ &&
+                (!$opts{'create-tar'} || $ref->{tar_creat})) {
             my $size;
             if ($opts{'create-tar'}) {
                 $size = $ref->{tar_creat};
@@ -3864,101 +3558,120 @@ sub transport_chattr {
                     1 - $attrs[8] / $attrs[7] >= $opts{preallocate} / 100);
                 $size = $attrs[7];
             }
-            if ($host ne 'localhost' && $op ne 'get') {
-                $ref->{tool} = "shift-aux";
-                # allocate remote files in batch
-                ($fh, $tmp) = sftp_tmp() if (!$tmp);
-                print $fh "fallocate ", escape($dst), " $size\n";
-                next;
-            }
-            # allocate local files immediately
-            if (defined $fhpid) {
-                $ref->{tool} = "shift-bin";
-                $fhpid->[0]->print("fallocate ", escape($dst), " $size\n");
-                $fhpid->[1]->getline;
-            } else {
-                $ref->{tool} = "shiftc";
-                eval {mkpath(dirname($dst))};
-                system("fallocate", "-n", "-l", $size, $dst);
-            }
+            my @args = ("fallocate", escape($dst), $size);
+            # use different queue to give higher probability that striping done
+            push(@allocs, \@args);
             # ignore errors since files automatically allocated anyway
         }
-    }
 
-    # setfacl
-    if ($opts{have}->{'shift-bin'} || $opts{have}->{setfacl} ||
-            $host ne 'localhost') {
-        foreach my $cmd (@{$tcmds}) {
-            my ($op, $src, $dst, $ref) = @{$cmd};
-            next if ($op ne 'chattr' || !$ref->{acls} ||
-                    $ref->{dstfs} && $ref->{dstfs} !~ /,acl/);
+        # setfacl
+        if ($op eq 'chattr' && $ref->{acls} &&
+                (!$ref->{dstfs} || $ref->{dstfs} =~ /,acl/)) {
+            my @args = ("setfacl", escape($dst), $ref->{acls});
+            push(@chattrs, \@args);
             # ignore errors since systems may have different command/users
-            if ($host ne 'localhost') {
-                $ref->{tool} = "shift-aux";
-                # chattr remote files in batch
-                ($fh, $tmp) = sftp_tmp() if (!$tmp);
-                print $fh "setfacl ", escape($dst), " $ref->{acls}\n";
-                next;
-            }
-            # chattr local files immediately
-            if (defined $fhpid) {
-                $ref->{tool} = "shift-bin";
-                $fhpid->[0]->print("setfacl ", escape($dst), " $ref->{acls}\n");
-                $fhpid->[1]->getline;
-            } else {
-                $ref->{tool} = "shiftc";
-                my $fhpid = open3_run([undef, -1, -1], "setfacl", "-M-", $dst);
-                next if (!defined $fhpid);
-                my $acls = $ref->{acls};
-                $acls =~ s/,/\n/g;
-                $fhpid->[0]->print(unescape($acls));
-                $fhpid->[0]->close;
-                open3_wait($fhpid);
-            }
         }
-    }
 
-    # setfattr
-    if ($opts{have}->{'shift-bin'} || $opts{have}->{setfattr} ||
-            $host ne 'localhost') {
-        foreach my $cmd (@{$tcmds}) {
-            my ($op, $src, $dst, $ref) = @{$cmd};
-            next if ($op ne 'chattr' || !$ref->{xattrs} ||
-                    $ref->{dstfs} && $ref->{dstfs} !~ /,xattr/);
+        # setfattr
+        if ($op eq 'chattr' && $ref->{xattrs} &&
+                (!$ref->{dstfs} || $ref->{dstfs} =~ /,xattr/)) {
+            my @args = ("setfattr", escape($dst), $ref->{xattrs});
+            push(@chattrs, \@args);
             # ignore errors since systems may have different command/users
-            if ($host ne 'localhost') {
-                $ref->{tool} = "shift-aux";
-                # chattr remote files in batch
-                ($fh, $tmp) = sftp_tmp() if (!$tmp);
-                print $fh "setfattr ", escape($dst), " $ref->{xattrs}\n";
-                next;
-            }
-            # chattr local files immediately
-            if (defined $fhpid) {
-                $ref->{tool} = "shift-bin";
-                $fhpid->[0]->print("setfattr ", escape($dst), " $ref->{xattrs}\n");
-                $fhpid->[1]->getline;
-            } else {
-                $ref->{tool} = "shiftc";
-                my $fhpid = open3_run([undef, -1, -1],
-                    "setfattr", "-h", "--restore=-");
-                next if (!defined $fhpid);
-                my $xattrs = $ref->{xattrs};
-                $xattrs =~ s/,/\n/g;
-                $fhpid->[0]->print("# file: $dst\n", unescape($xattrs));
-                $fhpid->[0]->close;
-                open3_wait($fhpid);
-            }
         }
+
+        $ref->{tool} = $host ne 'localhost' ? "shift-aux" :
+            ($opts{have}->{'shift-bin'} ? "shift-bin" : "shiftc");
     }
 
-    if ($tmp) {
+    return if (!scalar(@chattrs) && !scalar(@allocs));
+
+    my ($q, @threads);
+    if ($perl{threads} && $opts{threads} > 1) {
+        $q = Thread::Queue->new;
+        # mutual exclusion for stdout
+        @threads = map {threads->create(sub {
+            $opts{fhpid} = open3_run([undef, undef, -1], "shift-bin")
+                if ($opts{have}->{'shift-bin'});
+            transport_chattr1($_) while (defined ($_ = $q->dequeue));
+            open3_wait($opts{fhpid}) if (defined $opts{fhpid});
+        })} (1 .. $opts{threads});
+    }
+
+    if ($host ne 'localhost') {
+        my ($fh, $tmp) = sftp_tmp();
+        foreach (@chattrs, @allocs) {
+            print $fh join(" ", @{$_}), "\n";
+        }
         close $fh;
         open3_get([$tmp, -1, -1], "$opts{ssh} $host $opts{caux} chattr");
         unlink $tmp;
-        # ignore errors since will fail to system defaults
+    } else {
+        if ($perl{threads} && $opts{threads} > 1) {
+            $q->enqueue(@chattrs, @allocs);
+            # force threads to exit
+            $q->enqueue(undef) foreach (1 .. scalar(@threads));
+            foreach (@threads) {
+                $_->join if ($_);
+            }
+        } else {
+            $opts{fhpid} = open3_run([undef, undef, -1], "shift-bin")
+                if ($opts{have}->{'shift-bin'});
+            transport_chattr1($_) foreach (@chattrs, @allocs);
+            open3_wait($opts{fhpid}) if (defined $opts{fhpid});
+        }
     }
-    open3_wait($fhpid) if (defined $fhpid);
+}
+
+###########################
+#### transport_chattr1 ####
+###########################
+# set attrs of a single file
+sub transport_chattr1 {
+    my ($cmd, $file, $attrs) = @{$_[0]};
+    # short circuit if command not available
+    return if (!defined $opts{fhpid} && !$opts{have}->{$cmd});
+    # untaint arguments
+    $cmd = $1 if ($cmd =~ /(.*)/);
+    $file = $1 if ($file =~ /(.*)/s);
+    $attrs = $1 if ($attrs =~ /(.*)/);
+    my $ufile = unescape($file);
+
+    # make sure parent directory exists
+    my $dir = $ufile =~ s/\/$// ? $ufile : dirname($ufile);
+    eval {mkpath($dir)};
+
+    if (defined $opts{fhpid}) {
+        $opts{fhpid}->[0]->print(join(" ", $cmd, $file, $attrs), "\n");
+        $opts{fhpid}->[1]->getline;
+        # ignore errors
+    } else {
+        my ($cin, @copts, $in, $out);
+        if ($cmd eq 'fallocate') {
+            @copts = ("-n", "-l", unescape($attrs), $ufile);
+        } elsif ($cmd eq 'setstripe') {
+            $cmd = "lfs";
+            my ($count, $size, $pool) = split(/\s+/, unescape($attrs));
+            $count = 0 if (!$count);
+            $size = 0 if (!$size);
+            @copts = ("setstripe", "-c", $count, "-S", $size, $ufile);
+            splice(@copts, -1, 0, "-p", $pool) if ($pool);
+        } elsif ($cmd eq 'setfacl') {
+            $attrs =~ s/,/\n/g;
+            $cin = unescape($attrs);
+            @copts = ("-M-", $ufile);
+        } elsif ($cmd eq 'setfattr') {
+            $attrs =~ s/,/\n/g;
+            $cin = "# file: $ufile\n" . unescape($attrs);
+            @copts = ("-h", "--restore=-");
+        }
+        my $pid = IPC::Open3::open3($in, $out, $out, $cmd, @copts);
+        print $in $cin if ($cin);
+        close $in;
+        waitpid($pid, 0);
+        # ignore errors
+        close $out;
+    }
 }
 
 #######################
@@ -4013,7 +3726,7 @@ sub transport_dmf {
     foreach my $op (keys %gettmp) {
         close $getfh{$op};
         my $ssh = $op eq 'get' && $host ne 'localhost' ? "$opts{ssh} $host" : "";
-        # ignore errors since files will be automatically retrieved anyway
+        # ignore errors since files are automatically retrieved anyway
         open3_get([$gettmp{$op}, -1, -1], "$ssh dmget -nq$extra");
         unlink $gettmp{$op};
     }
@@ -4021,7 +3734,7 @@ sub transport_dmf {
     foreach my $rhost (keys %puttmp) {
         close $putfh{$rhost};
         my $ssh = $rhost ne 'localhost' ? "$opts{ssh} $rhost" : "";
-        # ignore errors since files will be automatically migrated anyway
+        # ignore errors since files are automatically migrated anyway
         open3_get([$puttmp{$rhost}, -1, -1], "$ssh dmput -n");
         unlink $puttmp{$rhost};
     }
@@ -4035,7 +3748,6 @@ sub transport_fadvise {
     my ($host, $tcmds) = @_;
     my ($fh, $tmp);
     #TODO: do we want --no-fadvise?
-    #TODO: what about remote hosts?
     foreach my $cmd (@{$tcmds}) {
         my ($op, $src, $dst, $ref) = @{$cmd};
         my @attrs = split(/,/, $ref->{attrs});
@@ -4052,32 +3764,20 @@ sub transport_fadvise {
                 # adjust dst by tar start offset
                 $doff = $x1 - $t1;
             }
-            # use eval as can die when permission denied
-            if ($perl{fadvise}) {
-                if ($op =~ /^(?:put|sum)$/ ||
-                        $op eq 'get' && $host eq 'localhost') {
-                    eval {fadvise($src, $soff, $x2 - $x1, POSIX_FADV_DONTNEED())};
-                }
-                if ($op eq 'get' ||
-                        $op =~ /^(?:cksum|put)$/ && $host eq 'localhost') {
-                    eval {fadvise($dst, $doff, $x2 - $x1, POSIX_FADV_DONTNEED())};
-                }
+            if ($op eq 'get') {
+                ($fh, $tmp) = sftp_tmp() if (!$tmp);
+                print $fh escape($src), " ", $soff, " ", $x2 - $x1, "\n";
             }
-            if ($host ne 'localhost') {
-                if ($op eq 'get') {
-                    ($fh, $tmp) = sftp_tmp() if (!$tmp);
-                    print $fh escape($src), " ", $soff, " ", $x2 - $x1, "\n";
-                }
-                if ($op =~ /^(?:cksum|put)$/) {
-                    ($fh, $tmp) = sftp_tmp() if (!$tmp);
-                    print $fh escape($dst), " ", $doff, " ", $x2 - $x1, "\n";
-                }
+            if ($op =~ /^(?:cksum|put)$/) {
+                ($fh, $tmp) = sftp_tmp() if (!$tmp);
+                print $fh escape($dst), " ", $doff, " ", $x2 - $x1, "\n";
             }
         }
     }
     if ($tmp) {
         close $fh;
-        open3_get([$tmp, -1, -1], "$opts{ssh} $host $opts{caux} fadvise");
+        open3_get([$tmp, -1, -1], $host eq 'localhost' ? "shift-bin" :
+            "$opts{ssh} $host $opts{caux} fadvise");
         unlink $tmp;
         # ignore errors since will eventually reclaim cache
     }
@@ -4086,36 +3786,37 @@ sub transport_fadvise {
 ########################
 #### transport_find ####
 ########################
-# compute remote files and sizes via shift-aux
 sub transport_find {
     my ($host, $tcmds) = @_;
+    my $logfh = $opts{logfh};
     my ($fh, $tmp);
     my %refs;
     foreach my $cmd (@{$tcmds}) {
         my ($op, $src, $dst, $ref) = @{$cmd};
         next if ($op ne 'find');
-        if ($host eq 'localhost') {
-            shift_find($host, $src, $dst, $ref);
-            next;
+        if ($host ne 'localhost') {
+            ($fh, $tmp) = sftp_tmp() if (!$tmp);
+            print $fh join(" ", map {escape($_)} ($host, $src, $dst));
+            foreach my $opt (qw(srcfs tar_name tar_tell)) {
+                print $fh " $opt=$ref->{$opt}" if (defined $ref->{$opt});
+            }
+            print $fh " $ref\n";
+            $ref->{tool} = "shift-aux";
         }
-        ($fh, $tmp) = sftp_tmp() if (!$tmp);
-        print $fh join(" ", map {escape($_)} ($host, $src, $dst));
-        foreach my $opt (qw(srcfs tar_name tar_tell)) {
-            print $fh " $opt=$ref->{$opt}" if (defined $ref->{$opt});
-        }
-        print $fh " $ref\n";
-        $ref->{tool} = "shift-aux";
         $refs{$ref} = [$src, $dst, $ref];
     }
+    return if (!scalar(keys %refs));
 
+    $opts{lhost} = fqdn(hostname);
     if ($tmp) {
+        # try to process remote finds using shift-aux
         close $fh;
         my $cmd = "$opts{ssh} $host $opts{caux} find";
         foreach my $opt (qw(create-tar dereference extract-tar ignore-times
-                index-tar sync)) {
+                index-tar recall sync)) {
             $cmd .= " --$opt" if ($opts{$opt});
         }
-        foreach my $opt (qw(find-files newer older preserve)) {
+        foreach my $opt (qw(buffer find-files newer older preserve threads)) {
             $cmd .= " --$opt $opts{$opt}" if ($opts{$opt});
         }
         foreach my $opt (qw(exclude include)) {
@@ -4123,36 +3824,132 @@ sub transport_find {
             $cmd .= " --$opt " . escape($_) foreach (@{$opts{$opt}});
         }
 
-        my $lhost = fqdn(hostname);
-        my ($ref, $logfh);
+        my %drefs;
         my $fhpid = open3_run([$tmp, undef, -1], $cmd);
         while (defined $fhpid && defined ($_ = $fhpid->[1]->getline)) {
             s/\s+$//;
             if (!/,/) {
                 if (/^ref\s+(\S+)$/) {
-                    $ref = $refs{$1}->[2];
-                    $logfh = $ref->{logfh};
-                    delete $refs{$1};
+                    my $ref = $refs{$1}->[2];
+                    $drefs{$ref} = $ref;
+                    delete $refs{$ref};
                 } else {
                     # errors indicated by comma-less line
-                    sftp_error($ref, $_);
+                    my ($ref, $err) = split(/:/, $_, 2);
+                    $ref = $drefs{$ref};
+                    sftp_error($ref, $err) if (defined $ref);
                 }
                 next;
             }
-            print $logfh $_, " host=$lhost\n";
+            print $logfh $_, " host=$opts{lhost}\n";
         }
         open3_wait($fhpid);
         unlink $tmp;
-        # additional processing needed if shift-aux failed
-        shift_find($host, @{$_}) foreach (values %refs);
-        if (defined $opts{fhpid}) {
-            open3_wait($opts{fhpid});
-            delete $opts{fhpid};
+        return if (!scalar(keys %refs));
+    }
+
+    # process any remaining tar files
+    if ($opts{'extract-tar'}) {
+        tar_extract($host, @{$_}) foreach (values %refs);
+        return;
+    }
+
+    # check for existence of various commands
+    if ((!defined $opts{have} || !$opts{have}->{GET}) && $host eq 'localhost') {
+        $opts{have}->{GET} = 1;
+        foreach my $bin (qw(dmget lfs getfacl getfattr shift-bin)) {
+            $opts{have}->{$bin} = first {-x "$_/$bin"} (split(/:/, $ENV{PATH}));
         }
     }
 
-    if ($opts{dmtmp}) {
-        close $opts{dmfh};
+    if ($opts{recall} && $opts{have}->{dmget}) {
+        # must set up tmp file for recalls in case threads need to access
+        ($opts{dmfh}, $opts{dmtmp}) = tempfile();
+    }
+
+    my @threads;
+    if ($perl{threads} && $opts{threads} > 1) {
+        $opts{findq} = Thread::Queue->new;
+        $opts{findeq} = Thread::Queue->new;
+        # number of worker "b's" processing files
+        $opts{findb4} = Thread::Semaphore->new(0);
+        # number of items that have been added to queue
+        $opts{findn4} = Thread::Semaphore->new(1);
+        # mutual exclusion for stdout
+        $opts{findo4} = Thread::Semaphore->new(1);
+        # number of unprocessed items on queue
+        $opts{findq4} = Thread::Semaphore->new(0);
+        @threads = map {threads->create(sub {
+            $opts{fhpid} = open3_run([undef, undef, -1], "shift-bin")
+                if ($opts{have}->{'shift-bin'} && ($opts{preserve} == 1 ||
+                        $opts{preserve} =~ /acl|stripe|xattr/));
+            # remove existing ssh connections so threads use their own
+            delete @opts{grep(/^sftp_/, keys %opts)};
+            while (1) {
+                my $path = $opts{findq}->dequeue_timed(1);
+                if (defined $path) {
+                    $opts{findb4}->up;
+                    $opts{findq4}->down;
+                    transport_find1($path);
+                    $opts{findb4}->down;
+                } elsif (!${$opts{findq4}} && !${$opts{findb4}}) {
+                    transport_find_buffer();
+                    last;
+                }
+            }
+            open3_wait($opts{fhpid}) if (defined $opts{fhpid});
+        })} (1 .. $opts{threads});
+    } else {
+        # need to define file count as used in both single/multi-threaded cases
+        $opts{findn4} = \0;
+        $opts{fhpid} = open3_run([undef, undef, -1], "shift-bin")
+            if ($opts{have}->{'shift-bin'} && ($opts{preserve} == 1 ||
+                    $opts{preserve} =~ /acl|stripe|xattr/));
+    }
+
+    foreach (values %refs) {
+        # compute local (or remote if shift-aux fails) files and sizes
+        my ($spath, $dst, $ref) = @{$_};
+        $ref->{tool} = "shiftc";
+        my $sdir = dirname($spath);
+        $sdir = "" if ($sdir eq '/');
+        my $ddir = dirname($dst);
+        $ddir = "" if ($ddir eq '/');
+        my $path = [[basename($spath), basename($dst), 
+            $perl{threads} && $opts{threads} > 1 ? "" . $ref : $ref],
+            $host, $sdir, $dst, $ddir, $ref->{srcfs}];
+        if ($opts{'create-tar'}) {
+            my $tdir = dirname(unescape($ref->{tar_name}));
+            $tdir = "" if ($tdir eq '.');
+            $tdir .= "/" if ($tdir && $tdir !~ /\/$/);
+            push(@{$path}, $tdir);
+        }
+        if ($perl{threads} && $opts{threads} > 1) {
+            $opts{findq4}->up;
+            $opts{findn4}->up;
+            $opts{findq}->enqueue($path);
+        } else {
+            transport_find1($path);
+        }
+    }
+
+    if ($perl{threads} && $opts{threads} > 1) {
+        foreach (@threads) {
+            $_->join if ($_);
+        }
+        # add error messages back to original ref
+        while (defined (my $referr = $opts{findeq}->dequeue_nb)) {
+            my ($ref, $err) = @{$referr};
+            sftp_error($refs{$ref}->[2], $err) if (defined $refs{$ref});
+        }
+        delete $opts{"find" . $_} foreach (qw(q eq b4 n4 o4 q4));
+    } else {
+        transport_find_buffer();
+        open3_wait($opts{fhpid}) if (defined $opts{fhpid});
+    }
+
+    close $opts{dmfh} if (defined $opts{dmfh});
+    if (-s $opts{dmtmp}) {
         # fork to avoid intermittent hangs of dmget
         my $pid = fork_setsid();
         if ($pid) {
@@ -4162,11 +3959,339 @@ sub transport_find {
         } else {
             my $ssh = $host eq 'localhost' ? "" : "$opts{ssh} $host";
             my $extra = $opts{'create-tar'} ? " -a" : "";
-            # ignore errors since files will be automatically retrieved anyway
+            # ignore errors since files are automatically retrieved anyway
             open3_get([$opts{dmtmp}, -1, -1], "$ssh dmget -nq$extra");
             unlink $opts{dmtmp};
             POSIX::_exit(0);
         }
+    } else {
+        unlink $opts{dmtmp};
+    }
+}
+
+###############################
+#### transport_find_buffer ####
+###############################
+# write output in blocks for efficiency
+sub transport_find_buffer {
+    my ($text, $file) = @_;
+    $opts{find_buf} .= $text;
+    $opts{recall_buf} .= $file;
+    if (($opts{find_buf} || $opts{recall_buf}) &&
+            (!defined $text || length $opts{find_buf} >= $opts{buffer} ||
+            length $opts{recall_buf} >= $opts{buffer})) {
+        $opts{findo4}->down if ($perl{threads} && $opts{threads} > 1);
+        if ($opts{find_buf} && (!defined $text ||
+                length $opts{find_buf} >= $opts{buffer})) {
+            print {$opts{logfh}} $opts{find_buf};
+            $opts{logfh}->flush;
+            delete $opts{find_buf};
+        }
+        if ($opts{recall_buf} && (!defined $text ||
+                length $opts{recall_buf} >= $opts{buffer})) {
+            print {$opts{dmfh}} $opts{recall_buf};
+            $opts{dmfh}->flush;
+            delete $opts{recall_buf};
+        }
+        $opts{findo4}->up if ($perl{threads} && $opts{threads} > 1);
+    }
+}
+
+#########################
+#### transport_find1 ####
+#########################
+# output list of files/dirs beneath given paths with stat info
+sub transport_find1 {
+    my $path = shift;
+    my ($file0, $shost, $sdir, $dst, $ddir, $srcfs, $tdir) = @{$path};
+    my $dfile0 = $file0;
+    my ($top, $ref);
+    if (ref $file0) {
+        $top = 1;
+        ($file0, $dfile0, $ref) = @{$file0};
+    }
+    return if ($file0 eq '.' || $file0 eq '..');
+    my $file = "$sdir/$file0";
+
+    my $dmf = $opts{recall} && $opts{have}->{dmget} && $srcfs =~ /,dmf/ ? 1 : 0;
+
+    # dereference before stat
+    if ($opts{dereference}) {
+        $file = $shost eq 'localhost' ?
+            abs_path($file) : sftp($shost)->realpath($file);
+    }
+    # always get stat info of real file
+    my @stat;
+    if ($file) {
+        if ($shost eq 'localhost') {
+            @stat = lstat($file);
+        } else {
+            my $fattrs = sftp($shost)->lstat($file);
+            if ($fattrs) {
+                # approximate local stat
+                @stat = (0, 0, $fattrs->perm , 0, $fattrs->uid, $fattrs->gid,
+                    0, $fattrs->size, $fattrs->atime, $fattrs->mtime,
+                    $fattrs->mtime, 0, int($fattrs->size / 512));
+            }
+        }
+    }
+    my $mode;
+    if (scalar(@stat) == 0) {
+        $file = "$sdir/$file0" if ($opts{dereference});
+        if ($top) {
+            # return error if original file
+            my $err = "Cannot stat $file";
+            if ($perl{threads} && $opts{threads} > 1) {
+                $opts{findeq}->enqueue([$ref, $err]);
+            } else {
+                sftp_error($ref, $err);
+            }
+            return;
+        }
+        # lower level files cannot return errors because there is no way
+        # to back out of previously added operations, so instead a find
+        # op is added, which will succeed/fail on its own when processed
+    } else {
+        $mode = $stat[2];
+        $stat[2] &= 07777;
+
+        # only directories, regular files, and symlinks are supported
+        return if (!S_ISDIR($mode) && !S_ISREG($mode) && !S_ISLNK($mode));
+        # dmf handling for individual files is carried out by transport_dmf
+        $dmf = 0 if ($top && !S_ISDIR($mode));
+    }
+
+    # exclude files (must be before dir processing)
+    if (defined $opts{exclude}) {
+        foreach my $re (@{$opts{exclude}}) {
+            return if (eval {$file =~ /$re/});
+        }
+    }
+
+    my $dh;
+    if (scalar(@stat) == 0 || S_ISDIR($mode)) {
+        # ensure $err defined unless explicitly set to undef
+        my $err = "";
+        if (scalar(@stat) > 0 && (!$opts{dereference} || $top) && 
+                (!defined $opts{'find-files'} ||
+                ${$opts{findn4}} < $opts{'find-files'})) {
+            # add subdirs of this directory for processing when below limit
+            if ($shost eq 'localhost' ? opendir($dh, $file) :
+                    ($dh = sftp($shost)->opendir($file))) {
+                $err = undef;
+                # directory will be processed after parent dir printed
+            } else {
+                $err = "Error opening directory $file";
+            }
+            if ($err && $top) {
+                # return error if original file
+                if ($perl{threads} && $opts{threads} > 1) {
+                    $opts{findeq}->enqueue([$ref, $err]);
+                } else {
+                    sftp_error($ref, $err);
+                }
+                return;
+            }
+        }
+        if (defined $err) {
+            # this handles directories as well as lower level stat failures
+            my $line = "args=find," . escape(hostpath($shost, $file)) . ",";
+            $line .= $opts{'create-tar'} ? escape($dst) . " tar_name=" .
+                escape("$tdir$file0") : escape("$ddir/$dfile0");
+            transport_find_buffer($line . " host=$opts{lhost}\n");
+            return;
+        }
+    }
+
+    # include files
+    if (defined $opts{include}) {
+        my $found;
+        foreach my $re (@{$opts{include}}) {
+            next if (eval {$file !~ /$re/});
+            $found = 1;
+            last;
+        }
+        # must be done both here for files and after dir processing
+        goto FIND_DIR if (!$found);
+    }
+
+    # newer/older files
+    my %ti = ('a' => 8, 'm' => 9, 'c' => 10);
+    if (defined $opts{newer}) {
+        if ($opts{newer} =~ /^([^:]+):(\S+)/) {
+            my ($type, $time) = ($1, $2);
+            $type =~ s/\|/1||/g;
+            $type =~ s/([amc])/$stat[$ti{$1}]>=$time&&/g;
+            $type =~ s/([AMC])/$stat[$ti{lc($1)}]<$time&&/g;
+            $type .= "1";
+            # must be done both here for files and after dir processing
+            goto FIND_DIR if (!eval $type);
+        } elsif ($stat[9] < $opts{newer}) {
+            # must be done both here for files and after dir processing
+            goto FIND_DIR;
+        }
+    }
+    if (defined $opts{older}) {
+        if ($opts{older} =~ /^([^:]+):(\S+)/) {
+            my ($type, $time) = ($1, $2);
+            $type =~ s/\|/1||/g;
+            $type =~ s/([amc])/$stat[$ti{$1}]<$time&&/g;
+            $type =~ s/([AMC])/$stat[$ti{lc($1)}]>=$time&&/g;
+            $type .= "1";
+            # must be done both here for files and after dir processing
+            goto FIND_DIR if (!eval $type);
+        } elsif ($stat[9] >= $opts{older}) {
+            # must be done both here for files and after dir processing
+            goto FIND_DIR;
+        }
+    }
+
+    # resolve uid/gid if possible
+    my $user = $opts{findu}->{$stat[4]};
+    if (!defined $user) {
+        $user = getpwuid($stat[4]);
+        $user = "uid_$stat[4]" if (!$user);
+        $opts{findu}->{$stat[4]} = $user;
+    }
+    my $group = $opts{findg}->{$stat[5]};
+    if (!defined $group) {
+        $group = getgrgid($stat[5]);
+        $group = "gid_$stat[5]" if (!$group);
+        $opts{findg}->{$stat[5]} = $group;
+    }
+    my $attrs = join(",", @stat[2,4,5,8,9],
+        escape($user), escape($group), $stat[7], 512 * $stat[12]);
+
+    my @acls;
+    my @lattrs;
+    my @xattrs;
+    if ($shost eq 'localhost') {
+        # if shift-aux failed, there is no backup to get this info remotely
+        # try to get acls
+        if (($opts{have}->{'shift-bin'} || $opts{have}->{getfacl}) &&
+                !$opts{'create-tar'} &&
+                ($opts{preserve} == 1 || $opts{preserve} =~ /acl/) && 
+                (!$srcfs || $srcfs =~ /,acl/)) {
+            if (defined $opts{fhpid}) {
+                $opts{fhpid}->[0]->print("getfacl $file\n");
+                my $text = $opts{fhpid}->[1]->getline;
+                my @cols = split(/\s+/, $text);
+                push(@acls, $cols[2]) if ($file eq $cols[1] && $cols[-1] eq '0');
+            } else {
+                my $fhpid = open3_run([-1, undef, -1],
+                    "getfacl", "-cps",  "--", $file);
+                while (defined $fhpid && defined ($_ = $fhpid->[1]->getline)) {
+                    chomp;
+                    next if (!$_);
+                    push(@acls, escape($_));
+                }
+                open3_wait($fhpid);
+            }
+        }
+
+        # try to get xattrs
+        if (($opts{have}->{'shift-bin'} || $opts{have}->{getfattr}) &&
+                !$opts{'create-tar'} &&
+                ($opts{preserve} == 1 || $opts{preserve} =~ /xattr/) && 
+                (!$srcfs || $srcfs =~ /,xattr/)) {
+            if (defined $opts{fhpid}) {
+                $opts{fhpid}->[0]->print("getfattr $file\n");
+                my $text = $opts{fhpid}->[1]->getline;
+                my @cols = split(/\s+/, $text);
+                push(@xattrs, $cols[2]) if ($file eq $cols[1] && $cols[-1] eq '0');
+            } else {
+                my $fhpid = open3_run([-1, undef, -1],
+                    "getfattr", "-dhe", "base64", $file);
+                while (defined $fhpid && defined ($_ = $fhpid->[1]->getline)) {
+                    chomp;
+                    next if (!$_ || /^\s*#/);
+                    push(@xattrs, escape(decode_base64($_)));
+                }
+                open3_wait($fhpid);
+            }
+        }
+
+        # try to get lustre striping
+        if (($opts{have}->{'shift-bin'} || $opts{have}->{lfs}) &&
+                !S_ISLNK($mode) && !$opts{'create-tar'} &&
+                ($opts{preserve} == 1 || $opts{preserve} =~ /stripe/) && 
+                $srcfs =~ /^lustre/) {
+            # ignore symlinks as link to fifo can hang forever
+            if (defined $opts{fhpid}) {
+                $opts{fhpid}->[0]->print("getstripe $file\n");
+                my $text = $opts{fhpid}->[1]->getline;
+                my @cols = split(/\s+/, $text);
+                @lattrs = split(/,/, $cols[2]) if ($file eq $cols[1] && $cols[-1] eq '0');
+            } else {
+                my $fhpid = open3_run([-1, undef, -1],
+                    "lfs", "getstripe", "-d", $file);
+                while (defined $fhpid && defined ($_ = $fhpid->[1]->getline)) {
+                    $lattrs[0] = $1 if (/stripe_count:\s*(-?\d+)/);
+                    $lattrs[1] = $1 if (/stripe_size:\s*(-?\d+)/);
+                }
+                open3_wait($fhpid);
+            }
+        }
+        $lattrs[0] = 0 if (!defined $lattrs[0] && defined $lattrs[1]);
+        $lattrs[1] = 0 if (!defined $lattrs[1] && defined $lattrs[0]);
+    }
+
+    # begin log entry
+    my $line;
+    my $index_len = !$opts{'index-tar'} ? 0 : 28 + length("$tdir$file0") +
+        length(sprintf("%7s%7s%9d", $user, $group, $stat[7]));
+    if (S_ISLNK($mode)) {
+        my $ln = $shost eq 'localhost' ? readlink($file) :
+            sftp($shost)->readlink($file);
+        $line .= "args=ln," . escape($ln);
+        $index_len += 4 + length($ln);
+    } elsif (S_ISDIR($mode)) {
+        $line .= "args=mkdir";
+    } elsif ($opts{sync}) {
+        $line .= "args=ckattr" . ($opts{'ignore-times'} ? "0" : "") .
+            "," . escape(hostpath($shost, $file));
+    } else {
+        $line .= "args=cp," . escape(hostpath($shost, $file));
+    }
+    $line .= "," . (escape($opts{'create-tar'} ? $dst : "$ddir/$dfile0"));
+    $line .= " acls=" . join(",", @acls) if (scalar(@acls) > 0);
+    $line .= " xattrs=" . join(",", @xattrs) if (scalar(@xattrs) > 0);
+    $line .= " lustre_attrs=" . join(",", @lattrs) if (scalar(@lattrs) > 0);
+    $line .= " tar_index=$index_len" if ($opts{'index-tar'});
+    $line .= " tar_name=" . escape("$tdir/$file0") if ($opts{'create-tar'});
+    $line .= " size=$stat[7] attrs=$attrs host=$opts{lhost}\n";
+    transport_find_buffer($line, !S_ISLNK($mode) && !S_ISDIR($mode) &&
+        $dmf ? $file . "\n" : undef);
+
+    FIND_DIR: if (defined $dh) {
+        # flush buffer to ensure parent dir printed before subdirs
+        transport_find_buffer();
+        while (1) {
+            my $ent;
+            if ($shost eq 'localhost') {
+                $ent = readdir $dh;
+            } else {
+                $ent = sftp($shost)->readdir($dh);
+                $ent = $ent->{filename} if ($ent);
+            }
+            last if (!defined $ent);
+            my $path = [$ent, $shost, $file, $dst, "$ddir/$dfile0", $srcfs];
+            push(@{$path}, "$tdir/$file0") if ($opts{'create-tar'});
+            if ($perl{threads} && $opts{threads} > 1 &&
+                    #$opts{findq}->pending < $opts{'queue-size'}) {
+                    #$opts{findq}->pending < $opts{'threads'}) {
+#TODO: determine what size should go here
+                    ${$opts{findq4}} < 4 * $opts{threads}) {
+                # only add to queue if not already at capacity
+                $opts{findq4}->up;
+                $opts{findn4}->up;
+                $opts{findq}->enqueue($path);
+            } else {
+                # process now if single threaded or queue at capacity
+                transport_find1($path);
+            }
+        }
+        closedir $dh;
     }
 }
 
@@ -4321,6 +4446,7 @@ sub transport_fish {
                 }
                 #TODO: de-hardcode 60 second timeout
                 $tin->sockopt(SO_RCVTIMEO, pack('L!L!', +60, 0));
+                $tin->setsockopt(IPPROTO_TCP, TCP_NODELAY, 1);
                 $tout = $tin;
                 my $nonce = "" . rand();
                 my $hmac = Digest::HMAC::hmac_hex($nonce, $key,
@@ -6142,7 +6268,7 @@ sub vdf {
         my $out;
         eval {
             local $SIG{__WARN__} = sub {die};
-            # use 2s alarm in case df stalls
+            # use 15s alarm in case df stalls
             local $SIG{ALRM} = sub {die};
             alarm 15;
             # use open3 to avoid executing a shell command based on the name

@@ -12,7 +12,7 @@ Shift Installation and Configuration
 
         o shift-mgr - the Shift manager, which is invoked by client instances
                       and must exist either on all client hosts or on a host
-                      accessible via ssh hostbased or pubkey authentication
+                      accessible via ssh hostbased or publickey authentication
                       (henceforth called "manager hosts")
 
         o shift-aux - the Shift auxiliary utility, which is invoked by client
@@ -42,7 +42,7 @@ Shift Installation and Configuration
     designated as manager hosts.  Since the manager is not an active server
     and is simply a passive executable invoked by clients, the manager can be
     located on any host with ssh access.  These hosts must support either
-    hostbased or pubkey authentication, however, since Shift is an automated
+    hostbased or publickey authentication, however, since Shift is an automated
     framework that performs actions without the user present.  The manager has
     a synchronization mechanism allowing multiple hosts without a shared file
     system to be used for redundancy.
@@ -54,7 +54,7 @@ Shift Installation and Configuration
 
         o perl >= 5.8.5 (>= 5.10.1 is required for multi-threading support)
         o ssh (and sftp) access to manager/remote hosts via hostbased or
-              pubkey authentication
+              publickey authentication
 
     2.2. Optional
 
@@ -70,7 +70,7 @@ Shift Installation and Configuration
             (http://toolkit.globus.org/toolkit/data/gridftp)
         o rsync - bandwidth-efficient local/remote copy
             (http://rsync.samba.org)
-        o mesh - lightweight single sign-on via ssh pubkeys
+        o mesh - lightweight single sign-on via ssh publickey authentication
             (http://mesh.sf.net)
 
     2.3. Invoked (standard on most systems or when specific file systems in use)
@@ -175,9 +175,9 @@ Shift Installation and Configuration
         5.1.1. ~/.ssh/id_rsa (or similar)
 
             If hostbased authentication is not supported by client hosts,
-            manager hosts, and/or remote hosts, pubkey authentication must be
-            used.  Clients must have access to private keys to access these
-            systems, which may either be referenced explicitly via the
+            manager hosts, and/or remote hosts, publickey authentication must
+            be used.  Clients must have access to private keys to access
+            these systems, which may either be referenced explicitly via the
             --mgr-identity and --identity options for manager and remote
             hosts, respectively, or be added to an ssh agent on the client(s).
             Note that the private keys used for these options must not be
@@ -189,7 +189,7 @@ Shift Installation and Configuration
         5.1.2. ~/.ssh/authorized_keys
 
             If hostbased authentication is not supported to other client hosts
-            for parallelization, pubkey authentication must be used.  In this
+            for parallelization, publickey authentication must be used.  In this
             case, the public key(s) corresponding to the private key(s) used by
             clients (those named ~/.ssh/id* loaded into an ssh agent) must be
             added to the invoking user's authorized_keys file on other client
@@ -270,24 +270,25 @@ Shift Installation and Configuration
         5.2.2. ~/.ssh/authorized_keys
 
             If hostbased authentication is not supported to manager hosts,
-            pubkey authentication must be used.  In this case, the public key(s)
-            corresponding to the private key(s) used by clients (either loaded
-            into an ssh agent or specified via --mgr-identity) must be added to
-            the appropriate user's authorized_keys file on manager hosts.
-            This user will either be the invoking user or the one specified by
-            --mgr-user.
+            publickey authentication must be used.  In this case, the public
+            key(s) corresponding to the private key(s) used by clients (either
+            loaded into an ssh agent or specified via --mgr-identity) must be
+            added to the appropriate user's authorized_keys file on manager
+            hosts.  This user will either be the invoking user or the one
+            specified by --mgr-user.
 
 
     5.3. Remote hosts
 
         5.3.1. ~/.ssh/authorized_keys
 
-            If hostbased authentication is not supported to remote hosts, pubkey
-            authentication must be used.  In this case, the public key(s)
-            corresponding to the private key(s) used by clients (either loaded
-            into an ssh agent or specified via --identity) must be added to the
-            appropriate user's authorized_keys file on remote hosts.  This user
-            will either be the invoking user or the one specified by --user.
+            If hostbased authentication is not supported to remote hosts,
+            publickey authentication must be used.  In this case, the public
+            key(s) corresponding to the private key(s) used by clients (either
+            loaded into an ssh agent or specified via --identity) must be added
+            to the appropriate user's authorized_keys file on remote hosts.
+            This user will either be the invoking user or the one specified by
+            --user.
 
 
 6. Usage
@@ -302,9 +303,6 @@ Shift Installation and Configuration
         if not already in a manpath directory.  Basic usage is drop-in
         compatible with cp/scp with special consideration for the authentication
         options --mgr, --mgr-identity, --mgr-user, --identity, and --user.
-        Note that the scp "user@host" syntax is not currently supported (the
-        "user@" portion will be dropped) so --user must be specified instead
-        when the remote user differs from the local user.
 
     6.2. shift-mgr
 
