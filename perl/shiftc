@@ -83,7 +83,7 @@ use constant SFTP_TRUNC => 0x10;
 use constant SFTP_WRITE => 0x02;
 use constant SFTP_EXCL => 0x20;
 
-our $VERSION = 0.98;
+our $VERSION = 0.981;
 
 $Data::Dumper::Indent = 0;
 $Data::Dumper::Purity = 1;
@@ -2360,7 +2360,7 @@ sub shift_loop {
         }
 
         # handle cron after opts have been received from manager
-        shift_cron() if (!$opts{crontab} && $opts{cron});
+        shift_cron() if (!$opts{crontab} && $opts{cron} && $opts{id} !~ /\D/);
 
         $size = transport('end');
         my $time = time - $run;
