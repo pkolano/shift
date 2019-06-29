@@ -83,7 +83,7 @@ use constant SFTP_TRUNC => 0x10;
 use constant SFTP_WRITE => 0x02;
 use constant SFTP_EXCL => 0x20;
 
-our $VERSION = 0.981;
+our $VERSION = 0.982;
 
 $Data::Dumper::Indent = 0;
 $Data::Dumper::Purity = 1;
@@ -4258,7 +4258,7 @@ sub transport_find1 {
     $line .= " xattrs=" . join(",", @xattrs) if (scalar(@xattrs) > 0);
     $line .= " lustre_attrs=" . join(",", @lattrs) if (scalar(@lattrs) > 0);
     $line .= " tar_index=$index_len" if ($opts{'index-tar'});
-    $line .= " tar_name=" . escape("$tdir/$file0") if ($opts{'create-tar'});
+    $line .= " tar_name=" . escape("$tdir$file0") if ($opts{'create-tar'});
     $line .= " size=$stat[7] attrs=$attrs host=$opts{lhost}\n";
     transport_find_buffer($line, !S_ISLNK($mode) && !S_ISDIR($mode) &&
         $dmf ? $file . "\n" : undef);
@@ -4276,7 +4276,7 @@ sub transport_find1 {
             }
             last if (!defined $ent);
             my $path = [$ent, $shost, $file, $dst, "$ddir/$dfile0", $srcfs];
-            push(@{$path}, "$tdir/$file0") if ($opts{'create-tar'});
+            push(@{$path}, "$tdir$file0/") if ($opts{'create-tar'});
             if ($perl{threads} && $opts{threads} > 1 &&
                     #$opts{findq}->pending < $opts{'queue-size'}) {
                     #$opts{findq}->pending < $opts{'threads'}) {
