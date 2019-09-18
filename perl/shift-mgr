@@ -71,7 +71,7 @@ use Text::ParseWords;
 require Tie::DB_FileLock;
 require Text::FormatTable;
 
-our $VERSION = 0.98;
+our $VERSION = 6.03;
 
 $Data::Dumper::Pair = " = ";
 $Data::Dumper::Sortkeys = 1;
@@ -171,6 +171,7 @@ my $self = (gethostbyname(hostname()))[0];
 $self = "localhost" if (!$self);
 my $time = time;
 my %umounts;
+my $ustore;
 
 # files only readable by owner unless explicitly specified
 umask 077;
@@ -361,8 +362,13 @@ if (defined $opts{put} && !defined $opts{id}) {
             $umounts{shells}->{$op{host}} = 1;
         }
     }
+
+    # lock user info
+    lock_dir(0);
     # store user db to file
     nstore(\%umounts, $conf{umount_db});
+    # unlock user info
+    lock_dir(0, 1);
 
     # synchronize user db
     sync_queue("$opts{user}.mounts") if ($conf{sync_host});
@@ -501,7 +507,7 @@ if ($opts{alive}) {
     # clear host/client info so clients can be respawned
     $meta{ohosts} = 0;
     delete $meta{$_} foreach
-        (grep(/^(clients|email|env|last|load|mount\w|pids|shells|sleep|warn)_/,
+        (grep(/^(clients|email|env|last|load|pids|shells|sleep|warn)_/,
             keys %meta));
 
     # move all failed operations out of error back into queues
@@ -516,8 +522,8 @@ if ($opts{alive}) {
         my $cmd = shift @args;
         if ($opts{restart} eq 'ignore') {
             # decrease total counts to pretend file was done
-            $meta{t_chattr}--
-                if ($cmd ne 'find' && ($meta{sanity} || $meta{preserve}));
+            $meta{t_chattr}-- if ($cmd !~ /^(?:chattr|find)$/ &&
+                    ($meta{sanity} || $meta{preserve}));
             if ($cmd =~ /^(?:cp|cksum|sum)$/) {
                 # decrease sizes to keep status consistent
                 $meta{s_total} -= $op{size};
@@ -537,6 +543,7 @@ if ($opts{alive}) {
                 }
             } else {
                 $meta{"t_$cmd"}--;
+                $meta{tar_mv}-- if ($op{tar_mv});
                 # record ignored finds so put() can terminate initialization
                 $opts{more_finds}++ if ($cmd eq 'find');
             }
@@ -595,7 +602,7 @@ put() if (defined $opts{put} && (!$opts{pid} ||
           # only process puts of most recent client
           $meta{"pids_$opts{host}$opts{cid}"} =~ /(?:^|,)$opts{pid}$/));
 # let other clients update silent corruption db
-$dblock->unlockDB if (defined $dblock);
+eval {$dblock->unlockDB} if (defined $dblock);
 
 if ($opts{get} && ($meta{stop} || $meta{time1} ||
         # stop client if a new process has taken over
@@ -634,11 +641,23 @@ foreach my $file (glob "$opts{base}/*") {
 # store metadata to file
 put_meta(\%meta);
 
-# synchronize log files
-sync_queue() if ($conf{sync_host});
-
 # unlock id before cleanup
 lock_dir(1, 1);
+
+if ($ustore) {
+    # lock user info
+    lock_dir(0);
+    # store user db to file
+    nstore(\%umounts, $conf{umount_db});
+    # unlock user info
+    lock_dir(0, 1);
+
+    # synchronize user db
+    sync_queue("$opts{user}.mounts") if ($conf{sync_host});
+}
+
+# synchronize log files
+sync_queue() if ($conf{sync_host});
 
 # detach process during cleanup
 exit if (fork);
@@ -695,9 +714,9 @@ if ($opts{get} || defined $opts{put}) {
     }
     nstore(\%loaddb, "$conf{user_dir}/$opts{user}.load");
     chmod(0644, "$conf{user_dir}/$opts{user}.load");
-    sync_queue("$opts{user}.load") if ($conf{sync_host});
     # unlock user info
     lock_dir(0, 1);
+    sync_queue("$opts{user}.load") if ($conf{sync_host});
     sync_local() if ($conf{sync_host});
 }
 
@@ -844,8 +863,10 @@ my %detect_silent_db;
 sub detect_silent {
     my ($op, $src, $dst) = @_;
     if (!defined $dblock) {
-        $dblock = tie(%detect_silent_db, 'Tie::DB_FileLock',
-            "$conf{user_dir}/$opts{user}.sums", O_RDWR | O_CREAT, 0600);
+        eval {
+            $dblock = tie(%detect_silent_db, 'Tie::DB_FileLock',
+                "$conf{user_dir}/$opts{user}.sums", O_RDWR | O_CREAT, 0600);
+        };
     }
     my @attrs = split(/,/, $op->{attrs});
     my ($hsize, $ophash);
@@ -2118,7 +2139,7 @@ sub lock_dir {
     my ($id, $unlock) = @_;
     if (!$unlock) {
         my $f = $id ? "$opts{base}/lock" : "$conf{user_dir}/$opts{user}.lock";
-        open($locks[$id], '>', $f) || return;
+        open($locks[$id], '>>', $f) || return;
         flock($locks[$id], LOCK_EX);
     } elsif (defined $locks[$id]) {
         close $locks[$id];
@@ -3100,7 +3121,8 @@ sub put {
                     }
                     if ($bytes) {
                         # reduce tries if progress being made
-                        $op{try}-- if ($op{bytes} ne $bytes);
+                        $op{try}-- if (join(",", sort {$a <=> $b} split(/,/, $op{bytes})) ne
+                                join(",", sort {$a <=> $b} split(/,/, $bytes)));
                         $op{bytes} = $bytes;
                         # adjust size of remaining operations
                         $op{size} = 0;
@@ -3427,7 +3449,6 @@ sub put {
 
     # update user db
     if (scalar(keys %mnts)) {
-        my $ustore;
         while (my ($line, $op) = each %mnts) {
             # only add hosts that are not in global db
             next if (!$op->{host} || $mounts{shells}->{$op->{host}});
@@ -3442,13 +3463,6 @@ sub put {
                 $db->{"mountr_$op->{host}:$op->{local}"} = $srv;
                 $db->{"mounto_$op->{host}:$op->{local}"} = $op->{opts};
             }
-        }
-
-        if ($ustore) {
-            # store user db to file
-            nstore(\%umounts, $conf{umount_db});
-            # synchronize user db
-            sync_queue("$opts{user}.mounts") if ($conf{sync_host});
         }
     }
 
@@ -4060,9 +4074,13 @@ sub sync_local {
     lock_dir(0);
     # process may have finished in meantime
     $sfile = $sbase if (! -e $sfile);
-    rename($sfile, "${sbase}_$$");
+    my $spid = "${sbase}_$$";
+    # untaint files
+    $sfile = $1 if ($sfile =~ /^(.*)$/);
+    $spid = $1 if ($spid =~ /^(.*)$/);
+    rename($sfile, $spid);
     lock_dir(0, 1);
-    open(SYNCQ, '<', "${sbase}_$$") or return;
+    open(SYNCQ, '<', $spid) or return;
 
     my $fhpid = open3_run([undef, undef, -1],
         "ssh $conf{sync_host} shift-mgr --sync");
@@ -4159,7 +4177,7 @@ sub sync_local {
 
     $out->write("#exit\n") if (!ref $rc0);
     open3_wait($fhpid);
-    unlink "${sbase}_$$";
+    unlink $spid;
 }
 
 #######################

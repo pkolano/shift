@@ -83,7 +83,7 @@ use constant SFTP_TRUNC => 0x10;
 use constant SFTP_WRITE => 0x02;
 use constant SFTP_EXCL => 0x20;
 
-our $VERSION = 0.982;
+our $VERSION = 6.03;
 
 $Data::Dumper::Indent = 0;
 $Data::Dumper::Purity = 1;
@@ -99,7 +99,7 @@ delete $ENV{DISPLAY};
 
 my %perl;
 $perl{ssl} = eval 'use IO::Socket::SSL; 1';
-# need threads and version of Thread::Queue from perl >= 5.10.1
+# need threads and version of Thread::Queue/Semaphore from perl >= 5.10.1
 $perl{threads} = eval 'require 5.010_001; use threads; use Thread::Queue; use Thread::Semaphore; 1';
 
 #########################
@@ -917,7 +917,7 @@ sub open3_wait {
     my $fhpid = shift;
     return if (!defined $fhpid);
     my $pid = pop(@{$fhpid});
-    close $_ foreach(@{$fhpid});
+    close $_ foreach (@{$fhpid});
     waitpid($pid, 0);
 }
 
@@ -2068,8 +2068,7 @@ sub shift_loop {
             chomp $text;
             print $logfh "args=exception text=", escape($text);
             close $logfh;
-            shift_mgr("--id=$opts{id} --host=$host --put $opts{get_host}",
-                $log, undef, 1440);
+            shift_mgr("--id=$opts{id} --host=$host --put $opts{get_host}", $log);
         }
     }
 
@@ -2124,7 +2123,7 @@ sub shift_loop {
         close $logfh;
         my $out = shift_mgr(
             "--id=$opts{id} --host=$host --pid=$$ --get --put $opts{get_host}",
-            $log, $task, 1440);
+            $log, $task, 1);
         die "$$out\n" if (ref $out);
         #TODO: error checking if id doesn't exist
         open($logfh, '>', $log);
@@ -2445,7 +2444,6 @@ sub shift_mgr {
     return open3_run([-1, undef, -1], $cmd) if ($cmd =~ /--lock/);
     return system(quotewords('\s+', 0, $cmd)) if ($cmd =~ /--monitor/);
     $stdin = -1 if (!$stdin);
-    my $start = time;
     my $err;
     do {
 =for mesh
@@ -2480,7 +2478,7 @@ sub shift_mgr {
         }
         unlink $tmp;
         return $out if (!$rc);
-    } while ($retry && time < $start + $retry * 60 && sleep 60);
+    } while ($retry && sleep 60);
     #TODO: more error checking to determine correct action
     return \"Unable to execute \"$cmd\": $err";
     #TODO: needs to stop on its own at some point
@@ -3314,8 +3312,8 @@ sub transport_bbcp {
             $lcs =~ s/^\/+//;
             if ($spath && $src eq "$spath/$lcs" && $dst eq "$dpath/$lcs") {
                 print $fh ($shost ? $shost . ":" : ""), "$lcs\n";
-                push(@{$errs{"$spath/$lcs"}}, $ref);
-                push(@{$errs{"$dpath/$lcs"}}, $ref);
+                $errs{"$spath/$lcs"}->{$ref} = $ref;
+                $errs{"$dpath/$lcs"}->{$ref} = $ref;
                 next;
             } elsif ($spath) {
                 # next file has different prefix so process current batch
@@ -3331,15 +3329,15 @@ sub transport_bbcp {
             $spath =~ s/\/\Q$lcs\E$//;
             $dpath = $dst;
             $dpath =~ s/\/\Q$lcs\E$//;
-            push(@{$errs{"$spath/$lcs"}}, $ref);
-            push(@{$errs{"$dpath/$lcs"}}, $ref);
+            $errs{"$spath/$lcs"}->{$ref} = $ref;
+            $errs{"$dpath/$lcs"}->{$ref} = $ref;
         } else {
             # no common suffix implies single file copy with rename
             # or symlink dereference
             my %errs_tmp;
             # use different hash as other files may already be in there
-            $errs_tmp{$src} = [$ref];
-            $errs_tmp{$dst} = [$ref];
+            $errs_tmp{$src}->{$ref} = $ref;
+            $errs_tmp{$dst}->{$ref} = $ref;
             transport_bbcp_batch($args . ($shost ? " -z" : ""), "",
                 "$shost$src", "$dhost$dst", \%errs_tmp, $host);
         }
@@ -3388,12 +3386,12 @@ sub transport_bbcp_batch {
             if ($line =~ /^File (.*) created(?!.*created)/) {
                 my $file = $1;
                 foreach my $key (grep(/^\Q$file\E$/, keys(%{$errs}))) {
-                    $_->{text} = 0 foreach(@{$errs->{$key}});
+                    $_->{text} = 0 foreach (values %{$errs->{$key}});
                 }
             } elsif ($line =~ /^bbcp: [^\/]*(\/.*)/) {
                 my $file = $1;
                 foreach my $key (grep(/^\Q$file\E$/, keys(%{$errs}))) {
-                    sftp_error($_, $line) foreach(@{$errs->{$key}});
+                    sftp_error($_, $line) foreach (values %{$errs->{$key}});
                 }
             }
         }
@@ -3403,7 +3401,7 @@ sub transport_bbcp_batch {
     waitpid($pid, 0) if ($pid);
 
     foreach my $key (keys %{$errs}) {
-        foreach(@{$errs->{$key}}) {
+        foreach (values %{$errs->{$key}}) {
             sftp_error($_, "unknown bbcp failure") if (!defined $_->{text});
         }
     }
@@ -3535,7 +3533,7 @@ sub transport_chattr {
                 $stripe[$i] = eval $eval;
             }
             # count >= 64k indicates a size per stripe
-            $stripe[0] = int($sz / $stripe[0]) if ($stripe[0] >= 65536);
+            $stripe[0] = ceil($sz / $stripe[0]) if ($stripe[0] >= 65536);
             my @args = ("setstripe", escape($dst) . ($op eq 'mkdir' ? "/" : ""),
                 join(" ", @stripe));
             push(@chattrs, \@args);
@@ -3886,7 +3884,17 @@ sub transport_find {
             # remove existing ssh connections so threads use their own
             delete @opts{grep(/^sftp_/, keys %opts)};
             while (1) {
-                my $path = $opts{findq}->dequeue_timed(1);
+                my $path;
+                if ($opts{findq}->can('dequeue_timed')) {
+                    $path = $opts{findq}->dequeue_timed(1);
+                } else {
+                    $path = $opts{findq}->dequeue_nb;
+                    if (!defined $path) {
+                        # must fake timed dequeue - use thread-safe sleep
+                        select(undef, undef, undef, 1);
+                        $path = $opts{findq}->dequeue_nb;
+                    }
+                }
                 if (defined $path) {
                     $opts{findb4}->up;
                     $opts{findq4}->down;
@@ -4441,11 +4449,14 @@ sub transport_fish {
             }
             if ($tin) {
                 if ($opts{window}) {
-                    $tin->sockopt(SO_RCVBUF, $opts{window});
-                    $tin->sockopt(SO_SNDBUF, $opts{window});
+                    # this has been observed to be detrimental to performance
+                    # in practice so revert to default linux window scaling
+                    #$tin->sockopt(SO_RCVBUF, $opts{window});
+                    #$tin->sockopt(SO_SNDBUF, $opts{window});
                 }
                 #TODO: de-hardcode 60 second timeout
                 $tin->sockopt(SO_RCVTIMEO, pack('L!L!', +60, 0));
+                $tin->sockopt(SO_SNDTIMEO, pack('L!L!', +60, 0));
                 $tin->setsockopt(IPPROTO_TCP, TCP_NODELAY, 1);
                 $tout = $tin;
                 my $nonce = "" . rand();
@@ -4582,6 +4593,7 @@ sub transport_fish_io {
     return (ref $err ? $err : $rc) if (ref $err || ref $rc);
     $len = $rc if ($cmd eq 'get');
     $rc = undef;
+    my $wlen = $len;
 
     my $sopts = !$opts{verify} || !$opts{'verify-fast'} || $cmd ne 'put' ? 0 :
         verify_init(length => $len);
@@ -4600,19 +4612,22 @@ sub transport_fish_io {
             $in->read($buf, $nbytes) : $fh->sysread($buf, $nbytes);
         last if ($n < $nbytes);
         $out->write("### 200\n") if ($cmd eq 'put');
-        $cmd eq 'get' ? $fh->syswrite($buf) : $out->write($buf);
+        my $wn = $cmd eq 'get' ? $fh->syswrite($buf) : $out->write($buf);
         $len -= $n;
+        # write() only returns ok/fail and not size like read()
+        $wlen -= $cmd eq 'get' ? $wn : ($wn ? $n : 0);
         verify_buffer($sopts, $buf, $sopts->{length} - $len)
             if ($opts{verify} && $opts{'verify-fast'} && $cmd eq 'put');
     }
     $fh->close;
 
-    if ($len > 0) {
-        $rc = {error => "Error reading $file: $!"};
+    if ($len + $wlen > 0) {
+        my $io = $len ? "read" : "writ";
+        $rc = {error => "Error ${io}ing $file: $!"};
         # remove newlines so doesn't interfere with protocol
         $rc->{error} =~ s/\n//g;
         $out->write("### 500 $rc->{error}\n");
-        transport_fish_return($in, "read");
+        transport_fish_return($in, $io);
     } else {
         $out->write("### 200\n");
         $rc = transport_fish_return($in, "exit");
@@ -4816,11 +4831,11 @@ sub transport_mcp {
         }
         if ($ref->{split}) {
             # need to track by split instead of file
-            push(@{$errs{"$dst bytes=$bytes"}}, $ref);
-            push(@{$errs{"$src bytes=$bytes"}}, $ref);
+            $errs{"$dst bytes=$bytes"}->{$ref} = $ref;
+            $errs{"$src bytes=$bytes"}->{$ref} = $ref;
         } else {
-            push(@{$errs{$dst}}, $ref);
-            push(@{$errs{$src}}, $ref);
+            $errs{$dst}->{$ref} = $ref;
+            $errs{$src}->{$ref} = $ref;
         }
         print $fh "\n";
         $ref->{tool} = "mcp";
@@ -4854,7 +4869,7 @@ sub transport_mcp {
                 $file =~ s/\\([abfnrtv'\\])/$emap{$1}/g;
                 my @keys = grep(/^\Q$file\E( bytes=\d+-\d+)?$/, keys(%errs));
                 foreach my $key (@keys) {
-                    $_->{text} = "\\E$line" foreach (@{$errs{$key}});
+                    $_->{text} = "\\E$line" foreach (values %{$errs{$key}});
                 }
             }
         }
@@ -4875,7 +4890,7 @@ sub transport_mcp {
                     if (!ref $refs && $hash =~ /^#mutil#(\d+)-(\d+)#/);
                 # skip if ref not found
                 next if (!ref $refs);
-                foreach my $ref (@{$refs}) {
+                foreach my $ref (values %{$refs}) {
                     # skip if error/hash already recorded
                     next if ($ref->{text} =~ /^\\E|^\\H\Q$hash\E/);
                     # record hash in error ref
@@ -4890,7 +4905,7 @@ sub transport_mcp {
 
     if ($rc == 127) {
         foreach my $key (keys %errs) {
-            foreach(@{$errs{$key}}) {
+            foreach (values %{$errs{$key}}) {
                 sftp_error($_, "unknown mcp failure") if (!defined $_->{text});
             }
         }
@@ -4932,12 +4947,12 @@ sub transport_rsync {
             my $lcs = $1;
             if ($spath && $src eq "$spath$lcs" && $dst eq "$dpath$lcs") {
                 print $fh "$lcs\n";
-                push(@{$errs{"$spath$lcs"}}, $ref);
-                push(@{$errs{"$dpath$lcs"}}, $ref);
+                $errs{"$spath$lcs"}->{$ref} = $ref;
+                $errs{"$dpath$lcs"}->{$ref} = $ref;
                 # track temporary dst name for permission errors
                 my $dst_tmp = dirname("$dpath$lcs") . "/." .
                     basename("$dpath$lcs") . ".XXXXXX";
-                push(@{$errs{$dst_tmp}}, $ref);
+                $errs{$dst_tmp}->{$ref} = $ref;
                 next;
             } elsif ($spath) {
                 # next file has different prefix so process current batch
@@ -4954,22 +4969,22 @@ sub transport_rsync {
             $spath =~ s/\Q$lcs\E$//;
             $dpath = $dst;
             $dpath =~ s/\Q$lcs\E$//;
-            push(@{$errs{"$spath$lcs"}}, $ref);
-            push(@{$errs{"$dpath$lcs"}}, $ref);
+            $errs{"$spath$lcs"}->{$ref} = $ref;
+            $errs{"$dpath$lcs"}->{$ref} = $ref;
             # track temporary dst name for permission errors
             my $dst_tmp = dirname("$dpath$lcs") . "/." .
                 basename("$dpath$lcs") . ".XXXXXX";
-            push(@{$errs{$dst_tmp}}, $ref);
+            $errs{$dst_tmp}->{$ref} = $ref;
         } else {
             # no common suffix implies single file copy with rename
             # or symlink dereference
             my %errs_tmp;
             # use different hash as other files may already be in there
-            $errs_tmp{$src} = [$ref];
-            $errs_tmp{$dst} = [$ref];
+            $errs_tmp{$src}->{$ref} = $ref;
+            $errs_tmp{$dst}->{$ref} = $ref;
             # track temporary dst name for permission errors
             my $dst_tmp = dirname($dst) . "/." . basename($dst) . ".XXXXXX";
-            $errs{$dst_tmp} = [$ref];
+            $errs{$dst_tmp}->{$ref} = $ref;
             $rsize += transport_rsync_batch($args, "",
                 "$shost$src", "$dhost$dst", \%errs_tmp);
         }
@@ -5018,7 +5033,7 @@ sub transport_rsync_batch {
             if ($line =~ /"([^"]+)"/) {
                 my $file = $1;
                 foreach my $key (grep(/^\Q$file\E$/, keys(%{$errs}))) {
-                    sftp_error($_, $line) foreach(@{$errs->{$key}});
+                    sftp_error($_, $line) foreach (values %{$errs->{$key}});
                 }
             } elsif ($line =~ /\(code\s+(\d+)\)/) {
                 $code = $1;
@@ -5038,7 +5053,7 @@ sub transport_rsync_batch {
         # set error/warning on all failures except partial transfers (code 23)
         my $type = $code <= 5 || $code == 255 ? "\\E" : "\\W";
         foreach my $refs (values %{$errs}) {
-            foreach my $ref (@{$refs}) {
+            foreach my $ref (values %{$refs}) {
                 $ref->{text} = "$type$code_text" if (!$ref->{text});
             }
         }
@@ -5611,12 +5626,12 @@ sub verify_cksum {
                     # shift hash to new range
                     $hash = "#mutil#$bytes#$hash";
                     # need to track by bytes instead of file
-                    push(@{$errs{"$dst bytes=$bytes"}}, $ref);
+                    $errs{"$dst bytes=$bytes"}->{$ref} = $ref;
                 } elsif (defined $ref->{split}) {
                     # need to track by split instead of file
-                    push(@{$errs{"$dst bytes=$ref->{bytes}"}}, $ref);
+                    $errs{"$dst bytes=$ref->{bytes}"}->{$ref} = $ref;
                 } else {
-                    push(@{$errs{$dst}}, $ref);
+                    $errs{$dst}->{$ref} = $ref;
                 }
                 ($fh, $tmp) = sftp_tmp() if (!$tmp);
                 print $fh "$hash  $file\n";
@@ -5655,7 +5670,7 @@ sub verify_cksum {
                         my @keys = grep(/^\Q$file\E( bytes=\d+-\d+)?$/,
                             keys(%errs));
                         foreach my $key (@keys) {
-                            $_->{text} = "\\E$line" foreach (@{$errs{$key}});
+                            $_->{text} = "\\E$line" foreach (values %{$errs{$key}});
                         }
                     }
                 }
@@ -5678,22 +5693,24 @@ sub verify_cksum {
                             # use only first range to find ref
                             my ($x1, $x2) = split(/-/, substr($bytes, 1));
                             # subset of split/tar range
-                            ERR: foreach my $err (values(%errs)) {
-                                next if (!defined $err->[0]->{split} &&
-                                        !defined $err->[0]->{tar_bytes});
-                                my @ranges = split(/,/, $err->[0]->{bytes});
-                                foreach my $range (@ranges) {
-                                    my ($min, $max) = split(/-/, $range);
-                                    if ($min <= $x1 && $x2 <= $max) {
-                                        $refs = $err;
-                                        last ERR;
+                            ERR: foreach my $err (values %errs) {
+                                foreach my $eref (values %{$err}) {
+                                    next if (!defined $eref->{split} &&
+                                        !defined $eref->{tar_bytes});
+                                    my @ranges = split(/,/, $eref->{bytes});
+                                    foreach my $range (@ranges) {
+                                        my ($min, $max) = split(/-/, $range);
+                                        if ($min <= $x1 && $x2 <= $max) {
+                                            $refs = $err;
+                                            last ERR;
+                                        }
                                     }
                                 }
                             }
                         }
                         # skip if ref not found
                         next if (!ref $refs);
-                        foreach my $ref (@{$refs}) {
+                        foreach my $ref (values %{$refs}) {
                             # skip if error already recorded
                             next if ($ref->{text} =~ /^\\E/);
                             if ($ok eq 'OK') {
@@ -5733,8 +5750,8 @@ sub verify_cksum {
             }
             unlink $out_tmp;
 
-            foreach my $refs (values(%errs)) {
-                $_->{tool} = $prog foreach (@{$refs});
+            foreach my $refs (values %errs) {
+                $_->{tool} = $prog foreach (values %{$refs});
             }
 
             # stop after the first program that runs
@@ -5742,8 +5759,8 @@ sub verify_cksum {
         }
         unlink $tmp;
         $tmp = undef;
-        foreach my $refs (values(%errs)) {
-            foreach (@{$refs}) {
+        foreach my $refs (values %errs) {
+            foreach (values %{$refs}) {
                 $_->{text} = "\\EUnable to compute destination hash"
                     if (!defined $_->{text});
             }
@@ -5822,9 +5839,9 @@ sub verify_sum_msum {
         print $fh "\n";
         if (defined $ref->{tar_bytes} || defined $ref->{split}) {
             # need to track by bytes/split instead of file
-            push(@{$errs{$src . " bytes=$ref->{sum_bytes}"}}, $ref);
+            $errs{$src . " bytes=$ref->{sum_bytes}"}->{$ref} = $ref;
         } else {
-            push(@{$errs{$src}}, $ref);
+            $errs{$src}->{$ref} = $ref;
         }
     }
     close $fh;
@@ -5856,7 +5873,7 @@ sub verify_sum_msum {
                 my @keys = grep(/^\Q$file\E( bytes=\d+-\d+)?$/,
                     keys(%errs));
                 foreach my $key (@keys) {
-                    $_->{text} = "\\E$line" foreach (@{$errs{$key}});
+                    $_->{text} = "\\E$line" foreach (values %{$errs{$key}});
                 }
             }
         }
@@ -5878,7 +5895,7 @@ sub verify_sum_msum {
                     if (!ref $refs && $hash =~ /^#mutil#(\d+)-(\d+)#/);
                 # skip if ref not found
                 next if (!ref $refs);
-                foreach my $ref (@{$refs}) {
+                foreach my $ref (values %{$refs}) {
                     # skip if error/hash already recorded
                     next if ($ref->{text} =~ /^\\E|^\\H\Q$hash\E/);
                     # record hash in error ref

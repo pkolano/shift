@@ -66,7 +66,7 @@ use Symbol qw(gensym);
 use Sys::Hostname;
 use Text::ParseWords;
 
-our $VERSION = 0.981;
+our $VERSION = 6.03;
 
 # do not die when receiving sigpipe
 $SIG{PIPE} = 'IGNORE';
@@ -81,7 +81,7 @@ umask ($< == 0 ? 077 : 077 & umask);
 
 my %perl;
 $perl{ssl} = eval 'use IO::Socket::SSL; 1';
-# need threads and version of Thread::Queue from perl >= 5.10.1
+# need threads and version of Thread::Queue/Semaphore from perl >= 5.10.1
 $perl{threads} = eval 'require 5.010_001; use threads; use Thread::Queue; use Thread::Semaphore; 1';
 
 my %opts = (
@@ -109,7 +109,10 @@ if (!$cmd) {
     if (scalar(@ARGV)) {
         print escape($_) foreach (@ARGV);
     } else {
-        print escape($_) while (<STDIN>);
+        while (<STDIN>) {
+            chomp;
+            print escape($_), "\n";
+        }
     }
 } elsif ($cmd eq 'fadvise') {
     die "Invalid options\n" if (scalar(@ARGV) > 0);
@@ -151,7 +154,10 @@ if (!$cmd) {
     if (scalar(@ARGV)) {
         print unescape($_) foreach (@ARGV);
     } else {
-        print unescape($_) while (<STDIN>);
+        while (<STDIN>) {
+            chomp;
+            print unescape($_), "\n";
+        }
     }
 }
 
@@ -199,21 +205,21 @@ sub chattr {
         $q = Thread::Queue->new;
         # mutual exclusion for stdout
         $buf4 = Thread::Semaphore->new(1);
+        my $run4 = Thread::Semaphore->new(1 - $opts{threads});
         @threads = map {threads->create(sub {
-            eval {
-                # this should not be needed but there is a weird race condition
-                # that causes the open3 forked child to never execute
-                local $SIG{ALRM} = sub {die};
-                alarm 2;
-                # will revert to individual commands if alarm hit
-                $opts{fhpid} = open3_run([undef, undef, -1], "shift-bin")
-                    if ($opts{have}->{'shift-bin'});
-                alarm 0;
-            };
+            $opts{fhpid} = open3_run([undef, undef, -1], "shift-bin")
+                if ($opts{have}->{'shift-bin'});
+            $run4->up;
             chattr1($_) while (defined ($_ = $q->dequeue));
             buffer();
             open3_wait($opts{fhpid}) if (defined $opts{fhpid});
         })} (1 .. $opts{threads});
+        # wait until threads run shift-bin or else random deadlocks occur
+        foreach (@threads) {
+            # avoid deadlock on threads that never ran
+            $run4->up if (!$_);
+        }
+        $run4->down;
     } else {
         # offload to shift-bin for more efficient processing if possible
         exec("shift-bin") if ($opts{have}->{'shift-bin'});
@@ -222,13 +228,14 @@ sub chattr {
     while (<STDIN>) {
         chomp;
         next if (!$_);
-        if ($perl{threads} && $opts{threads} > 1) {
+        if (first {defined($_)} @threads) {
             $q->enqueue($_);
         } else {
+            # handle personally if single-threaded or threads never ran
             chattr1($_);
         }
     }
-    if ($perl{threads} && $opts{threads} > 1) {
+    if (first {defined($_)} @threads) {
         # force threads to exit
         $q->enqueue(undef) foreach (@threads);
         foreach (@threads) {
@@ -342,7 +349,17 @@ sub find {
                     if ($opts{have}->{'shift-bin'} && ($opts{preserve} == 1 ||
                             $opts{preserve} =~ /acl|stripe|xattr/));
                 while (1) {
-                    my $path = $findq->dequeue_timed(1);
+                    my $path;
+                    if ($findq->can('dequeue_timed')) {
+                        $path = $findq->dequeue_timed(1);
+                    } else {
+                        $path = $findq->dequeue_nb;
+                        if (!defined $path) {
+                            # must fake timed dequeue - use thread-safe sleep
+                            select(undef, undef, undef, 1);
+                            $path = $findq->dequeue_nb;
+                        }
+                    }
                     if (defined $path) {
                         $findb4->up;
                         $findq4->down;
@@ -955,11 +972,14 @@ sub fish {
             $opts{tcp} = 0;
         } else {
             if ($opts{window}) {
-                $sock->sockopt(SO_RCVBUF, $opts{window});
-                $sock->sockopt(SO_SNDBUF, $opts{window});
+                # this has been observed to be detrimental to performance
+                # in practice so revert to default linux window scaling
+                #$sock->sockopt(SO_RCVBUF, $opts{window});
+                #$sock->sockopt(SO_SNDBUF, $opts{window});
             }
             #TODO: de-hardcode 60 second timeout
             $sock->sockopt(SO_RCVTIMEO, pack('L!L!', +60, 0));
+            $sock->sockopt(SO_SNDTIMEO, pack('L!L!', +60, 0));
             $sock->setsockopt(IPPROTO_TCP, TCP_NODELAY, 1);
             $key = "" . rand();
             my $scert;
@@ -1097,6 +1117,7 @@ sub fish_io {
     return (ref $err ? $err : $rc) if (ref $err || ref $rc);
     $len = $rc if ($cmd eq 'put');
     $rc = undef;
+    my $wlen = $len;
 
     my $sopts = !$opts{verify} || $cmd ne 'get' ? 0 :
         verify_init(length => $len);
@@ -1115,19 +1136,22 @@ sub fish_io {
             $in->read($buf, $nbytes) : $fh->sysread($buf, $nbytes);
         last if ($n < $nbytes);
         $out->write("### 200\n") if ($cmd eq 'get');
-        $cmd eq 'put' ? $fh->syswrite($buf) : $out->write($buf);
+        my $wn = $cmd eq 'put' ? $fh->syswrite($buf) : $out->write($buf);
         $len -= $n;
+        # write() only returns ok/fail and not size like read()
+        $wlen -= $cmd eq 'put' ? $wn : ($wn ? $n : 0);
         verify_buffer($sopts, $buf, $sopts->{length} - $len)
             if ($opts{verify} && $cmd eq 'get');
     }
     $fh->close;
 
-    if ($len > 0) {
-        $rc = {error => "Error reading $file: $!"};
+    if ($len + $wlen > 0) {
+        my $io = $len ? "read" : "writ";
+        $rc = {error => "Error ${io}ing $file: $!"};
         # remove cr/lf so doesn't interfere with protocol
         $rc->{error} =~ s/[\n\r]//g;
         $out->write("### 500 $rc->{error}\n");
-        fish_return($in, "rread");
+        fish_return($in, "r$io");
     } else {
         if ($cmd eq 'put' && defined $size && $size != -1 &&
                 $len + $off == $size && (stat $dst)[7] > $size) {
@@ -1308,7 +1332,7 @@ sub mount {
 ###################
 #### open3_get ####
 ###################
-# run given command with stdin/stdout/stderr from/to given files
+# run given command with STDIN/STDOUT/STDERR from/to given files
 # and return command output when requested
 sub open3_get {
     my $files = shift;
@@ -1332,7 +1356,7 @@ sub open3_get {
 ###################
 #### open3_run ####
 ###################
-# run given command with stdin/stdout/stderr either from/to given files
+# run given command with STDIN/STDOUT/STDERR either from/to given files
 # or from/to autocreated pipes and return associated file handles and pid
 sub open3_run {
     my $files = shift;

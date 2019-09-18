@@ -64,6 +64,7 @@ Shift Installation and Configuration
             (http://mutil.sf.net)
         o bbcp - high speed remote copy
             (http://www.slac.stanford.edu/~abh/bbcp) 
+            (note latest v17.12.00.00.0 fails when overwriting existing files)
         o bbftp - high speed remote copy
             (http://doc.in2p3.fr/bbftp)
         o gridftp - high speed remote copy
@@ -132,7 +133,7 @@ Shift Installation and Configuration
         4.1.1. Client hosts
 
             install -m 700 perl/shiftc ~/bin/
-            install -m 700 perl/shift-bin ~/bin/
+            install -m 700 c/shift-bin ~/bin/
             install -m 600 doc/shiftc.1 ~/man/man1/
 
         4.1.2. Manager hosts
@@ -143,7 +144,7 @@ Shift Installation and Configuration
         4.1.3. Remote hosts (optional but recommended when possible)
 
             install -m 700 perl/shift-aux ~/bin/
-            install -m 700 perl/shift-bin ~/bin/
+            install -m 700 c/shift-bin ~/bin/
 
     4.2. Multi-user installation
 
@@ -154,7 +155,7 @@ Shift Installation and Configuration
         4.2.1. Client hosts
 
             install -m 755 perl/shiftc /usr/local/bin/
-            install -m 755 perl/shift-bin /usr/local/bin/
+            install -m 755 c/shift-bin /usr/local/bin/
             install -m 644 doc/shiftc.1 /usr/local/man/man1/
 
         4.2.2. Manager hosts
@@ -165,7 +166,7 @@ Shift Installation and Configuration
         4.2.3. Remote hosts (optional but recommended when possible)
 
             install -m 755 perl/shift-aux /usr/local/bin/
-            install -m 755 perl/shift-bin /usr/local/bin/
+            install -m 755 c/shift-bin /usr/local/bin/
 
 
 5. Configuration

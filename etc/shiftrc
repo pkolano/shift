@@ -133,6 +133,7 @@ user_dir /home/%u/.shift
 #   (format is TYPE_BITS, BITS required when TYPE supports multiple lengths)
 #   (for msum, see "msum --help" --hash-type list, "_" will be ignored)
 #   (for built-in perl sums, will use Digest::TYPE->new(BITS))
+#   (note built-in SHA before perl v5.19.2 can trigger coredump via double free)
 #   (example: sum_type sha3_256)
 #sum_type md5
 

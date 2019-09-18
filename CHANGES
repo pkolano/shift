@@ -283,3 +283,23 @@ CHANGES
     - Fixed high memory utilization during traversal of very large directories
     - Fixed stalls due to inadvertent newlines left in logs after restarts
     - Fixed preservation of lustre striping due to bad conditional
+
+* Shift 6.3 (09/18/19)
+    - Fixed erroneous crontab entries for extra clients when --clients > 1
+    - Fixed slash prepended to relative paths during tar creation
+    - Fixed Tie::DB_FileLock exceptions that can abort manager updates
+    - Fixed tainted file names preventing manager synchronization
+    - Fixed missing lock during writes of user mount db
+    - Fixed use of dequeue_timed preventing directory traversal in older perls
+    - Fixed double locks causing deadlock during manager synchronization
+    - Fixed thread race condition resulting in zombie shift-aux chattr processes
+    - Fixed rounding of lustre stripe count causing allocated stripes off by 1
+    - Fixed potential noop in shift-aux chattr when thread creation fails
+    - Fixed stalls due to deletion of local mount information during restarts
+    - Fixed asymmetric fish-tcp performance during some wan scenarios
+    - Fixed potential duplicate error messages in various transports
+    - Fixed duplication of corrupt byte ranges resulting in negative rates/sizes
+    - Fixed infinite retry of corruption rectification when no progress made
+    - Fixed missing write error handling in fish and fish-tcp transports
+    - Fixed metadata counts during tar creation renames with --restart=ignore
+    - Fixed bad newline handling in shift-aux escape/unescape commands
