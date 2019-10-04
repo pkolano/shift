@@ -54,7 +54,7 @@ CHANGES
     - Fixed table of contents truncation during remote tar creation
 
 * Shift 4.0 (07/23/15)
-    - Note that this version is not backward compatible with previous versions
+    - Note that metadata is not backward compatible with previous versions
     - Added backgroundable, parallelizable, and restartable initialization
     - Added --newer and --older options for incremental backups
     - Added --preallocate option to preallocate files below given sparsity
@@ -196,7 +196,7 @@ CHANGES
     - Fixed hash errors when remote source mapped to local file system
 
 * Shift 6.0 (01/16/19)
-    - Note that this version is not backward compatible with previous versions
+    - Note that metadata is not backward compatible with previous versions
     - Added depth-first file stage processing using --pipeline
     - Added CSV history output using --history=csv
     - Added disablement of email status for states given in --no-mail
@@ -303,3 +303,17 @@ CHANGES
     - Fixed missing write error handling in fish and fish-tcp transports
     - Fixed metadata counts during tar creation renames with --restart=ignore
     - Fixed bad newline handling in shift-aux escape/unescape commands
+
+* Shift 7.0 (10/04/19)
+    - Note that metadata is not backward compatible with previous versions
+    - Fixed vulnerability in root --stats/--status due to use of Storable
+        when metadata directly accessible by users (bug report by J. Neff)
+	- Fixed race condition causing permission denied during some remote mkdirs
+    - Fixed built-in checksums when thread creation fails
+    - Fixed chattrs when thread creation fails
+    - Fixed leftover shift-bin processes due to unneeded chattr thread spawns
+    - Fixed exception when setting binmode on remote file handles
+    - Fixed local dmget calls during traversal when source is not local
+    - Fixed duplicated source tar lines in dmget input files
+    - Fixed deceptive thread creation errors during fish-tcp initialization
+

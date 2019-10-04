@@ -48,6 +48,7 @@ require Compress::BGZF::Reader;
 require Compress::BGZF::Writer;
 use Compress::Zlib;
 use Data::Dumper;
+require Data::MessagePack;
 use DB_File;
 use Fcntl qw(:DEFAULT :flock :mode);
 use File::Basename;
@@ -63,7 +64,7 @@ require Mail::Sendmail;
 use Math::BigInt;
 use Net::Ping;
 use POSIX qw(ceil setsid setuid strftime);
-use Storable qw(dclone nfreeze nstore retrieve thaw);
+use Storable qw(dclone);
 use Symbol qw(gensym);
 use Sys::Hostname;
 use Term::ANSIColor;
@@ -71,7 +72,7 @@ use Text::ParseWords;
 require Tie::DB_FileLock;
 require Text::FormatTable;
 
-our $VERSION = 6.03;
+our $VERSION = 7.0;
 
 $Data::Dumper::Pair = " = ";
 $Data::Dumper::Sortkeys = 1;
@@ -366,7 +367,7 @@ if (defined $opts{put} && !defined $opts{id}) {
     # lock user info
     lock_dir(0);
     # store user db to file
-    nstore(\%umounts, $conf{umount_db});
+    mp_store(\%umounts, $conf{umount_db});
     # unlock user info
     lock_dir(0, 1);
 
@@ -585,7 +586,7 @@ if ($opts{alive}) {
             log_print($cmd, $gzs, $line . "\n");
         }
         $file =~ s/.*\///;
-        log_print($file, $gzs, escape(nfreeze({})) . "\n");
+        log_print($file, $gzs, escape(Data::MessagePack->pack({})) . "\n");
     }
     log_close($_, $gzs) foreach (keys %{$gzs});
     # transfer may have finished after --restart=ignore
@@ -621,7 +622,7 @@ email_status()
 if ($opts{get} || defined $opts{put}) {
     # store doing to file
     my $gzs = {};
-    log_print($opts{doing}, $gzs, escape(nfreeze($doing)) . "\n");
+    log_print($opts{doing}, $gzs, escape(Data::MessagePack->pack($doing)) . "\n");
     log_close($opts{doing}, $gzs);
 
     # update running time average for manager get/put invocations
@@ -648,7 +649,7 @@ if ($ustore) {
     # lock user info
     lock_dir(0);
     # store user db to file
-    nstore(\%umounts, $conf{umount_db});
+    mp_store(\%umounts, $conf{umount_db});
     # unlock user info
     lock_dir(0, 1);
 
@@ -676,7 +677,7 @@ monitor(1) if (defined $opts{put} || defined $opts{restart} || $opts{stop});
 if ($opts{get} || defined $opts{put}) {
     # lock user info
     lock_dir(0);
-    my %loaddb = eval {%{retrieve("$conf{user_dir}/$opts{user}.load")}};
+    my %loaddb = %{mp_retrieve("$conf{user_dir}/$opts{user}.load")};
     if ($meta{time1}) {
         # remove load info for completed transfers
         delete $loaddb{$_} foreach (grep(/^(next_)?id_$opts{id}(\.|_)/,
@@ -712,7 +713,7 @@ if ($opts{get} || defined $opts{put}) {
             $loaddb{$_} = $nload{$_} foreach (grep(/^io_/, keys %nload));
         }
     }
-    nstore(\%loaddb, "$conf{user_dir}/$opts{user}.load");
+    mp_store(\%loaddb, "$conf{user_dir}/$opts{user}.load");
     chmod(0644, "$conf{user_dir}/$opts{user}.load");
     # unlock user info
     lock_dir(0, 1);
@@ -816,8 +817,8 @@ sub default_select {
 sub last_sum {
     my $is_tar = $opts{'last-sum'} ? 0 : 1;
     # load dbs for fs mappings and sum lookups
-    %mounts = eval {%{retrieve($conf{mount_db})}};
-    %umounts = eval {%{retrieve($conf{umount_db})}};
+    %mounts = %{mp_retrieve($conf{mount_db})};
+    %umounts = %{mp_retrieve($conf{umount_db})};
     my %sums;
     tie(%sums, 'DB_File', "$conf{user_dir}/$opts{user}.sums",
         O_RDONLY, 0600);
@@ -1178,10 +1179,8 @@ sub format_bytes {
 # output a set of operations for the invoking client to process
 sub get {
     # retrieve global and user database from file
-    local $SIG{__WARN__} = sub {die};
-    %mounts = eval {%{retrieve($conf{mount_db})}};
-    %umounts = eval {%{retrieve($conf{umount_db})}};
-    local $SIG{__WARN__} = 'DEFAULT';
+    %mounts = %{mp_retrieve($conf{mount_db})};
+    %umounts = %{mp_retrieve($conf{umount_db})};
 
     my $warn = delete $meta{"warn_$opts{host}$opts{cid}"};
     if ($warn > 0) {
@@ -1556,7 +1555,7 @@ sub get {
         }
         log_close($log, $gzs) if ($log !~ /^doing_/);
         if ($log ne $opts{doing} && $log =~ /^doing_/) {
-            log_print($log, $gzs, escape(nfreeze($ldoing)) . "\n");
+            log_print($log, $gzs, escape(Data::MessagePack->pack($ldoing)) . "\n");
             log_close($log, $gzs);
         }
     }
@@ -1776,7 +1775,7 @@ sub get_doing {
     $line = last_line($gz) while ($past-- > 0);
     my $log = basename($arg);
     log_close($log, {$log => $gz});
-    return thaw(unescape($line)) if ($line);
+    return Data::MessagePack->unpack(unescape($line)) if ($line);
     return {};
 }
 
@@ -1812,7 +1811,10 @@ sub get_meta {
         # meta lines are serialized, compressed, and yEnc encoded
         my $zmetay = yenc_decode($meta);
         my $zmeta = uncompress($zmetay);
-        $meta = thaw($zmeta);
+        $meta = Data::MessagePack->unpack($zmeta);
+        # convert strings back to Math::BigInt
+        $meta->{$_} = Math::BigInt->new($meta->{$_})
+            foreach (grep(/^sd_/, keys %{$meta}));
     }
     if ($meta && defined $mtell && $mtell > 0) {
         # metadata corrupted so revert to last known good state
@@ -2467,6 +2469,34 @@ sub monitor {
     }
 }
 
+#####################
+#### mp_retrieve ####
+#####################
+# return data structure stored in MessagePack format from given file
+sub mp_retrieve {
+    my $file = shift;
+    my $return = {};
+    if (open(MPFILE, '<', $file)) {
+        my $line;
+        $line .= $_ while (<MPFILE>);
+        $return = eval {Data::MessagePack->unpack($line)};
+        close MPFILE;
+    }
+    return $return;
+}
+
+##################
+#### mp_store ####
+##################
+# store given data structure to given file in MessagePack format
+sub mp_store {
+    my ($data, $file) = @_;
+    if (open(MPFILE, '>', $file)) {
+        print MPFILE eval {Data::MessagePack->pack($data)};
+        close MPFILE;
+    }
+}
+
 ###################
 #### open3_get ####
 ###################
@@ -2651,7 +2681,9 @@ sub plot {
         while (my $line = <$fh>) {
             last if (!defined $line);
             last if (substr($line, 0, 1) != '[' || substr($line, -1, 1) != ']');
-            my $meta = thaw(uncompress(yenc_decode(substr($line, 1, -1))));
+            # note that this doesn't handle Math::BigInt as is normally done
+            my $meta = Data::MessagePack->unpack(uncompress(
+                enc_decode(substr($line, 1, -1))));
             my $client = $meta->{update_id};
             my $host = $client;
             $host =~ s/\.\d+$//;
@@ -2792,10 +2824,8 @@ sub put {
     # only process a put when the corresponding get was from this host
     return if ($opts{put} && $opts{put} ne $self);
     # retrieve global and user database from file
-    local $SIG{__WARN__} = sub {die};
-    %mounts = eval {%{retrieve($conf{mount_db})}};
-    %umounts = eval {%{retrieve($conf{umount_db})}};
-    local $SIG{__WARN__} = 'DEFAULT';
+    %mounts = %{mp_retrieve($conf{mount_db})};
+    %umounts = %{mp_retrieve($conf{umount_db})};
 
     my $gzs = {};
     my $more_finds = $opts{more_finds} + $meta{d_find} + $meta{e_find} ==
@@ -3484,7 +3514,12 @@ sub put_meta {
     open(FILE, '>>', $file);
     if (defined $meta) {
         if (!$ewrite) {
-            print FILE yenc_encode(compress(nfreeze($meta)), ""), "]\n";
+            my $mpmeta = dclone($meta);
+            # convert Math::BigInt values to strings for storage
+            $mpmeta->{$_} = $meta->{$_}->bstr
+                foreach (grep(/^sd_/, keys %{$meta}));
+            print FILE yenc_encode(compress(
+                Data::MessagePack->pack($mpmeta)), ""), "]\n";
         }
         # do not write trailing ] on write error, which will force retry
     } else {
@@ -4427,7 +4462,7 @@ sub throttle {
                  !scalar(@fshost_keys));
 
     # compute new load for this transfer since its global data not updated yet
-    my %my_loaddb = eval {%{retrieve("$conf{user_dir}/$opts{user}.load")}};
+    my %my_loaddb = %{mp_retrieve("$conf{user_dir}/$opts{user}.load")};
     my %my_load =
         split(/[= ]+/, $my_loaddb{"next_id_$opts{id}$opts{cid}_$opts{host}"});
     $cli_load{time} = 1 if (!$cli_load{time});
@@ -4507,7 +4542,7 @@ sub throttle {
         foreach my $file (glob "$opts{user_dir}/*.load") {
             my $user = $file;
             $user =~ s/.*\/|\.load$//g;
-            my %loaddb = eval {%{retrieve($file)}};
+            my %loaddb = %{mp_retrieve($file)};
             # ignore the ^next_ load fields
             $all_loaddb{"$user\_$_"} = $loaddb{$_}
                 foreach (grep(/^id_/, keys %loaddb));
@@ -4664,7 +4699,7 @@ sub track_cache {
         foreach my $file (glob "$opts{user_dir}/*.load") {
             my $user = $file;
             $user =~ s/.*\/|\.load$//g;
-            my %loaddb = eval {%{retrieve($file)}};
+            my %loaddb = %{mp_retrieve($file)};
             $ioall{$_} += $loaddb{$_} foreach (grep(/^io_/, keys %loaddb));
         }
         $ioall{init} = 1;
@@ -4753,6 +4788,18 @@ COMPRESS_BGZF_READER
 $fatpacked{"Compress/BGZF/Writer.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'COMPRESS_BGZF_WRITER';
   package Compress::BGZF::Writer;use strict;use warnings;use Carp;use Compress::Zlib;use IO::Compress::RawDeflate qw/rawdeflate $RawDeflateError/;use constant HEAD_BYTES=>18;use constant FOOT_BYTES=>8;use constant FLUSH_SIZE=>2**16 - HEAD_BYTES - FOOT_BYTES - 1;use constant BGZF_HEADER=>pack "H*",'1f8b08040000000000ff060042430200';sub TIEHANDLE {Compress::BGZF::Writer::new(@_)}sub PRINT {Compress::BGZF::Writer::_queue(@_)}sub CLOSE {Compress::BGZF::Writer::finalize(@_)}sub new_filehandle {my ($class,$fn_out)=@_;open my$fh,'<',undef;tie *$fh,$class,$fn_out or croak "failed to tie filehandle";return$fh}sub new {my ($class,$fn_out)=@_;my$self=bless {},$class;if (defined$fn_out){open$self->{fh},">$fn_out" or croak "Error opening file for writing"}else {$self->{fh}=\*STDOUT}binmode$self->{fh};$self->{c_level}=Z_DEFAULT_COMPRESSION;$self->{buffer}='';$self->{block_offset}=0;$self->{buffer_offset}=0;$self->{u_offset}=0;$self->{idx}=[];return$self}sub set_level {my ($self,$level)=@_;croak "Invalid compression level (allowed 0-9)" if ($level !~ /^\d$/);$self->{c_level}=$level;return}sub add_data {my ($self,$content)=@_;my$vo=($self->{block_offset}<< 16)| $self->{buffer_offset};$self->_queue($content);return$vo}sub _queue {my ($self,$content)=@_;$self->{buffer}.= $content;while (length($self->{buffer})>= FLUSH_SIZE){my$chunk=substr$self->{buffer},0,FLUSH_SIZE,'';my$unwritten=$self->_write_block($chunk);$self->{buffer}=$unwritten .$self->{buffer}if (length($unwritten))}$self->{buffer_offset}=length$self->{buffer};return}sub _write_block {my ($self,$chunk)=@_;my$chunk_len=length($chunk);rawdeflate(\$chunk,\my$payload,-Level=>$self->{c_level})or croak "deflate failed: $RawDeflateError\n";my$trimmed='';while (length($payload)> FLUSH_SIZE){my$trim_len=int($chunk_len * 0.05);$trimmed=substr($chunk,-$trim_len,$trim_len,'').$trimmed;rawdeflate(\$chunk,\$payload,-Level=>$self->{c_level})or croak "deflate failed: $RawDeflateError\n";$chunk_len=length($chunk)}my$block_size=length($payload)+ HEAD_BYTES + FOOT_BYTES;croak "Internal error: block size > 65536" if ($block_size > 2**16);print {$self->{fh}}pack("a*va*VV",BGZF_HEADER,$block_size - 1,$payload,crc32($chunk),$chunk_len,)or croak "Error writing compressed block";$self->{block_offset}+= $block_size;$self->{u_offset}+= $chunk_len;push @{$self->{idx}},[$self->{block_offset},$self->{u_offset}];return$trimmed}sub finalize {my ($self)=@_;while (length($self->{buffer})> 0){croak "file closed but buffer not empty" if (!defined fileno($self->{fh}));my$chunk=substr$self->{buffer},0,FLUSH_SIZE,'';my$unwritten=$self->_write_block($chunk);$self->{buffer}=$unwritten .$self->{buffer}if (length($unwritten))}close$self->{fh};return}sub write_index {my ($self,$fn_out)=@_;$self->finalize();croak "missing index output filename" if (!defined$fn_out);open my$fh_out,'>:raw',$fn_out;my@offsets=@{$self->{idx}};pop@offsets;print {$fh_out}pack('Q<',scalar(@offsets));print {$fh_out}pack('Q<Q<',@{$_})for (@offsets);close$fh_out;return}sub DESTROY {my ($self)=@_;$self->finalize();return}1;
 COMPRESS_BGZF_WRITER
+
+$fatpacked{"Data/MessagePack.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'DATA_MESSAGEPACK';
+  package Data::MessagePack;use strict;use warnings;use 5.008001;our$VERSION='1.00';sub true () {require Data::MessagePack::Boolean;no warnings 'once';return$Data::MessagePack::Boolean::true}sub false () {require Data::MessagePack::Boolean;no warnings 'once';return$Data::MessagePack::Boolean::false}if (!__PACKAGE__->can('pack')){my$backend=$ENV{PERL_DATA_MESSAGEPACK}|| ($ENV{PERL_ONLY}? 'pp' : '');if ($backend !~ /\b pp \b/xms){eval {require XSLoader;XSLoader::load(__PACKAGE__,$VERSION)};die $@ if $@ && $backend =~ /\b xs \b/xms}if (!__PACKAGE__->can('pack')){require 'Data/MessagePack/PP.pm'}}sub new {my($class,%args)=@_;return bless \%args,$class}for my$name(qw(canonical prefer_integer utf8)){my$setter=sub {my($self,$value)=@_;$self->{$name}=defined($value)? $value : 1;return$self};my$getter=sub {my($self)=@_;return$self->{$name}};no strict 'refs';*{$name}=$setter;*{'get_' .$name}=$getter}sub encode;*encode=__PACKAGE__->can('pack');sub decode;*decode=__PACKAGE__->can('unpack');1;
+DATA_MESSAGEPACK
+
+$fatpacked{"Data/MessagePack/Boolean.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'DATA_MESSAGEPACK_BOOLEAN';
+  package Data::MessagePack::Boolean;use strict;use warnings;use overload 'bool'=>sub {${$_[0]}},'0+'=>sub {${$_[0]}},'""'=>sub {${$_[0]}? 'true' : 'false'},fallback=>1,;our$true=do {bless \(my$dummy=1)};our$false=do {bless \(my$dummy=0)};1;
+DATA_MESSAGEPACK_BOOLEAN
+
+$fatpacked{"Data/MessagePack/PP.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'DATA_MESSAGEPACK_PP';
+  package Data::MessagePack::PP;use 5.008001;use strict;use warnings;no warnings 'recursion';use Carp ();use B ();use Config;BEGIN {my$unpack_int64_slow;my$unpack_uint64_slow;if(!eval {pack 'Q',1}){$unpack_int64_slow=sub {require Math::BigInt;my$high=unpack_uint32($_[0],$_[1]);my$low=unpack_uint32($_[0],$_[1]+ 4);if($high < 0xF0000000){$high=Math::BigInt->new($high);$low=Math::BigInt->new($low);return +($high << 32 | $low)->bstr}else {$high=Math::BigInt->new(~$high);$low=Math::BigInt->new(~$low);return +(-($high << 32 | $low + 1))->bstr}};$unpack_uint64_slow=sub {require Math::BigInt;my$high=Math::BigInt->new(unpack_uint32($_[0],$_[1]));my$low=Math::BigInt->new(unpack_uint32($_[0],$_[1]+ 4));return +($high << 32 | $low)->bstr}}*unpack_uint16=sub {return unpack 'n',substr($_[0],$_[1],2)};*unpack_uint32=sub {return unpack 'N',substr($_[0],$_[1],4)};my$bo_is_me=unpack ('d',"\x00\x00\xf0\x3f\x00\x00\x00\x00")==1;my$pack_double_oabi;my$unpack_double_oabi;if ($] < 5.010){my$bo_is_le=($Config{byteorder}=~ /^1234/);if ($bo_is_me){$pack_double_oabi=sub {my@v=unpack('V2',pack('d',$_[0]));return pack 'CN2',0xcb,@v[0,1]};$unpack_double_oabi=sub {my@v=unpack('V2',substr($_[0],$_[1],8));return unpack('d',pack('N2',@v[0,1]))}}*unpack_int16=sub {my$v=unpack 'n',substr($_[0],$_[1],2);return$v ? $v - 0x10000 : 0};*unpack_int32=sub {no warnings;my$v=unpack 'N',substr($_[0],$_[1],4);return$v ? $v - 0x100000000 : 0};if($bo_is_le){*pack_uint64=sub {my@v=unpack('V2',pack('Q',$_[0]));return pack 'CN2',0xcf,@v[1,0]};*pack_int64=sub {my@v=unpack('V2',pack('q',$_[0]));return pack 'CN2',0xd3,@v[1,0]};*pack_double=$pack_double_oabi || sub {my@v=unpack('V2',pack('d',$_[0]));return pack 'CN2',0xcb,@v[1,0]};*unpack_float=sub {my@v=unpack('v2',substr($_[0],$_[1],4));return unpack('f',pack('n2',@v[1,0]))};*unpack_double=$unpack_double_oabi || sub {my@v=unpack('V2',substr($_[0],$_[1],8));return unpack('d',pack('N2',@v[1,0]))};*unpack_int64=$unpack_int64_slow || sub {my@v=unpack('V*',substr($_[0],$_[1],8));return unpack('q',pack('N2',@v[1,0]))};*unpack_uint64=$unpack_uint64_slow || sub {my@v=unpack('V*',substr($_[0],$_[1],8));return unpack('Q',pack('N2',@v[1,0]))}}else {*pack_uint64=sub {return pack 'CQ',0xcf,$_[0]};*pack_int64=sub {return pack 'Cq',0xd3,$_[0]};*pack_double=$pack_double_oabi || sub {return pack 'Cd',0xcb,$_[0]};*unpack_float=sub {return unpack('f',substr($_[0],$_[1],4))};*unpack_double=$unpack_double_oabi || sub {return unpack('d',substr($_[0],$_[1],8))};*unpack_int64=$unpack_int64_slow || sub {unpack 'q',substr($_[0],$_[1],8)};*unpack_uint64=$unpack_uint64_slow || sub {unpack 'Q',substr($_[0],$_[1],8)}}}else {if ($bo_is_me){$pack_double_oabi=sub {my@v=unpack('V2',pack('d',$_[0]));my$d=unpack('d',pack('V2',@v[1,0]));return pack 'Cd>',0xcb,$d};$unpack_double_oabi=sub {my$first_word=substr($_[0],$_[1],4);my$second_word=substr($_[0],$_[1]+ 4,4);my$d_bin=$second_word .$first_word;return unpack('d>',$d_bin)}}*pack_uint64=sub {return pack 'CQ>',0xcf,$_[0]};*pack_int64=sub {return pack 'Cq>',0xd3,$_[0]};*pack_double=$pack_double_oabi || sub {return pack 'Cd>',0xcb,$_[0]};*unpack_float=sub {return unpack('f>',substr($_[0],$_[1],4))};*unpack_double=$unpack_double_oabi || sub {return unpack('d>',substr($_[0],$_[1],8))};*unpack_int16=sub {return unpack('n!',substr($_[0],$_[1],2))};*unpack_int32=sub {return unpack('N!',substr($_[0],$_[1],4))};*unpack_int64=$unpack_int64_slow || sub {return unpack('q>',substr($_[0],$_[1],8))};*unpack_uint64=$unpack_uint64_slow || sub {return unpack('Q>',substr($_[0],$_[1],8))}}no warnings 'once';@Data::MessagePack::ISA=qw(Data::MessagePack::PP);@Data::MessagePack::Unpacker::ISA=qw(Data::MessagePack::PP::Unpacker);*true=\&Data::MessagePack::true;*false=\&Data::MessagePack::false}sub _unexpected {Carp::confess("Unexpected " .sprintf(shift,@_)." found")}our$_max_depth;sub pack :method {my($self,$data,$max_depth)=@_;Carp::croak('Usage: Data::MessagePack->pack($dat [,$max_depth])')if @_ < 2;$_max_depth=defined$max_depth ? $max_depth : 512;if(not ref$self){$self=$self->new(prefer_integer=>$Data::MessagePack::PreferInteger || 0,canonical=>$Data::MessagePack::Canonical || 0,)}return$self->_pack($data)}sub _pack {my ($self,$value)=@_;local$_max_depth=$_max_depth - 1;if ($_max_depth < 0){Carp::croak("perl structure exceeds maximum nesting level (max_depth set too low?)")}return CORE::pack('C',0xc0)if (not defined$value);if (ref($value)eq 'ARRAY'){my$num=@$value;my$header=$num < 16 ? CORE::pack('C',0x90 + $num): $num < 2 ** 16 - 1 ? CORE::pack('Cn',0xdc,$num): $num < 2 ** 32 - 1 ? CORE::pack('CN',0xdd,$num): _unexpected("number %d",$num);return join('',$header,map {$self->_pack($_)}@$value)}elsif (ref($value)eq 'HASH'){my$num=keys %$value;my$header=$num < 16 ? CORE::pack('C',0x80 + $num): $num < 2 ** 16 - 1 ? CORE::pack('Cn',0xde,$num): $num < 2 ** 32 - 1 ? CORE::pack('CN',0xdf,$num): _unexpected("number %d",$num);if ($self->{canonical}){return join('',$header,map {$self->_pack($_),$self->_pack($value->{$_})}sort {$a cmp $b}keys %$value)}else {return join('',$header,map {$self->_pack($_)}%$value)}}elsif (ref($value)eq 'Data::MessagePack::Boolean'){return CORE::pack('C',${$value}? 0xc3 : 0xc2)}my$b_obj=B::svref_2object(\$value);my$flags=$b_obj->FLAGS;if ($flags & B::SVp_POK){if ($self->{prefer_integer}){if ($value =~ /^-?[0-9]+$/){my$ivalue=0 + $value;if (!($ivalue > 0xFFFFFFFF or $ivalue < ('-' .0x80000000)or $ivalue!=B::svref_2object(\$ivalue)->int_value)){return$self->_pack($ivalue)}}}utf8::encode($value)if utf8::is_utf8($value);my$num=length$value;my$header;if ($self->{utf8}){$header=$num < 32 ? CORE::pack('C',0xa0 + $num): $num < 2 ** 8 - 1 ? CORE::pack('CC',0xd9,$num): $num < 2 ** 16 - 1 ? CORE::pack('Cn',0xda,$num): $num < 2 ** 32 - 1 ? CORE::pack('CN',0xdb,$num): _unexpected('number %d',$num)}else {$header=$num < 2 ** 8 - 1 ? CORE::pack('CC',0xc4,$num): $num < 2 ** 16 - 1 ? CORE::pack('Cn',0xc5,$num): $num < 2 ** 32 - 1 ? CORE::pack('CN',0xc6,$num): _unexpected('number %d',$num)}return$header .$value}elsif($flags & B::SVp_NOK){return pack_double($value)}elsif ($flags & B::SVp_IOK){if ($value >= 0){return$value <= 127 ? CORE::pack 'C',$value : $value < 2 ** 8 ? CORE::pack 'CC',0xcc,$value : $value < 2 ** 16 ? CORE::pack 'Cn',0xcd,$value : $value < 2 ** 32 ? CORE::pack 'CN',0xce,$value : pack_uint64($value)}else {return -$value <= 32 ? CORE::pack 'C',($value & 255): -$value <= 2 ** 7 ? CORE::pack 'Cc',0xd0,$value : -$value <= 2 ** 15 ? CORE::pack 'Cn',0xd1,$value : -$value <= 2 ** 31 ? CORE::pack 'CN',0xd2,$value : pack_int64($value)}}else {_unexpected("data type %s",$b_obj)}}our$_utf8=0;my$p;sub _insufficient {Carp::confess("Insufficient bytes (pos=$p, type=@_)")}sub unpack :method {$p=0;$_utf8=(ref($_[0])&& $_[0]->{utf8})|| $_utf8;my$data=_unpack($_[1]);if($p < length($_[1])){Carp::croak("Data::MessagePack->unpack: extra bytes")}return$data}my$T_STR=0x01;my$T_ARRAY=0x02;my$T_MAP=0x04;my$T_BIN=0x08;my$T_DIRECT=0x10;my@typemap=((0x00)x 256);$typemap[$_]|=$T_ARRAY for 0x90 .. 0x9f,0xdc,0xdd,;$typemap[$_]|=$T_MAP for 0x80 .. 0x8f,0xde,0xdf,;$typemap[$_]|=$T_STR for 0xa0 .. 0xbf,0xd9,0xda,0xdb,;$typemap[$_]|=$T_BIN for 0xc4,0xc5,0xc6,;my@byte2value;for my$pair([0xc3,true],[0xc2,false],[0xc0,undef],(map {[$_,$_ ]}0x00 .. 0x7f),(map {[$_,$_ - 0x100 ]}0xe0 .. 0xff),){$typemap[$pair->[0]]|=$T_DIRECT;$byte2value[$pair->[0]]=$pair->[1]}sub _fetch_size {my($value_ref,$byte,$x8,$x16,$x32,$x_fixbits)=@_;if (defined($x8)&& $byte==$x8){$p += 1;$p <= length(${$value_ref})or _insufficient('x/8');return unpack 'C',substr(${$value_ref},$p - 1,1)}elsif ($byte==$x16){$p += 2;$p <= length(${$value_ref})or _insufficient('x/16');return unpack 'n',substr(${$value_ref},$p - 2,2)}elsif ($byte==$x32){$p += 4;$p <= length(${$value_ref})or _insufficient('x/32');return unpack 'N',substr(${$value_ref},$p - 4,4)}else {return$byte & ~$x_fixbits}}sub _unpack {my ($value)=@_;$p < length($value)or _insufficient('header byte');my$byte=ord(substr$value,$p,1);$p++;return$byte2value[$byte]if$typemap[$byte]& $T_DIRECT;if ($typemap[$byte]& $T_STR){my$size=_fetch_size(\$value,$byte,0xd9,0xda,0xdb,0xa0);my$s=substr($value,$p,$size);length($s)==$size or _insufficient('raw');$p += $size;utf8::decode($s);return$s}elsif ($typemap[$byte]& $T_ARRAY){my$size=_fetch_size(\$value,$byte,undef,0xdc,0xdd,0x90);my@array;push@array,_unpack($value)while --$size >= 0;return \@array}elsif ($typemap[$byte]& $T_MAP){my$size=_fetch_size(\$value,$byte,undef,0xde,0xdf,0x80);my%map;while(--$size >= 0){no warnings;my$key=_unpack($value);my$val=_unpack($value);$map{$key }=$val}return \%map}elsif ($typemap[$byte]& $T_BIN){my$size=_fetch_size(\$value,$byte,0xc4,0xc5,0xc6,0x80);my$s=substr($value,$p,$size);length($s)==$size or _insufficient('bin');$p += $size;utf8::decode($s)if$_utf8;return$s}elsif ($byte==0xcc){$p++;$p <= length($value)or _insufficient('uint8');return CORE::unpack('C',substr($value,$p - 1,1))}elsif ($byte==0xcd){$p += 2;$p <= length($value)or _insufficient('uint16');return unpack_uint16($value,$p - 2)}elsif ($byte==0xce){$p += 4;$p <= length($value)or _insufficient('uint32');return unpack_uint32($value,$p - 4)}elsif ($byte==0xcf){$p += 8;$p <= length($value)or _insufficient('uint64');return unpack_uint64($value,$p - 8)}elsif ($byte==0xd3){$p += 8;$p <= length($value)or _insufficient('int64');return unpack_int64($value,$p - 8)}elsif ($byte==0xd2){$p += 4;$p <= length($value)or _insufficient('int32');return unpack_int32($value,$p - 4)}elsif ($byte==0xd1){$p += 2;$p <= length($value)or _insufficient('int16');return unpack_int16($value,$p - 2)}elsif ($byte==0xd0){$p++;$p <= length($value)or _insufficient('int8');return CORE::unpack 'c',substr($value,$p - 1,1)}elsif ($byte==0xcb){$p += 8;$p <= length($value)or _insufficient('double');return unpack_double($value,$p - 8)}elsif ($byte==0xca){$p += 4;$p <= length($value)or _insufficient('float');return unpack_float($value,$p - 4)}else {_unexpected("byte 0x%02x",$byte)}}package Data::MessagePack::PP::Unpacker;sub new {bless {pos=>0,utf8=>0,buff=>'',},shift}sub utf8 {my$self=shift;$self->{utf8}=(@_ ? shift : 1);return$self}sub get_utf8 {my($self)=@_;return$self->{utf8}}sub execute_limit {execute(@_)}sub execute {my ($self,$data,$offset,$limit)=@_;$offset ||=0;my$value=substr($data,$offset,$limit ? $limit : length$data);my$len=length$value;$self->{buff}.= $value;local$self->{stack}=[];$p=0;while (length($self->{buff})> $p){_count($self,$self->{buff})or last;while (@{$self->{stack}}> 0 && --$self->{stack}->[-1]==0){pop @{$self->{stack}}}if (@{$self->{stack}}==0){$self->{is_finished}++;last}}$self->{pos}=$p;return$p + $offset}sub _count {my ($self,$value)=@_;no warnings;my$byte=unpack('C',substr($value,$p++,1));Carp::croak('invalid data')unless defined$byte;return 1 if$typemap[$byte]& $T_DIRECT;if ($typemap[$byte]& $T_STR){my$num;if ($byte==0xd9){$num=unpack 'C',substr($value,$p,1);$p += 1}elsif ($byte==0xda){$num=unpack 'n',substr($value,$p,2);$p += 2}elsif ($byte==0xdb){$num=unpack 'N',substr($value,$p,4);$p += 4}else {$num=$byte & ~0xa0}$p += $num;return 1}elsif ($typemap[$byte]& $T_ARRAY){my$num;if ($byte==0xdc){$num=unpack 'n',substr($value,$p,2);$p += 2}elsif ($byte==0xdd){$num=unpack 'N',substr($value,$p,4);$p += 4}else {$num=$byte & ~0x90}if ($num){push @{$self->{stack}},$num + 1}return 1}elsif ($typemap[$byte]& $T_MAP){my$num;if ($byte==0xde){$num=unpack 'n',substr($value,$p,2);$p += 2}elsif ($byte==0xdf){$num=unpack 'N',substr($value,$p,4);$p += 4}else {$num=$byte & ~0x80}if ($num){push @{$self->{stack}},$num * 2 + 1}return 1}elsif ($typemap[$byte]& $T_BIN){my$num;if ($byte==0xc4){$num=unpack 'C',substr($value,$p,1);$p += 1}elsif ($byte==0xc5){$num=unpack 'n',substr($value,$p,2);$p += 2}elsif ($byte==0xc6){$num=unpack 'N',substr($value,$p,4);$p += 4}$p += $num;return 1}elsif ($byte >= 0xcc and $byte <= 0xcf){$p += $byte==0xcc ? 1 : $byte==0xcd ? 2 : $byte==0xce ? 4 : $byte==0xcf ? 8 : Data::MessagePack::PP::_unexpected("byte 0x%02x",$byte);return 1}elsif ($byte >= 0xd0 and $byte <= 0xd3){$p += $byte==0xd0 ? 1 : $byte==0xd1 ? 2 : $byte==0xd2 ? 4 : $byte==0xd3 ? 8 : Data::MessagePack::PP::_unexpected("byte 0x%02x",$byte);return 1}elsif ($byte==0xca or $byte==0xcb){$p += $byte==0xca ? 4 : 8;return 1}else {Data::MessagePack::PP::_unexpected("byte 0x%02x",$byte)}return 0}sub data {my($self)=@_;local$Data::MessagePack::PP::_utf8=$self->{utf8};return Data::MessagePack->unpack(substr($self->{buff},0,$self->{pos}))}sub is_finished {my ($self)=@_;return$self->{is_finished}}sub reset :method {$_[0]->{buff}='';$_[0]->{pos}=0;$_[0]->{is_finished}=0}1;
+DATA_MESSAGEPACK_PP
 
 $fatpacked{"IPC/Open3.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'IPC_OPEN3';
   package IPC::Open3;use strict;no strict 'refs';our ($VERSION,@ISA,@EXPORT);require Exporter;use Carp;use Symbol qw(gensym qualify);$VERSION='1.20';@ISA=qw(Exporter);@EXPORT=qw(open3);our$Me='open3 (bug)';sub xpipe {pipe $_[0],$_[1]or croak "$Me: pipe($_[0], $_[1]) failed: $!"}sub xopen {open $_[0],$_[1],@_[2..$#_]and return;local $"=', ';carp "$Me: open(@_) failed: $!"}sub xclose {$_[0]=~ /\A=?(\d+)\z/ ? do {my$fh;open($fh,$_[1].'&=' .$1)and close($fh)}: close $_[0]or croak "$Me: close($_[0]) failed: $!"}sub xfileno {return $1 if $_[0]=~ /\A=?(\d+)\z/;return fileno $_[0]}use constant FORCE_DEBUG_SPAWN=>0;use constant DO_SPAWN=>$^O eq 'os2' || $^O eq 'MSWin32' || FORCE_DEBUG_SPAWN;sub _open3 {local$Me=shift;splice @_,0,1,undef if \$_[0]==\undef;splice @_,1,1,undef if \$_[1]==\undef;unless (eval {$_[0]=gensym unless defined $_[0]&& length $_[0];$_[1]=gensym unless defined $_[1]&& length $_[1];1}){$@ =~ s/(?<=value attempted) at .*//s;croak "$Me: $@"}my@handles=({mode=>'<',handle=>\*STDIN },{mode=>'>',handle=>\*STDOUT },{mode=>'>',handle=>\*STDERR },);for (@handles){$_->{parent}=shift;$_->{open_as}=gensym}if (@_ > 1 and $_[0]eq '-'){croak "Arguments don't make sense when the command is '-'"}$handles[2]{parent}||=$handles[1]{parent};$handles[2]{dup_of_out}=$handles[1]{parent}eq $handles[2]{parent};my$package;for (@handles){$_->{dup}=($_->{parent}=~ s/^[<>]&//);if ($_->{parent}!~ /\A=?(\d+)\z/){$package=caller 1 if (!defined$package);$_->{parent}=qualify $_->{parent},$package}next if $_->{dup}or $_->{dup_of_out};if ($_->{mode}eq '<'){xpipe $_->{open_as},$_->{parent}}else {xpipe $_->{parent},$_->{open_as}}}my$kidpid;if (!DO_SPAWN){xpipe my$stat_r,my$stat_w;$kidpid=fork;croak "$Me: fork failed: $!" unless defined$kidpid;if ($kidpid==0){eval {untie*STDIN;untie*STDOUT;untie*STDERR;close$stat_r;require Fcntl;my$flags=fcntl$stat_w,&Fcntl::F_GETFD,0;croak "$Me: fcntl failed: $!" unless$flags;fcntl$stat_w,&Fcntl::F_SETFD,$flags|&Fcntl::FD_CLOEXEC or croak "$Me: fcntl failed: $!";if (!$handles[2]{dup_of_out}&& $handles[2]{dup}&& xfileno($handles[2]{parent})==fileno \*STDOUT){my$tmp=gensym;xopen($tmp,'>&',$handles[2]{parent});$handles[2]{parent}=$tmp}for (@handles){if ($_->{dup_of_out}){xopen \*STDERR,">&STDOUT" if defined fileno STDERR && fileno STDERR!=fileno STDOUT}elsif ($_->{dup}){xopen $_->{handle},$_->{mode}.'&',$_->{parent}if fileno $_->{handle}!=xfileno($_->{parent})}else {xclose $_->{parent},$_->{mode};xopen $_->{handle},$_->{mode}.'&=',fileno $_->{open_as}}}return 1 if ($_[0]eq '-');exec @_ or do {local($")=(" ");croak "$Me: exec of @_ failed: $!"}}and do {close$stat_w;return 0};my$bang=0+$!;my$err=$@;utf8::encode$err if $] >= 5.008;print$stat_w pack('IIa*',$bang,length($err),$err);close$stat_w;eval {require POSIX;POSIX::_exit(255)};exit 255}else {close$stat_w;my$to_read=length(pack('I',0))* 2;my$bytes_read=read($stat_r,my$buf='',$to_read);if ($bytes_read){(my$bang,$to_read)=unpack('II',$buf);read($stat_r,my$err='',$to_read);waitpid$kidpid,0;if ($err){utf8::decode$err if $] >= 5.008}else {$err="$Me: " .($!=$bang)}$!=$bang;die($err)}}}else {my@close;for (@handles){if ($_->{dup_of_out}){$_->{open_as}=$handles[1]{open_as}}elsif ($_->{dup}){$_->{open_as}=$_->{parent}=~ /\A[0-9]+\z/ ? $_->{parent}: \*{$_->{parent}};push@close,$_->{open_as}}else {push@close,\*{$_->{parent}},$_->{open_as}}}require IO::Pipe;$kidpid=eval {spawn_with_handles(\@handles,\@close,@_)};die "$Me: $@" if $@}for (@handles){next if $_->{dup}or $_->{dup_of_out};xclose $_->{open_as},$_->{mode}}xclose$handles[0]{parent},$handles[0]{mode}if$handles[0]{dup};select((select($handles[0]{parent}),$|=1)[0]);$kidpid}sub open3 {if (@_ < 4){local $"=', ';croak "open3(@_): not enough arguments"}return _open3 'open3',@_}sub spawn_with_handles {my$fds=shift;my$close_in_child=shift;my ($fd,%saved,@errs);for$fd (@$fds){$fd->{tmp_copy}=IO::Handle->new_from_fd($fd->{handle},$fd->{mode});$saved{fileno$fd->{handle}}=$fd->{tmp_copy}if$fd->{tmp_copy}}for$fd (@$fds){bless$fd->{handle},'IO::Handle' unless eval {$fd->{handle}->isa('IO::Handle')};my$open_as=$fd->{open_as};my$fileno=fileno($open_as);$fd->{handle}->fdopen(defined($fileno)? $saved{$fileno}|| $open_as : $open_as,$fd->{mode})}unless ($^O eq 'MSWin32'){require Fcntl;for$fd (@$close_in_child){next unless fileno$fd;fcntl($fd,Fcntl::F_SETFD(),1)or push@errs,"fcntl $fd: $!" unless$saved{fileno$fd}}}my$pid;unless (@errs){if (FORCE_DEBUG_SPAWN){pipe my$r,my$w or die "Pipe failed: $!";$pid=fork;die "Fork failed: $!" unless defined$pid;if (!$pid){{no warnings;exec @_}print$w 0 + $!;close$w;require POSIX;POSIX::_exit(255)}close$w;my$bad=<$r>;if (defined$bad){$!=$bad;undef$pid}}else {$pid=eval {system 1,@_}}if($@){push@errs,"IO::Pipe: Can't spawn-NOWAIT: $@"}elsif(!$pid || $pid < 0){push@errs,"IO::Pipe: Can't spawn-NOWAIT: $!"}}for$fd (reverse @$fds){$fd->{handle}->fdopen($fd->{tmp_copy},$fd->{mode})}for (values%saved){$_->close or croak "Can't close: $!"}croak join "\n",@errs if@errs;return$pid}1;

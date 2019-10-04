@@ -66,7 +66,7 @@ use Symbol qw(gensym);
 use Sys::Hostname;
 use Text::ParseWords;
 
-our $VERSION = 6.03;
+our $VERSION = 7.0;
 
 # do not die when receiving sigpipe
 $SIG{PIPE} = 'IGNORE';
@@ -1471,17 +1471,18 @@ sub sum {
     }
 
     return if (!$perl{threads} || $opts{threads} <= 1);
-    # choose min of specified threads and amount of work
-    my $nthr = min($opts{threads}, $q->pending);
-    my @threads = map {threads->create(sub {
-        while (defined (my $sum = $q->dequeue)) {
+    # choose min of specified threads minus self and amount of work
+    my $nthr = min($opts{threads} - 1, $q->pending);
+    my $dqsum = sub {
+        while (defined (my $sum = $q->dequeue_nb)) {
             my ($qi, $i, $file, $x1, $x2) = @{$sum};
             my $hash = sum1($file, $x1, $x2);
             $qret->enqueue([$qi, $i, $hash]);
         }
-    })} (1 .. $nthr);
-    # force threads to exit
-    $q->enqueue(undef) foreach (@threads);
+    };
+    my @threads = map {threads->create($dqsum)} (1 .. $nthr);
+    # ensure work gets done even if thread creation fails
+    &$dqsum();
     foreach (@threads) {
         $_->join if ($_);
     }
