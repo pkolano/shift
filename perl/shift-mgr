@@ -1,6 +1,6 @@
 #!/usr/bin/perl -T
 #
-# Copyright (C) 2012-2019 United States Government as represented by the
+# Copyright (C) 2012-2021 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration
 # (NASA).  All Rights Reserved.
 #
@@ -72,7 +72,7 @@ use Text::ParseWords;
 require Tie::DB_FileLock;
 require Text::FormatTable;
 
-our $VERSION = 7.0;
+our $VERSION = 7.08;
 
 $Data::Dumper::Pair = " = ";
 $Data::Dumper::Sortkeys = 1;
@@ -133,8 +133,10 @@ my %conf = (
     default_stripe => "1g",
     default_threads => 4,
     latency_lan => 0.001,
+    latency_wait => 600,
     latency_wan => 0.05,
     local_small => "shift,fish,fish-tcp",
+    max_files => "100k",
     max_streams_lan => 8,
     max_streams_wan => 16,
     min_streams_lan => 1,
@@ -161,7 +163,6 @@ my %conf = (
 my $dbgfh;
 my $dblock;
 my $doing;
-my $ewrite;
 my %ioall;
 my %nload;
 my $localtime = localtime;
@@ -182,10 +183,12 @@ $ENV{PATH} = "/bin:/usr/bin:/usr/local/bin";
 # untaint insecure environment variables
 delete $ENV{$_} foreach (qw(BASH_ENV CDPATH ENV IFS)); 
 
-# unlock files at program termination
 END {
+    # save exceptions to user's debug file
+    our @exception;
+    debug_print('DBG', "@exception") if (@exception);
     close $dbgfh if (defined $dbgfh);
-    # unlock user and transfer directories
+    # unlock user and transfer directories at program termination
     lock_dir($_, 1) foreach (0, 1);
 }
 
@@ -333,6 +336,9 @@ if (defined $opts{put} && !defined $opts{id}) {
     # initialize other items
     $meta{last} = 0;
     $meta{origin} = $opts{host};
+    $meta{origin_ip} = (split(/\s+/, $ENV{SSH_CONNECTION}))
+        # tty indicates local invocation
+        [defined $ENV{SSH_TTY} ? 2 : 0];
     $meta{split_id} = 0;
     $meta{stop} = 0;
     # time0 must be set before sync_id() called
@@ -463,6 +469,11 @@ if (defined $opts{status} && $opts{state} eq 'none') {
     die "Only running transfers can be stopped\n";
 }
 
+# use catchall exception handler to report manager failures
+$SIG{__DIE__} = sub {
+    our @exception = @_ if (defined $^S && !$^S);
+};
+
 # initialize next metadata line so can detect interruption
 put_meta();
 $meta{update_id} = "$opts{host}$opts{cid}";
@@ -542,6 +553,9 @@ if ($opts{alive}) {
                     $meta{s_sum} -= $op{size};
                     $meta{d_sum}--;
                 }
+            } elsif ($cmd eq 'chattr' && !$op{tar_mv}) {
+                # add instead of subtract due to way run() expected computed
+                $meta{"d_$cmd"}++;
             } else {
                 $meta{"t_$cmd"}--;
                 $meta{tar_mv}-- if ($op{tar_mv});
@@ -612,8 +626,6 @@ if ($opts{get} && ($meta{stop} || $meta{time1} ||
 } elsif ($opts{get}) {
     get();
 }
-
-#TODO: option to list operations or state of each client host
 
 # send email status updates
 email_status()
@@ -771,7 +783,7 @@ sub build_find {
 # print given text from get to stdout and mirror to file if debugging enabled
 sub debug_print {
     my $type = shift;
-    if ($conf{debug} || $conf{"debug_$opts{user}"}) {
+    if ($conf{debug} || $conf{"debug_$opts{user}"} || $type eq 'DBG') {
         # open user-specific debug file if not already open
         open($dbgfh, '>>', "$conf{user_dir}/$opts{user}.debug") if (!$dbgfh);
         print $dbgfh "$localtime $opts{host} $opts{id}$opts{cid} $type ";
@@ -1180,7 +1192,7 @@ sub format_bytes {
 sub get {
     # retrieve global and user database from file
     %mounts = %{mp_retrieve($conf{mount_db})};
-    %umounts = %{mp_retrieve($conf{umount_db})};
+    %umounts = %{mp_retrieve($conf{umount_db})} if (!scalar(keys %mounts));
 
     my $warn = delete $meta{"warn_$opts{host}$opts{cid}"};
     if ($warn > 0) {
@@ -1269,6 +1281,7 @@ sub get {
     my $ndoing = "0." . reverse($meta{"$opts{doing}_size"});
     my $gzs = {};
     my ($ldoing, $kdoing, $size, $files, $ops, $all, $secs, $skip);
+    my $max_files = parse_bytes($conf{max_files});
     my (%diskfs, %localfs, %rtthost);
     my %cli_load = split(/[= ]+/, $meta{"load_$opts{host}$opts{cid}"});
     my $ncli = grep(/^doing_/, keys %meta);
@@ -1292,8 +1305,8 @@ sub get {
             $gzs->{$log}->seek($meta{$log}, $whence);
         }
 
-        while (($size < $meta{size} && $all < $meta{files} ||
-                $secs < $opts{interval}) &&
+        while ($all < $max_files && ($secs < $opts{interval} ||
+                $size < $meta{size} && $all < $meta{files}) &&
                 ($log =~ /^doing_/ && (($kdoing, $line) = each %{$ldoing}) ||
                 $log eq 'rtree' && defined($line = last_line($gzs->{rtree})) ||
                 $log !~ /^(?:doing_|rtree)/ &&
@@ -1409,11 +1422,18 @@ sub get {
                     # remove user name (if applicable)
                     $host = (split(/@/, $host))[-1];
                     if ($host ne 'localhost' && !defined $rtthost{$host}) {
-                        # determine if already have round-trip time for domain
+                        # determine if domain needs another latency measurement
                         my $dn = $host;
                         $dn =~ s/^[^.]+.//;
-                        # only include hosts in new domains
-                        $rtthost{$host} = $meta{"rtt_$dn"} ? -1 : 1;
+                        # measure when enough time elapsed and not all errors
+                        if ($time - $meta{"lastrtt_$dn"} > $conf{"latency_wait"} &&
+                                ($meta{"rtt_$dn"} || $meta{"e_rtt_$dn"} < 5)) {
+                            $rtthost{$host} = 1;
+                            $meta{"lastrtt_$dn"} = $time;
+                        } else {
+                            # store host for use by later non-rtt processing
+                            $rtthost{$host} = -1;
+                        }
                     }
                     if ($cmd =~ /^(?:cp|find)/ && $i == 1 && $ref->{local}) {
                         # store target file systems for disk throttling
@@ -1809,12 +1829,14 @@ sub get_meta {
 
     if ($meta) {
         # meta lines are serialized, compressed, and yEnc encoded
-        my $zmetay = yenc_decode($meta);
-        my $zmeta = uncompress($zmetay);
-        $meta = Data::MessagePack->unpack($zmeta);
-        # convert strings back to Math::BigInt
-        $meta->{$_} = Math::BigInt->new($meta->{$_})
-            foreach (grep(/^sd_/, keys %{$meta}));
+        my $zmeta = uncompress(yenc_decode($meta));
+        $meta = undef;
+        if ($zmeta) {
+            $meta = Data::MessagePack->unpack($zmeta);
+            # convert strings back to Math::BigInt
+            $meta->{$_} = Math::BigInt->new($meta->{$_})
+                foreach (grep(/^sd_/, keys %{$meta}));
+        }
     }
     if ($meta && defined $mtell && $mtell > 0) {
         # metadata corrupted so revert to last known good state
@@ -2128,7 +2150,7 @@ sub last_line {
     # set file handle position for next invocation
     $fh->seek($tell + $pos, 0);
     # return buffer after newline
-    my $buf = substr($buf, $pos);
+    $buf = substr($buf, $pos);
     $buf =~ s/\r?\n//;
     return $buf;
 }
@@ -2163,14 +2185,18 @@ sub log_close {
                 defined $bgr->{idx}->[-1]) {
             my ($coff, $uoff) = @{$bgr->{idx}->[-1]};
             # rtree is just tree in reverse
-	        my $f = $log eq 'rtree' ? 'tree' : $log;
+            my $f = $log eq 'rtree' ? 'tree' : $log;
             $f = "$opts{base}/$f.gzi";
             local $SIG{__WARN__} = sub {};
-            $bgr->write_index($f) if ($uoff && -s $f < int($uoff / 4096));
+            # ignore exceptions since gzi is only to increase performance
+            eval {$bgr->write_index($f)} if ($uoff && -s $f < int($uoff / 4096));
+            # a corrupt/incomplete index will throw exceptions on read
+            unlink $f if ($@);
         }
         close $gzs->{$log};
         delete $gzs->{$log};
     }
+    # error conditions will trigger exception, which will not finalize metadata
 }
 
 #####################
@@ -2184,11 +2210,11 @@ sub log_getline {
     # find/ln/mkdir are stored in cp
     $log = "cp" if ($log =~ /^(?:find|ln|mkdir)$/);
     if (!defined $gzs->{$log}) {
-		# rtree is just tree in reverse
-    	my $f = $log eq 'rtree' ? 'tree' : $log;
+        # rtree is just tree in reverse
+        my $f = $log eq 'rtree' ? 'tree' : $log;
         # open new reader and store in given hash
         $gzs->{$log} = Compress::BGZF::Reader->new_filehandle("$opts{base}/$f");
-        #TODO: need error if cannot be opened
+        # error conditions will trigger exception
     }
     return if ($noread);
     return $gzs->{$log}->getline;
@@ -2200,31 +2226,26 @@ sub log_getline {
 # print given text to open/new Compress::BGZF::Writer for given log
 # obtained from/stored to given hash
 sub log_print {
-	my ($log, $gzs, $line) = @_;
+    my ($log, $gzs, $line) = @_;
     # untaint $log
     $log = $1 if ($log =~ /^(\w+)$/);
     # find/ln/mkdir are stored in cp
     $log = "cp" if ($log =~ /^(?:find|ln|mkdir)$/);
-    # catch error conditions such as disk exhaustion
-    eval {
-        if (!defined $line) {
-            log_close($log, $gzs);
-            unlink("$opts{base}/$log.gzi");
-            # force new file
-            my $fh = Compress::BGZF::Writer->new_filehandle("$opts{base}/$log");
-            close $fh;
-            return;
-        } else {
-            if (!defined $gzs->{$log}) {
-                # open new writer and store in given hash
-                $gzs->{$log} = Compress::BGZF::Writer->new_filehandle(">$opts{base}/$log");
-                #TODO: need error if cannot be opened
-            }
-            $gzs->{$log}->print($line);
+    if (!defined $line) {
+        log_close($log, $gzs);
+        unlink("$opts{base}/$log.gzi");
+        # force new file
+        my $fh = Compress::BGZF::Writer->new_filehandle("$opts{base}/$log");
+        close $fh;
+    } else {
+        if (!defined $gzs->{$log}) {
+            # open new writer and store in given hash
+            $gzs->{$log} = Compress::BGZF::Writer->new_filehandle(">$opts{base}/$log");
         }
-    };
-    # set write error on exception
-    $ewrite = 1 if ($@);
+        # note data may be buffered until close so error may be in log_close
+        $gzs->{$log}->print($line);
+    }
+    # error conditions will trigger exception, which will not finalize metadata
 }
 
 ##################
@@ -2475,14 +2496,15 @@ sub monitor {
 # return data structure stored in MessagePack format from given file
 sub mp_retrieve {
     my $file = shift;
-    my $return = {};
+    my $return;
     if (open(MPFILE, '<', $file)) {
         my $line;
         $line .= $_ while (<MPFILE>);
+        # ignore exceptions since load/umount dbs not critical for completion
         $return = eval {Data::MessagePack->unpack($line)};
         close MPFILE;
     }
-    return $return;
+    return defined $return ? $return : {};
 }
 
 ##################
@@ -2492,6 +2514,7 @@ sub mp_retrieve {
 sub mp_store {
     my ($data, $file) = @_;
     if (open(MPFILE, '>', $file)) {
+        # ignore exceptions since load/umount dbs not critical for completion
         print MPFILE eval {Data::MessagePack->pack($data)};
         close MPFILE;
     }
@@ -2598,31 +2621,36 @@ sub plot {
     #TODO: not all gnuplots have pdf terminal
     #TODO: find not being shown properly?
     my $by;
-    if ($opts{plot} =~ /^(client|host|id|user)$/) {
+    if ($opts{plot} =~ /^(client|fs|host|id|user)$/) {
         ($by, $opts{plot}) = ($opts{plot}, "io");
     } elsif ($opts{plot} =~ /(\S+):(\S+)/) {
         ($by, $opts{plot}) = ($1, $2);
+        die "Can only plot by client, fs, host, id, or user\n"
+            if ($by !~ /^(client|fs|host|id|user)$/);
     } elsif (!$opts{plot}) {
         $opts{plot} = "io,meta";
     }
-    $opts{plot} =~ s/io/cp,sum,cksum/g;
-    $opts{plot} =~ s/meta/find,mkdir,ln,chattr/g;
+    my @io = $by eq 'fs' ? qw(get put sum cksum) : qw(cp sum cksum);
+    my $sep = $by ? "+" : ",";
+    $opts{plot} =~ s/io/join($sep,@io)/eg;
+    $opts{plot} =~ s/meta/join($sep,qw(find mkdir ln chattr))/eg;
+    die "Unsupported operation/operator found in plot expression\n"
+        if ($opts{plot} !~ /^((chattr|cksum|cp|find|get|ln|mkdir|put|sum)([+,]|$))+$/);
+    # remove trailing operators since above regex doesn't catch
+    $opts{plot} =~ s/[+,]+$//;
+    die "Cannot mix io and meta operations in sum expressions\n"
+        if ($opts{plot} =~ /(chattr|find|ln|mkdir)\+(cksum|cp|sum)/ ||
+                $opts{plot} =~ /(cksum|cp|sum)\+(chattr|find|ln|mkdir)/);
 
     my %keys;
+    $keys{$_} = "s_" foreach (@io);
     $keys{$_} = "d_" foreach (qw(chattr find ln mkdir));
-    $keys{$_} = "s_" foreach (qw(cksum cp sum));
 
-    my @cmds = split(/,/, $opts{plot});
-    my %hcmds;
-    # separate io and meta operations
-    push(@{$hcmds{$keys{$_}}}, $_) foreach (@cmds);
-    $hcmds{1} = defined $hcmds{s_} ? $hcmds{s_} : $hcmds{d_};
-    my $unit = defined $hcmds{s_} ? "MB" : "ops";
-    @cmds = @{$hcmds{1}};
-    push(@cmds, @{$hcmds{d_}}) if (defined $hcmds{d_});
-
+    my @cmds = qw(chattr cksum find ln mkdir sum);
+    push(@cmds, $by eq 'fs' ? qw(get put) : "cp");
     my %times;
-    my (@metas, @seen);
+    my @metas;
+    my %seen;
     my $dir = $> != 0 ? $conf{user_dir} : $opts{user_dir};
     my $user = $> != 0 ? $opts{user} : "*";
     do {
@@ -2682,8 +2710,9 @@ sub plot {
             last if (!defined $line);
             last if (substr($line, 0, 1) != '[' || substr($line, -1, 1) != ']');
             # note that this doesn't handle Math::BigInt as is normally done
-            my $meta = Data::MessagePack->unpack(uncompress(
-                enc_decode(substr($line, 1, -1))));
+            my $meta = eval {Data::MessagePack->unpack(uncompress(
+                yenc_decode(substr($line, 1, -1))))};
+            next if (!$meta);
             my $client = $meta->{update_id};
             my $host = $client;
             $host =~ s/\.\d+$//;
@@ -2694,38 +2723,59 @@ sub plot {
             if ($gets{$client} &&
                     sum(map {$meta->{"$_\_size"}} qw(chattr cksum cp done error sum tree)) >
                     sum(map {$meta0->{"$_\_size"}} qw(chattr cksum cp done error sum tree))) {
-                my @counts;
-                foreach (@cmds) {
-                    my $rate = $meta->{$keys{$_} . $_} -
-                        $meta0->{$keys{$_} . $_};
-                    # io operations are shown in MB/s
-                    $rate /= 1E6 if ($keys{$_} eq 's_');
-                    # throw out negative results due to retries
-                    $rate = 0 if ($rate < 0);
-                    push(@counts, ceil($rate / ($time - $gets{$client})));
+                my %fs;
+                if ($by eq 'fs') {
+                    foreach my $cmd (@cmds) {
+                        foreach (grep(/^$keys{$cmd}${cmd}_/, keys %{$meta})) {
+                            s/^$keys{$cmd}${cmd}_//;
+                            # ignore <op>_size metadata
+                            next if ($_ eq 'size');
+                            $fs{$_} = 1;
+                        }
+                    }
+                } else {
+                    $fs{""} = 1;
                 }
-                if (sum(@counts)) {
-                    # add to operations if something done (i.e. not --alive)
-                    $times{$gets{$client}} = []
-                        if (!defined $times{$gets{$client}});
-                    $times{$time} = [] if (!defined $times{$time});
-                    # computed rates begin when the get occurred
-                    push(@{$times{$gets{$client}}},
-                        [$user, $id, $host, $client, @counts]);
-                    # computed rates end when the put occurred
-                    push(@{$times{$time}},
-                        [$user, $id, $host, $client, map {-$_} @counts]);
-                    # record id/host/user for creation of header/data rows
-                    $seen[0]->{$user} = 1;
-                    $seen[1]->{$id} = 1;
-                    $seen[2]->{$host} = 1;
-                    $seen[3]->{$client} = 1;
-                    # no more outstanding operations by client
-                    delete $gets{$client};
+                foreach my $fs (keys %fs) {
+                    my $data;
+                    foreach my $cmd (@cmds) {
+                        my $fscmd = $keys{$cmd} . $cmd;
+                        $fscmd .= "_$fs" if ($fs);
+                        my $rate = $meta->{$fscmd} - $meta0->{$fscmd};
+                        # io operations are shown in MB/s
+                        $rate /= 1E6 if ($keys{$cmd} eq 's_');
+                        # throw out negative results due to retries
+                        $rate = 0 if ($rate < 0);
+                        $data->{$cmd} = ceil($rate / ($time - $gets{$client}));
+                    }
+                    if (defined $data) {
+                        # add to operations if something done (i.e. not --alive)
+                        $times{$gets{$client}} = []
+                            if (!defined $times{$gets{$client}});
+                        $times{$time} = [] if (!defined $times{$time});
+                        $data->{user} = $user;
+                        $data->{id} = $id;
+                        $data->{host} = $host;
+                        $data->{client} = $client;
+                        $data->{fs} = $fs;
+                        # computed rates begin when the get occurred
+                        push(@{$times{$gets{$client}}}, $data);
+                        # computed rates end when the put occurred
+                        my $data2 = dclone($data);
+                        $data2->{$_} *= -1 foreach (@cmds);
+                        push(@{$times{$time}}, $data2);
+                        # record id/host/user for creation of header/data rows
+                        $seen{user}->{$user} = 1;
+                        $seen{id}->{$id} = 1;
+                        $seen{host}->{$host} = 1;
+                        $seen{client}->{$client} = 1;
+                        $seen{fs}->{$fs} = 1;
+                    }
                 }
+                # no more outstanding operations by client
+                delete $gets{$client};
             }
             # record when clients have operations in progress (get)
-            #TODO: this may not work anymore after change to doing format
             $gets{$client} = $time
                 if ($meta->{"doing_$client\_size"} >
                     $meta0->{"doing_$client\_size"});
@@ -2734,13 +2784,21 @@ sub plot {
         close $fh;
     }
 
-    my $index = $by eq 'user' ? 0 : ($by eq 'id' ? 1 : ($by eq 'host' ? 2 : 3));
-    my @header = $by ? sort(keys %{$seen[$index]}) : @cmds;
+    my @header;
+    if ($by) {
+        foreach my $col (sort(split(/,/, $opts{plot}))) {
+            foreach my $group (sort(keys %{$seen{$by}})) {
+                push(@header, "[$col] $group");
+            }
+        }
+    } else {
+        @header = split(/,/, $opts{plot});
+    }
 
     # embed data inline so output can be piped directly into gnuplot
     print "# This output requires gnuplot version 5 or higher\n";
     print '$data << EOF', "\n";
-    print join(" ", "time", @header), "\n";
+    print join(" ", "time", map {"\"$_\""} @header), "\n";
 
     my ($time0, $time1);
     my %vals = map {$_ => 0} @header;
@@ -2750,12 +2808,14 @@ sub plot {
         # record first time witnessed
         $time0 = $time if (!defined $time0);
         foreach my $val (@{$times{$time}}) {
-            # add to running totals for 
-            if ($by) {
-                $vals{$val->[$index]} += sum(@{$val}[4 .. 2 + scalar(@cmds)]);
-            } else {
-                foreach my $i (0 .. scalar(@cmds) - 1) {
-                    $vals{$cmds[$i]} += $val->[4 + $i];
+            for (my $i = 0; $i < scalar(@header); $i++) {
+                my $head = $header[$i];
+                my ($col, $group) = split(/\s/, $head);
+                next if ($by && $val->{$by} ne $group);
+                $col =~ s/^[[]|[]]$//g;
+                my @adds = split(/\+/, $col);
+                foreach my $add (@adds) {
+                    $vals{$head} += $val->{$add};
                 }
             }
         }
@@ -2770,48 +2830,46 @@ sub plot {
 
     # set basic plot characteristics
     print "set terminal pdf enhanced\n";
-    print "set xlabel 'time (s)' textcolor rgb 'white'\n";
+    print "set xlabel 'Time (s)' textcolor rgb 'white'\n";
     print "set border linecolor rgb 'white'\n";
-    print "set key outside textcolor rgb 'white'\n";
+    print "set key Left reverse font ',6' outside textcolor rgb 'white'\n";
     print "set obj 1 rect behind from screen 0,0 to screen 1,1 fillcolor rgb 'black' behind\n";
-    print "set ylabel '", join("-", @{$hcmds{1}}),
-        " performance ($unit/s)' textcolor rgb 'white'\n";
+    my $unit = $opts{plot} =~ /cksum|cp|sum/ ? "MB" : "ops";
+    my $type = $opts{plot} =~ /cksum|cp|sum/ ? "I/O" : "Meta";
+    print "set ylabel '$type performance ($unit/s)' textcolor rgb 'white'\n";
 
     # set color of each data column (based on savors palette)
     my @palette = qw(
-        FF0000 FF7F00 FFFF00 80FF00 00FF00 00FF80 00FFFF 0080FF 0000FF 7F00FF
-        FF00FF FF007F CC0000 CC6600 CCCC00 66CC00 00CC00 00CC66 00CCCC 0066CC
-        0000CC 6600CC CC00CC CC0066 990000 994C00 999900 4D9900 009900 00994D
-        009999 004C99 000099 4D0099 990099 99004D FF7F7F FFBF80 FFFF7F BFFF80
-        80FF80 80FFBF 80FFFF 80BFFF 807FFF BF7FFF FF7FFF FF7FBF CC6666 CC9966
-        CCCC66 99CC66 66CC66 66CC99 66CCCC 6699CC 6666CC 9966CC CC66CC CC6699
-        994C4D 99734C 99994D 73994D 4D994D 4D9973 4D9999 4D7399 4D4C99 734C99
-        994C99 994C73 FFBFBF FFDFBF FFFFBF DFFFBF BFFFBF BFFFDF BFFFFF BFDFFF
-        BFBFFF DFBFFF FFBFFF FFBFDF CC9999 CCB399 CCCC99 B3CC99 99CC99 99CCB3
-        99CCCC 99B2CC 9999CC B399CC CC99CC CC99B3
+        FF0000 FF7F00 FFFF00 80FF00 00FF00 00FFFF 0080FF 0000FF 7F00FF FF00FF FF007F
+        CC0000 CC6600 CCCC00 66CC00 00CC00 00CCCC 0066CC 0000CC 6600CC CC00CC CC0066
+        990000 994C00 999900 4D9900 009900 009999 004C99 000099 4D0099 990099 99004D
+        FF7F7F FFBF80 FFFF7F BFFF80 80FF80 80FFFF 80BFFF 807FFF BF7FFF FF7FFF FF7FBF
+        CC6666 CC9966 CCCC66 99CC66 66CC66 66CCCC 6699CC 6666CC 9966CC CC66CC CC6699
+        994C4D 99734C 99994D 73994D 4D994D 4D9999 4D7399 4D4C99 734C99 994C99 994C73
+        FFBFBF FFDFBF FFFFBF DFFFBF BFFFBF BFFFFF BFDFFF BFBFFF DFBFFF FFBFFF FFBFDF
+        CC9999 CCB399 CCCC99 B3CC99 99CC99 99CCCC 99B2CC 9999CC B399CC CC99CC CC99B3
     );
-    foreach my $i (2 .. 1 + scalar(@header)) {
+    foreach my $i (2 .. scalar(@header) + 1) {
         print "set style line $i linecolor rgb '#",
             # reuse colors when more columns than palette colors
             $palette[($i - 2) % scalar(@palette)], "'\n";
     }
 
-    if (scalar(keys %hcmds) == 3) {
+    if ($opts{plot} =~ /chattr|find|ln|mkdir/ &&
+            $opts{plot} =~ /cksum|cp|sum/) {
         # set up dual y-axes when plotting both io and meta operations
         print "set ytics nomirror\n";
         print "set y2tics nomirror\n";
         print "set y2range [0:]\n";
-        print "set y2label '", join("-", @{$hcmds{d_}}),
-            " performance (ops/s)' textcolor rgb 'white'\n";
-        @header = @{$hcmds{1}};
+        print "set y2label 'Meta performance (ops/s)' textcolor rgb 'white'\n";
     }
-    print "plot for [i=2:", 1 + scalar(@header),
-        "] \$data using 1:i ti columnheader(i) with steps ls i";
-    if (scalar(keys %hcmds) == 3) {
-        # add plot for meta operations on second y-axis
-        print ", \\\n";
-        print "for [i=", 2 + scalar(@{$hcmds{1}}), ":", 1 + scalar(@cmds),
-            "] \$data using 1:i ti columnheader(i) with steps ls i axes x1y2";
+    print "plot \\\n";
+    my $i = 2;
+    foreach my $head (@header) {
+        my $axis = $head =~ /cksum|cp|sum/ ? "" : " axes x1y2";
+        print "  \$data using 1:$i ti columnheader($i) with steps ls $i$axis";
+        $i++;
+        print ",\\\n" if ($i < scalar(@header) + 2);
     }
     print "\n";
 }
@@ -2935,7 +2993,15 @@ sub put {
                 next if ($host eq 'args');
                 my $dn = $host;
                 $dn =~ s/^[^.]+.//;
-                $meta{"rtt_$dn"} = $op{$host};
+                $meta{"lastrtt_$dn"} = $time;
+                if ($op{$host} < 0) {
+                    $meta{"e_rtt_$dn"}++;
+                } else {
+                    $meta{"rc_rtt_$dn"}++;
+                    my $m = $op{$host} - $meta{"rtt_$dn"};
+                    $meta{"rtt_$dn"} += $m / $meta{"rc_rtt_$dn"};
+                    $meta{"r2_rtt_$dn"} += $m * ($op{$host} - $meta{"rtt_$dn"});
+                }
             }
         } elsif ($cmd eq 'load') {
             # record host load for throttling
@@ -3052,12 +3118,10 @@ sub put {
             $meta{"e_$cmd"}++;
             $meta{"e_$op{tool}"}++;
             $meta{time1} = $time if (($meta{last} || $meta{e_find}) && !run());
-            if ($cmd eq 'chattr' && unescape($op{text}) =~ /file sizes differ$/ ||
-                    $cmd eq 'cksum' && unescape($op{text}) =~ /^Corruption/) {
-                # track corruption for stats processing
-                $meta{e_corruption}++
-                    if ($cmd ne 'cksum' || !$meta{sync} || $op{try} > 1);
-            }
+            # track corruption for stats processing
+            $meta{e_corruption}++
+                if ($cmd eq 'cksum' && unescape($op{text}) =~ /^Corruption/ &&
+                    (!$meta{sync} || $op{try} > 1));
         } elsif ($op{state}) {
             $meta{s_run} -= $op{size};
             $meta{t_run}--;
@@ -3066,8 +3130,6 @@ sub put {
             $meta{time1} = $time if ($meta{time1});
             if ($cmd eq 'chattr' &&
                     unescape($op{text}) =~ /file sizes differ$/) {
-                # track corruption for stats processing
-                $meta{e_corruption}++;
                 # reset size since may have changed during chattr split join
                 $op{size} = (split(/,/, $op{attrs}))[7];
                 # file corrupted so next state is cp
@@ -3513,15 +3575,10 @@ sub put_meta {
     my $file = "$opts{base}/meta";
     open(FILE, '>>', $file);
     if (defined $meta) {
-        if (!$ewrite) {
-            my $mpmeta = dclone($meta);
-            # convert Math::BigInt values to strings for storage
-            $mpmeta->{$_} = $meta->{$_}->bstr
-                foreach (grep(/^sd_/, keys %{$meta}));
-            print FILE yenc_encode(compress(
-                Data::MessagePack->pack($mpmeta)), ""), "]\n";
-        }
-        # do not write trailing ] on write error, which will force retry
+        my $mpmeta = dclone($meta);
+        # convert Math::BigInt values to strings for storage
+        $mpmeta->{$_} = $meta->{$_}->bstr foreach (grep(/^sd_/, keys %{$meta}));
+        print FILE yenc_encode(compress(Data::MessagePack->pack($mpmeta)), ""), "]\n";
     } else {
         print FILE "[";
     }
@@ -3540,27 +3597,29 @@ sub run {
         $expect += $meta{"t_$_"} foreach (qw(cp ln mkdir));
     }
     # only count chattr errors when not tar_mv errors
-    my $echattr = $meta{t_chattrs} - $meta{d_chattrs} <= $meta{tar_mv} ?
+    my $echattr = $meta{t_chattr} - $meta{d_chattr} <= $meta{tar_mv} ?
         0 : $meta{e_chattr};
     if ($meta{verify} && ($meta{sanity} || $meta{preserve})) {
         # expect sums for done cps and cksums for done sums
         $expect += $meta{"d_$_"} foreach (qw(cp sum));
         # expect file chattrs for done cksums and done lns
         $expect += $meta{"d_$_"} foreach (qw(cksum ln));
-        # expect dir chattrs only when no other errors
+        # expect dir chattrs only when tar create or no other errors
         my $errs = sum(map {$meta{"e_$_"}} qw(cksum cp find ln mkdir sum));
-        $expect += $echattr + $errs ? 0 : $meta{t_mkdir};
+        $expect += $echattr + $errs && (!$meta{'create-tar'} || !$meta{last}) ?
+            0 : $meta{t_mkdir};
     } elsif ($meta{verify}) {
         # expect sums for done cps and cksums for done sums
         $expect += $meta{"d_$_"} foreach (qw(cp sum));
     } elsif ($meta{sanity} || $meta{preserve}) {
         # expect file chattrs for done cps and done lns
         $expect += $meta{"d_$_"} foreach (qw(cp ln));
-        # expect dir chattrs only when no other errors
+        # expect dir chattrs only when tar create or no other errors
         my $errs = sum(map {$meta{"e_$_"}} qw(cp find ln mkdir));
         # when errs > 0 and rtree == 0, any chattr errors are from dirs
         # and not files, so should still expect t_mkdir dir chattrs
-        $expect += $echattr + $errs && $meta{rtree} ? 0 : $meta{t_mkdir};
+        $expect += $echattr + $errs && $meta{rtree} && !$meta{'create-tar'} ?
+            0 : $meta{t_mkdir};
     }
     my $actual = sum(map {$meta{"d_$_"}} qw(chattr cksum cp find ln mkdir sum));
     my $errs = sum(map {$meta{"e_$_"}} qw(chattr cksum cp find ln mkdir sum));
@@ -3578,29 +3637,32 @@ sub run {
 # user or all users if invoked as root
 sub stats {
     my $all;
-    my %heads;
     my %types;
     my %users;
 
     # define headers for each table type
-    $heads{Transfers} =
-        [qw(xfers local lan wan dirs files size sums ssize attrs hosts)];
-    $heads{Rates} =
-        [qw(local_min local_max local_avg lan_min lan_max lan_avg wan_min
-            wan_max wan_avg all_min all_max all_avg)];
-    $heads{Tools} =
-        [qw(bbcp bbftp fish fish-tcp gridftp mcp msum rsync shiftc shift-aux)];
-    $heads{Options_1} =
-        [qw(bandwidth buffer clients cpu create-tar exclude extract-tar files
-            force host-list hosts include index-tar interval)];
-    $heads{Options_2} =
-        [qw(io ior iow local net netr netw newer no-cron no-mail no-offline
-            no-preserve no-recall no-sanity no-silent no-verify)];
-    $heads{Options_3} =
-        [qw(older pipeline ports preallocate remote retry secure size split
-            split-tar streams stripe sync threads verify-fast window)];
-    $heads{Errors} =
-        [qw(corruption exception silent throttle chattr cksum cp host ln mkdir sum)];
+    my %heads = (
+        Transfers =>
+            [qw(xfers local lan wan dirs files size sums ssize attrs hosts)],
+        Rates =>
+            [qw(local_min local_max local_avg lan_min lan_max lan_avg wan_min
+                wan_max wan_avg all_min all_max all_avg)],
+        Tools =>
+            [qw(bbcp bbftp fish fish-tcp gridftp mcp msum rsync shift-chattr
+                shift-cp shift-find shift-sum)],
+        Options_1 =>
+            [qw(bandwidth buffer clients cpu create-tar exclude extract-tar
+                files force host-list hosts include index-tar interval)],
+        Options_2 =>
+            [qw(io ior iow local net netr netw newer no-cron no-mail no-offline
+                no-preserve no-recall no-sanity no-silent no-verify)],
+        Options_3 =>
+            [qw(older pipeline ports preallocate remote retry secure size split
+                split-tar streams stripe sync threads verify-fast window)],
+        Errors =>
+            [qw(corruption exception silent throttle chattr cksum cp host ln
+                mkdir sum)],
+    );
 
     # define order in output
     my @order = qw(Transfers Rates Tools Options_1 Options_2 Options_3 Errors);
@@ -3637,7 +3699,6 @@ sub stats {
 
         # derive transfer type
         my $type = "local";
-        my @args = split(/\s+/, $meta{command});
         if ($meta{origin} =~ /\Q$conf{email_domain}\E$/ &&
                 grep(/^picks_.*\Q$conf{email_domain}\E$/, keys %meta)) {
             # original client host is in local domain and remote host picked
@@ -4432,7 +4493,8 @@ sub throttle {
         $disk =~ s/^used/disk/;
         my $left = $used;
         $left =~ s/^used/left/;
-        my $pct = 100 * $cli_load{$used} / ($cli_load{$used} + $cli_load{$left});
+        # avoid divide by zero
+        my $pct = eval{100 * $cli_load{$used} / ($cli_load{$used} + $cli_load{$left})};
         if (defined $meta{$disk} && $pct <= $meta{$disk}) {
             # load has become less than lower threshold
             delete $meta{$disk};
@@ -4612,7 +4674,7 @@ sub throttle {
 
                 # each user initially gets an equal share of the load limit
                 my $per_user = $conf{$key} / scalar(@all_users);
-                my $my_user_index2 = scalar(@all_vals)
+                $my_user_index2 = scalar(@all_vals)
                     if (!defined $my_user_index2);
                 # no throttling needed if this user is under per_user limit
                 next if (sum(@all_vals[
@@ -4665,11 +4727,17 @@ sub throttle {
 # update i/o stats for clients and servers used to mitigate cache effects
 sub track_cache {
     my ($op, $cmd, $args) = @_;
-    return if (
-        !defined $conf{cache_size_client} || !defined $conf{cache_size_server} ||
-        !defined $conf{cache_time_client} || !defined $conf{cache_time_server});
-    return if ($cmd !~ /(?:cksum|cp|sum)/);
     my @srv = ((split(/,/, $op->{srcfs}))[-1], (split(/,/, $op->{dstfs}))[-1]);
+    # keep track of file system stats for plot by file system
+    if ($cmd =~ /(?:find|mkdir|ln|chattr)/) {
+        $meta{"d_${cmd}_$srv[-1]"}++;
+    } elsif ($cmd eq 'cp') {
+        $meta{"s_get_$srv[0]"} += $op->{size};
+        $meta{"s_put_$srv[1]"} += $op->{size};
+    }
+    # file system stats for sum/cksum done later
+
+    return if ($cmd !~ /(?:cksum|cp|sum)/);
     my $host = $opts{host};
     if ($args->[0] =~ /^([^\/]+)%3A/) {
         # remote src so sum done on dst and cksum done on src
@@ -4683,13 +4751,19 @@ sub track_cache {
         # sum and one half of cp always done on local host
         $nload{"io_fs_$srv[0]"} += $op->{size};
         $nload{"io_host_$opts{host}"} += $op->{size};
+        # keep track of file system stats for plot by file system
+        $meta{"s_${cmd}_$srv[0]"} += $op->{size} if ($cmd eq 'sum');
     }
     if ($cmd =~ /(?:cksum|cp)/) {
         # cksum and one half of cp always done on dst (or remote src)
         $nload{"io_fs_$srv[1]"} += $op->{size};
         $nload{"io_host_$host"} += $op->{size};
+        # keep track of file system stats for plot by file system
+        $meta{"s_${cmd}_$srv[1]"} += $op->{size} if ($cmd eq 'cksum');
     }
-    return if ($cmd ne 'cp');
+    return if ($cmd ne 'cp' ||
+        !defined $conf{cache_size_client} || !defined $conf{cache_size_server} ||
+        !defined $conf{cache_time_client} || !defined $conf{cache_time_server});
     # store cache properties for utilization during get()
     $op->{cache_time} = $time;
     $op->{cache_client} = $opts{host};
@@ -4778,15 +4852,15 @@ BEGIN {
 my %fatpacked;
 
 $fatpacked{"Compress/BGZF.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'COMPRESS_BGZF';
-  package Compress::BGZF 0.005;use 5.012;use strict;use warnings;1;
+  package Compress::BGZF 0.006;use 5.012;use strict;use warnings;1;
 COMPRESS_BGZF
 
 $fatpacked{"Compress/BGZF/Reader.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'COMPRESS_BGZF_READER';
-  package Compress::BGZF::Reader;use strict;use warnings;use Carp;use Compress::Zlib;use List::Util qw/sum/;use FileHandle;use constant BGZF_MAGIC=>pack "H*",'1f8b0804';use constant HEAD_BYTES=>12;use constant FOOT_BYTES=>8;sub TIEHANDLE {Compress::BGZF::Reader::new(@_)}sub READ {Compress::BGZF::Reader::_read(@_)}sub READLINE {Compress::BGZF::Reader::getline(@_)}sub SEEK {Compress::BGZF::Reader::_seek(@_)}sub CLOSE {close $_[0]->{fh}}sub TELL {return $_[0]->{u_offset}}sub EOF {return $_[0]->{buffer_len}==-1}sub FILENO {return fileno $_[0]->{fh}}sub usize {return $_[0]->{u_file_size}};sub new_filehandle {my ($class,$fn_in)=@_;croak "input filename required" if (!defined$fn_in);my$fh=FileHandle->new;tie *$fh,$class,$fn_in or croak "failed to tie filehandle";return$fh}sub new {my ($class,$fn_in)=@_;my$self=bless {},$class;$self->{fn_in}=$fn_in or croak "Input name required";open my$fh,'<:raw',$fn_in or croak "Failed to open input file";$self->{fh}=$fh;$self->{buffer}='';$self->{buffer_len}=0;$self->{block_offset}=0;$self->{buffer_offset}=0;$self->{block_size}=0;$self->{file_size}=-s $fn_in;$self->{u_offset}=0;$self->{u_file_size}=0;if (-e "$fn_in.gzi"){$self->_load_index("$fn_in.gzi")}else {$self->_generate_index()}$self->_load_block();return$self}sub _load_block {my ($self,$block_offset)=@_;$self->{buffer_offset}=0;return if (defined$block_offset && $block_offset==$self->{block_offset});if (!defined$block_offset){$block_offset=$self->{block_offset}+ $self->{block_size}}$self->{block_offset}=$block_offset;croak "Read past file end (perhaps corrupted/truncated input?)" if ($self->{block_offset}> $self->{file_size});if ($self->{block_offset}==$self->{file_size}){$self->{buffer}='';$self->{buffer_len}=-1;return}sysseek$self->{fh},$self->{block_offset},0;my ($block_size,$uncompressed_size,$content)=$self->_unpack_block(1);$self->{block_size}=$block_size;$self->{buffer_len}=$uncompressed_size;$self->{buffer}=$content;return}sub _unpack_block {my ($self,$do_unpack)=@_;my@return_values;my ($magic,$mod,$flags,$os,$len_extra)=unpack 'A4A4CCv',_safe_sysread($self->{fh},HEAD_BYTES);my$t=sysseek$self->{fh},0,1;croak "invalid header at $t (corrupt file or not BGZF?)" if ($magic ne BGZF_MAGIC);my$block_size;my$l=0;while ($l < $len_extra){my ($field_id,$field_len)=unpack 'A2v',_safe_sysread($self->{fh},4);if ($field_id eq 'BC'){croak "invalid BC length" if ($field_len!=2);croak "multiple BC fields" if (defined$block_size);$block_size=unpack 'v',_safe_sysread($self->{fh}=>$field_len);$block_size += 1}$l += 4 + $field_len}croak "invalid extra field length" if ($l!=$len_extra);croak "failed to read block size" if (!defined$block_size);push@return_values,$block_size;my$payload_len=$block_size - HEAD_BYTES - FOOT_BYTES - $len_extra;my$content;if ($do_unpack){my$payload=_safe_sysread($self->{fh},$payload_len);my ($i,$status)=inflateInit(-WindowBits=>-&MAX_WBITS());croak "Error during inflate init\n" if ($status!=Z_OK);($content,$status)=$i->inflate($payload);croak "Error during inflate run\n" if ($status!=Z_STREAM_END);my$crc_given=unpack 'V',_safe_sysread($self->{fh}=>4);croak "content CRC32 mismatch" if ($crc_given!=crc32($content))}else {sysseek$self->{fh},$payload_len + 4,1}my$size_given=unpack 'V',_safe_sysread($self->{fh}=>4);croak "content length mismatch" if (defined$content && $size_given!=length($content));push@return_values,$size_given;push@return_values,$content if (defined$content);return@return_values}sub read_data {my ($self,$bytes)=@_;my$r=$self->_read(my$buffer,$bytes);carp "received fewer bytes than requested" if ($r < $bytes && $self->{buffer_len}> -1);$buffer=undef if ($r < 1);return$buffer}sub _read {my$self=shift;my$buf=\shift;my$bytes=shift;my$offset=shift;my$prefix='';if (defined$offset && $offset!=0){$prefix=substr $$buf,0,$offset;$prefix .= "\0" x ($offset - length($$buf))if ($offset > length($$buf))}$$buf='';ITER: while (length($$buf)< $bytes){my$l=length($$buf);my$remaining=$bytes - $l;if ($self->{buffer_offset}+ $remaining <= $self->{buffer_len}){$$buf .= substr$self->{buffer},$self->{buffer_offset},$remaining;$self->{buffer_offset}+= $remaining;$self->_load_block()if ($self->{buffer_offset}==$self->{buffer_len})}else {last ITER if ($self->{buffer_len}< 0);$$buf .= substr$self->{buffer},$self->{buffer_offset};$self->_load_block()}}my$l=length($$buf);$self->{u_offset}+= $l;$$buf=$prefix .$$buf;return$l}sub getline {my ($self)=@_;my$data="";while (1){last if ($self->{buffer_len}< 0);pos($self->{buffer})=$self->{buffer_offset};if ($self->{buffer}=~ m|$/|g){my$pos=pos$self->{buffer};$data .= substr$self->{buffer},$self->{buffer_offset},$pos - $self->{buffer_offset};$self->{buffer_offset}=$pos;$self->_load_block if ($pos==$self->{buffer_len});$self->{u_offset}+= length($data);last}$data .= substr$self->{buffer},$self->{buffer_offset};$self->_load_block}return length($data)> 0 ? $data : undef}sub write_index {my ($self,$fn_out)=@_;croak "missing index output filename" if (!defined$fn_out);$self->_generate_index()if (!defined$self->{idx});my@offsets=@{$self->{idx}};shift@offsets;open my$fh_out,'>:raw',$fn_out;print {$fh_out}pack('Q<',scalar(@offsets));for (@offsets){print {$fh_out}pack('Q<',$_->[0]);print {$fh_out}pack('Q<',$_->[1])}close$fh_out;return}sub _load_index {my ($self,$fn_in)=@_;croak "missing index input filename" if (!defined$fn_in);open my$fh_in,'<:raw',$fn_in or croak "error opening index";read($fh_in,my$n_offsets,8)or croak "failed to read first quad";$n_offsets=unpack 'Q<',$n_offsets;my@idx;for (0..$n_offsets-1){read($fh_in,my$buff,16)or croak "error reading index";$idx[$_]=[unpack 'Q<Q<',$buff ]}close$fh_in;unshift@idx,[0,0];$self->{u_file_size}=$idx[-1]->[1];my$c_size=$idx[-1]->[0];sysseek$self->{fh},$idx[-1]->[0],0;my ($c,$u)=$self->_unpack_block(0);$self->{u_file_size}+= $u;$c_size += $c;while ($c_size < $self->{file_size}){push@idx,[$idx[-1]->[0]+$c,$idx[-1]->[1]+$u];sysseek$self->{fh},$idx[-1]->[0],0;($c,$u)=$self->_unpack_block(0);$self->{u_file_size}+= $u;$c_size += $c}croak "Unexpected file size/last index mismatch ($c_size v $self->{file_size})" if ($c_size!=$self->{file_size});$self->{idx}=[@idx];$self->{ridx}->{$_->[0]}=$_->[1]for (@idx);sysseek$self->{fh},$self->{block_offset},0;return}sub _generate_index {my ($self)=@_;my$uncmp_offset=0;my$cmp_offset=0;my$i=0;$self->{u_file_size}=0;$self->{idx}=[];$self->{ridx}={};sysseek$self->{fh},0,0;while ($cmp_offset < $self->{file_size}){push @{$self->{idx}},[$cmp_offset,$uncmp_offset];$self->{ridx}->{$cmp_offset}=$uncmp_offset;my ($block_size,$uncompressed_size)=$self->_unpack_block(0);$cmp_offset += $block_size;$uncmp_offset += $uncompressed_size;$self->{u_file_size}+= $uncompressed_size}sysseek$self->{fh},$self->{block_offset},0;return}sub move_to {my ($self,@args)=@_;$self->_seek(@args);return}sub _seek {my ($self,$pos,$whence)=@_;$pos += $self->{u_offset}if ($whence==1);$pos=$self->{u_file_size}+ $pos if ($whence==2);return if ($pos < 0);if ($pos >= $self->{u_file_size}){$self->{buffer_len}=-1;$self->{u_offset}=$pos;$self->{block_offset}=$pos;return 1}my$s=scalar @{$self->{idx}};my$idx=int($pos/($self->{u_file_size})* $s);while (1){if ($pos < $self->{idx}->[$idx]->[1]){--$idx;next}if ($idx+1 < $s && $pos >= $self->{idx}->[$idx+1]->[1]){++$idx;next}last}my$block_o=$self->{idx}->[$idx]->[0];my$block_o_u=$self->{idx}->[$idx]->[1];my$buff_o=$pos - $block_o_u;$self->_load_block($block_o);$self->{buffer_offset}=$buff_o;$self->{u_offset}=$block_o_u + $buff_o;return 1}sub get_vo {my ($self)=@_;return ($self->{block_offset}<< 16)| $self->{buffer_offset}}sub move_to_vo {my ($self,$vo)=@_;my$block_o=$vo >> 16;my$buff_o=$vo ^ ($block_o << 16);$self->_load_block($block_o);$self->{buffer_offset}=$buff_o;croak "invalid block offset" if (!defined$self->{ridx}->{$block_o});$self->{u_offset}=$self->{ridx}->{$block_o}+ $buff_o;return}sub _safe_sysread {my ($fh,$len)=@_;my$buf='';my$r=sysread$fh,$buf,$len;croak "returned unexpected byte count" if ($r!=$len);return$buf}1;
+  package Compress::BGZF::Reader;use strict;use warnings;use Carp;use Compress::Zlib;use List::Util qw/sum/;use FileHandle;use constant BGZF_MAGIC=>pack "H*",'1f8b0804';use constant HEAD_BYTES=>12;use constant FOOT_BYTES=>8;sub TIEHANDLE {Compress::BGZF::Reader::new(@_)}sub READ {Compress::BGZF::Reader::_read(@_)}sub READLINE {Compress::BGZF::Reader::getline(@_)}sub SEEK {Compress::BGZF::Reader::_seek(@_)}sub CLOSE {close $_[0]->{fh}}sub TELL {return $_[0]->{u_offset}}sub EOF {return $_[0]->{buffer_len}==-1}sub FILENO {return fileno $_[0]->{fh}}sub usize {return $_[0]->{u_file_size}};sub new_filehandle {my ($class,$fn_in)=@_;croak "input filename required" if (!defined$fn_in);my$fh=FileHandle->new;tie *$fh,$class,$fn_in or croak "failed to tie filehandle";return$fh}sub new {my ($class,$fn_in)=@_;my$self=bless {},$class;$self->{fn_in}=$fn_in or croak "Input name required";open my$fh,'<:raw',$fn_in or croak "Failed to open input file";$self->{fh}=$fh;$self->{buffer}='';$self->{buffer_len}=0;$self->{block_offset}=0;$self->{buffer_offset}=0;$self->{block_size}=0;$self->{file_size}=-s $fn_in;$self->{u_offset}=0;$self->{u_file_size}=0;if (-e "$fn_in.gzi"){$self->_load_index("$fn_in.gzi")}else {$self->_generate_index()}$self->_load_block();return$self}sub _load_block {my ($self,$block_offset)=@_;$self->{buffer_offset}=0;return if (defined$block_offset && $block_offset==$self->{block_offset});if (!defined$block_offset){$block_offset=$self->{block_offset}+ $self->{block_size}}$self->{block_offset}=$block_offset;croak "Read past file end (perhaps corrupted/truncated input?)" if ($self->{block_offset}> $self->{file_size});if ($self->{block_offset}==$self->{file_size}){$self->{buffer}='';$self->{buffer_len}=-1;return}sysseek$self->{fh},$self->{block_offset},0;my ($block_size,$uncompressed_size,$content)=$self->_unpack_block(1);$self->{block_size}=$block_size;$self->{buffer_len}=$uncompressed_size;$self->{buffer}=$content;return}sub _unpack_block {my ($self,$do_unpack)=@_;my@return_values;my ($magic,$mod,$flags,$os,$len_extra)=unpack 'A4A4CCv',_safe_sysread($self->{fh},HEAD_BYTES);my$t=sysseek$self->{fh},0,1;croak "invalid header at $t (corrupt file or not BGZF?)" if ($magic ne BGZF_MAGIC);my$block_size;my$l=0;while ($l < $len_extra){my ($field_id,$field_len)=unpack 'A2v',_safe_sysread($self->{fh},4);if ($field_id eq 'BC'){croak "invalid BC length" if ($field_len!=2);croak "multiple BC fields" if (defined$block_size);$block_size=unpack 'v',_safe_sysread($self->{fh}=>$field_len);$block_size += 1}$l += 4 + $field_len}croak "invalid extra field length" if ($l!=$len_extra);croak "failed to read block size" if (!defined$block_size);push@return_values,$block_size;my$payload_len=$block_size - HEAD_BYTES - FOOT_BYTES - $len_extra;my$content;if ($do_unpack){my$payload=_safe_sysread($self->{fh},$payload_len);my ($i,$status)=inflateInit(-WindowBits=>-&MAX_WBITS());croak "Error during inflate init\n" if ($status!=Z_OK);($content,$status)=$i->inflate($payload);croak "Error during inflate run\n" if ($status!=Z_STREAM_END);my$crc_given=unpack 'V',_safe_sysread($self->{fh}=>4);croak "content CRC32 mismatch" if ($crc_given!=crc32($content))}else {sysseek$self->{fh},$payload_len + 4,1}my$size_given=unpack 'V',_safe_sysread($self->{fh}=>4);croak "content length mismatch" if (defined$content && $size_given!=length($content));push@return_values,$size_given;push@return_values,$content if (defined$content);return@return_values}sub read_data {my ($self,$bytes)=@_;my$r=$self->_read(my$buffer,$bytes);carp "received fewer bytes than requested" if ($r < $bytes && $self->{buffer_len}> -1);$buffer=undef if ($r < 1);return$buffer}sub _read {my$self=shift;my$buf=\shift;my$bytes=shift;my$offset=shift;my$prefix='';if (defined$offset && $offset!=0){$prefix=substr $$buf,0,$offset;$prefix .= "\0" x ($offset - length($$buf))if ($offset > length($$buf))}$$buf='';ITER: while (length($$buf)< $bytes){my$l=length($$buf);my$remaining=$bytes - $l;if ($self->{buffer_offset}+ $remaining <= $self->{buffer_len}){$$buf .= substr$self->{buffer},$self->{buffer_offset},$remaining;$self->{buffer_offset}+= $remaining;$self->_load_block()if ($self->{buffer_offset}==$self->{buffer_len})}else {last ITER if ($self->{buffer_len}< 0);$$buf .= substr$self->{buffer},$self->{buffer_offset};$self->_load_block()}}my$l=length($$buf);$self->{u_offset}+= $l;$$buf=$prefix .$$buf;return$l}sub getline {my ($self)=@_;my$data='';while (1){last if ($self->{buffer_len}< 0);pos($self->{buffer})=$self->{buffer_offset};if ($self->{buffer}=~ m|$/|g){my$pos=pos$self->{buffer};$data .= substr$self->{buffer},$self->{buffer_offset},$pos - $self->{buffer_offset};$self->{buffer_offset}=$pos;$self->_load_block if ($pos==$self->{buffer_len});$self->{u_offset}+= length($data);last}$data .= substr$self->{buffer},$self->{buffer_offset};$self->_load_block}return length($data)> 0 ? $data : undef}sub write_index {my ($self,$fn_out)=@_;croak "missing index output filename" if (!defined$fn_out);$self->_generate_index()if (!defined$self->{idx});my@offsets=@{$self->{idx}};shift@offsets;open my$fh_out,'>:raw',$fn_out;print {$fh_out}pack('Q<',scalar(@offsets));for (@offsets){print {$fh_out}pack('Q<',$_->[0]);print {$fh_out}pack('Q<',$_->[1])}close$fh_out;return}sub _load_index {my ($self,$fn_in)=@_;croak "missing index input filename" if (!defined$fn_in);open my$fh_in,'<:raw',$fn_in or croak "error opening index";read($fh_in,my$n_offsets,8)or croak "failed to read first quad";$n_offsets=unpack 'Q<',$n_offsets;my@idx;for (0..$n_offsets-1){read($fh_in,my$buff,16)or croak "error reading index";$idx[$_]=[unpack 'Q<Q<',$buff ]}close$fh_in;unshift@idx,[0,0];$self->{u_file_size}=$idx[-1]->[1];my$c_size=$idx[-1]->[0];sysseek$self->{fh},$idx[-1]->[0],0;my ($c,$u)=$self->_unpack_block(0);$self->{u_file_size}+= $u;$c_size += $c;while ($c_size < $self->{file_size}){push@idx,[$idx[-1]->[0]+$c,$idx[-1]->[1]+$u];sysseek$self->{fh},$idx[-1]->[0],0;($c,$u)=$self->_unpack_block(0);$self->{u_file_size}+= $u;$c_size += $c}croak "Unexpected file size/last index mismatch ($c_size v $self->{file_size})" if ($c_size!=$self->{file_size});$self->{idx}=[@idx];$self->{ridx}->{$_->[0]}=$_->[1]for (@idx);sysseek$self->{fh},$self->{block_offset},0;return}sub _generate_index {my ($self)=@_;my$uncmp_offset=0;my$cmp_offset=0;my$i=0;$self->{u_file_size}=0;$self->{idx}=[];$self->{ridx}={};sysseek$self->{fh},0,0;while ($cmp_offset < $self->{file_size}){push @{$self->{idx}},[$cmp_offset,$uncmp_offset];$self->{ridx}->{$cmp_offset}=$uncmp_offset;my ($block_size,$uncompressed_size)=$self->_unpack_block(0);$cmp_offset += $block_size;$uncmp_offset += $uncompressed_size;$self->{u_file_size}+= $uncompressed_size}sysseek$self->{fh},$self->{block_offset},0;return}sub move_to {my ($self,@args)=@_;$self->_seek(@args);return}sub _seek {my ($self,$pos,$whence)=@_;$pos += $self->{u_offset}if ($whence==1);$pos=$self->{u_file_size}+ $pos if ($whence==2);return if ($pos < 0);if ($pos >= $self->{u_file_size}){$self->{buffer_len}=-1;$self->{u_offset}=$pos;$self->{block_offset}=$pos;return 1}my$s=scalar @{$self->{idx}};my$idx=int($pos/($self->{u_file_size})* $s);while (1){if ($pos < $self->{idx}->[$idx]->[1]){--$idx;next}if ($idx+1 < $s && $pos >= $self->{idx}->[$idx+1]->[1]){++$idx;next}last}my$block_o=$self->{idx}->[$idx]->[0];my$block_o_u=$self->{idx}->[$idx]->[1];my$buff_o=$pos - $block_o_u;$self->_load_block($block_o);$self->{buffer_offset}=$buff_o;$self->{u_offset}=$block_o_u + $buff_o;return 1}sub get_vo {my ($self)=@_;return ($self->{block_offset}<< 16)| $self->{buffer_offset}}sub move_to_vo {my ($self,$vo)=@_;my$block_o=$vo >> 16;my$buff_o=$vo ^ ($block_o << 16);$self->_load_block($block_o);$self->{buffer_offset}=$buff_o;croak "invalid block offset" if (!defined$self->{ridx}->{$block_o});$self->{u_offset}=$self->{ridx}->{$block_o}+ $buff_o;return}sub _safe_sysread {my ($fh,$len)=@_;my$buf='';my$r=sysread$fh,$buf,$len;croak "returned unexpected byte count" if ($r!=$len);return$buf}1;
 COMPRESS_BGZF_READER
 
 $fatpacked{"Compress/BGZF/Writer.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'COMPRESS_BGZF_WRITER';
-  package Compress::BGZF::Writer;use strict;use warnings;use Carp;use Compress::Zlib;use IO::Compress::RawDeflate qw/rawdeflate $RawDeflateError/;use constant HEAD_BYTES=>18;use constant FOOT_BYTES=>8;use constant FLUSH_SIZE=>2**16 - HEAD_BYTES - FOOT_BYTES - 1;use constant BGZF_HEADER=>pack "H*",'1f8b08040000000000ff060042430200';sub TIEHANDLE {Compress::BGZF::Writer::new(@_)}sub PRINT {Compress::BGZF::Writer::_queue(@_)}sub CLOSE {Compress::BGZF::Writer::finalize(@_)}sub new_filehandle {my ($class,$fn_out)=@_;open my$fh,'<',undef;tie *$fh,$class,$fn_out or croak "failed to tie filehandle";return$fh}sub new {my ($class,$fn_out)=@_;my$self=bless {},$class;if (defined$fn_out){open$self->{fh},">$fn_out" or croak "Error opening file for writing"}else {$self->{fh}=\*STDOUT}binmode$self->{fh};$self->{c_level}=Z_DEFAULT_COMPRESSION;$self->{buffer}='';$self->{block_offset}=0;$self->{buffer_offset}=0;$self->{u_offset}=0;$self->{idx}=[];return$self}sub set_level {my ($self,$level)=@_;croak "Invalid compression level (allowed 0-9)" if ($level !~ /^\d$/);$self->{c_level}=$level;return}sub add_data {my ($self,$content)=@_;my$vo=($self->{block_offset}<< 16)| $self->{buffer_offset};$self->_queue($content);return$vo}sub _queue {my ($self,$content)=@_;$self->{buffer}.= $content;while (length($self->{buffer})>= FLUSH_SIZE){my$chunk=substr$self->{buffer},0,FLUSH_SIZE,'';my$unwritten=$self->_write_block($chunk);$self->{buffer}=$unwritten .$self->{buffer}if (length($unwritten))}$self->{buffer_offset}=length$self->{buffer};return}sub _write_block {my ($self,$chunk)=@_;my$chunk_len=length($chunk);rawdeflate(\$chunk,\my$payload,-Level=>$self->{c_level})or croak "deflate failed: $RawDeflateError\n";my$trimmed='';while (length($payload)> FLUSH_SIZE){my$trim_len=int($chunk_len * 0.05);$trimmed=substr($chunk,-$trim_len,$trim_len,'').$trimmed;rawdeflate(\$chunk,\$payload,-Level=>$self->{c_level})or croak "deflate failed: $RawDeflateError\n";$chunk_len=length($chunk)}my$block_size=length($payload)+ HEAD_BYTES + FOOT_BYTES;croak "Internal error: block size > 65536" if ($block_size > 2**16);print {$self->{fh}}pack("a*va*VV",BGZF_HEADER,$block_size - 1,$payload,crc32($chunk),$chunk_len,)or croak "Error writing compressed block";$self->{block_offset}+= $block_size;$self->{u_offset}+= $chunk_len;push @{$self->{idx}},[$self->{block_offset},$self->{u_offset}];return$trimmed}sub finalize {my ($self)=@_;while (length($self->{buffer})> 0){croak "file closed but buffer not empty" if (!defined fileno($self->{fh}));my$chunk=substr$self->{buffer},0,FLUSH_SIZE,'';my$unwritten=$self->_write_block($chunk);$self->{buffer}=$unwritten .$self->{buffer}if (length($unwritten))}close$self->{fh};return}sub write_index {my ($self,$fn_out)=@_;$self->finalize();croak "missing index output filename" if (!defined$fn_out);open my$fh_out,'>:raw',$fn_out;my@offsets=@{$self->{idx}};pop@offsets;print {$fh_out}pack('Q<',scalar(@offsets));print {$fh_out}pack('Q<Q<',@{$_})for (@offsets);close$fh_out;return}sub DESTROY {my ($self)=@_;$self->finalize();return}1;
+  package Compress::BGZF::Writer;use strict;use warnings;use Carp;use Compress::Zlib;use IO::Compress::RawDeflate qw/rawdeflate $RawDeflateError/;use constant HEAD_BYTES=>18;use constant FOOT_BYTES=>8;use constant FLUSH_SIZE=>2**16 - HEAD_BYTES - FOOT_BYTES - 1;use constant BGZF_HEADER=>pack "H*",'1f8b08040000000000ff060042430200';sub TIEHANDLE {Compress::BGZF::Writer::new(@_)}sub PRINT {Compress::BGZF::Writer::_queue(@_)}sub CLOSE {Compress::BGZF::Writer::finalize(@_)}sub new_filehandle {my ($class,$fn_out)=@_;open my$fh,'<',undef;tie *$fh,$class,$fn_out or croak "failed to tie filehandle";return$fh}sub new {my ($class,$fn_out)=@_;my$self=bless {},$class;if (defined$fn_out){open$self->{fh},">$fn_out" or croak "Error opening file for writing"}else {$self->{fh}=\*STDOUT}binmode$self->{fh};$self->{c_level}=Z_DEFAULT_COMPRESSION;$self->{buffer}='';$self->{block_offset}=0;$self->{buffer_offset}=0;$self->{u_offset}=0;$self->{idx}=[];return$self}sub set_level {my ($self,$level)=@_;croak "Invalid compression level (allowed 0-9)" if ($level !~ /^\d$/);$self->{c_level}=$level;return}sub add_data {my ($self,$content)=@_;my$vo=($self->{block_offset}<< 16)| $self->{buffer_offset};$self->_queue($content);return$vo}sub _queue {my ($self,$content)=@_;$self->{buffer}.= $content;while (length($self->{buffer})>= FLUSH_SIZE){my$chunk=substr$self->{buffer},0,FLUSH_SIZE,'';my$unwritten=$self->_write_block($chunk);$self->{buffer}=$unwritten .$self->{buffer}if (length($unwritten))}$self->{buffer_offset}=length$self->{buffer};return}sub _write_block {my ($self,$chunk)=@_;my$chunk_len=length($chunk);rawdeflate(\$chunk,\my$payload,-Level=>$self->{c_level})or croak "deflate failed: $RawDeflateError\n";my$trimmed='';while (length($payload)> FLUSH_SIZE){my$trim_len=int($chunk_len * 0.05);$trimmed=substr($chunk,-$trim_len,$trim_len,'').$trimmed;rawdeflate(\$chunk,\$payload,-Level=>$self->{c_level})or croak "deflate failed: $RawDeflateError\n";$chunk_len=length($chunk)}my$block_size=length($payload)+ HEAD_BYTES + FOOT_BYTES;croak "Internal error: block size > 65536" if ($block_size > 2**16);print {$self->{fh}}pack("a*va*VV",BGZF_HEADER,$block_size - 1,$payload,crc32($chunk),$chunk_len,)or croak "Error writing compressed block";$self->{block_offset}+= $block_size;$self->{u_offset}+= $chunk_len;push @{$self->{idx}},[$self->{block_offset},$self->{u_offset}];return$trimmed}sub finalize {my ($self)=@_;while (length($self->{buffer})> 0){croak "file closed but buffer not empty" if (!defined fileno($self->{fh}));my$chunk=substr$self->{buffer},0,FLUSH_SIZE,'';my$unwritten=$self->_write_block($chunk);$self->{buffer}=$unwritten .$self->{buffer}if (length($unwritten))}if (defined fileno($self->{fh})){close$self->{fh}or croak "Error closing compressed file"}return}sub write_index {my ($self,$fn_out)=@_;$self->finalize();croak "missing index output filename" if (!defined$fn_out);open my$fh_out,'>:raw',$fn_out or croak "Error opening index file for writing";my@offsets=@{$self->{idx}};pop@offsets;print {$fh_out}pack('Q<',scalar(@offsets))or croak "Error printing to index file";for (@offsets){print {$fh_out}pack('Q<Q<',@{$_})or croak "Error printing offset to index file"}close$fh_out or croak "Error closing index file after writing";return}sub DESTROY {my ($self)=@_;$self->finalize();return}1;
 COMPRESS_BGZF_WRITER
 
 $fatpacked{"Data/MessagePack.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'DATA_MESSAGEPACK';

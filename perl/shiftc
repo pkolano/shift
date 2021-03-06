@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 #
-# Copyright (C) 2012-2019 United States Government as represented by the
+# Copyright (C) 2012-2021 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration
 # (NASA).  All Rights Reserved.
 #
@@ -83,7 +83,7 @@ use constant SFTP_TRUNC => 0x10;
 use constant SFTP_WRITE => 0x02;
 use constant SFTP_EXCL => 0x20;
 
-our $VERSION = 6.03;
+our $VERSION = 7.08;
 
 $Data::Dumper::Indent = 0;
 $Data::Dumper::Purity = 1;
@@ -201,6 +201,7 @@ if ($opts{r} || $opts{s}) {
 ###################
 #### show help ####
 ###################
+print STDERR "Using version $VERSION\n" if ($opts{v});
 $opts{h} = 1 if (scalar(@ARGV) == 0 && !$opts{g});
 if ($opts{h}) {
     print "Usage: $opts{base0} [OPTION]... COMMAND\n";
@@ -225,7 +226,6 @@ if ($opts{h}) {
     print "    -v           verbose mode\n";
     exit;
 }
-print STDERR "Using version $VERSION\n" if ($opts{v});
 
 ###############################
 #### execute local command ####
@@ -276,12 +276,15 @@ if (scalar(@ARGV) > 0) {
 ####################
 my $agent_sock;
 if (!$opts{n}) {
-    my @agents = glob("$opts{tmp_d}/ssh-*/agent.*");
-    push(@agents, glob("/tmp/ssh-*/agent.*")) if ($opts{tmp_d} ne "/tmp");
+    # store $< or else getuid() will be run on every glob item
+    my $uid = $<;
+    # use multi-stage glob in less elegant, but more audit-friendly fashion
+    my @agents = grep {(stat $_)[4] == $uid} (glob("/tmp/ssh-*"),
+        $opts{tmp_d} ne "/tmp" ? glob("$opts{tmp_d}/ssh-*") : ());
+    @agents = map {glob("$_/agent.*")} @agents;
     unshift(@agents, $ENV{SSH_AUTH_SOCK});
     foreach my $agent (@agents) {
-        my @stat = stat $agent;
-        next if ($stat[4] != $< || ! -S $agent);
+        next if (! -S $agent);
         print STDERR "Checking validity of agent socket $agent\n" if ($opts{v});
         $ENV{SSH_AUTH_SOCK} = $agent;
         my $out = open3_get([-1, undef], "ssh-add -l");
@@ -444,6 +447,9 @@ if ($opts{p} ne 'none' && (!$agent_key || $opts{g})) {
     my $time = $opts{d} * 24 * 60 * 60;
     $agent_key_time = time + $time;
     $agent_key = "$opts{I}/meshkey.$agent_key_time";
+    die "Unable to write key $agent_key: check directory permissions/acls\n"
+        if (!open(TMP, '>', $agent_key));
+    close TMP;
     print STDERR "Generating key on $opts{p} (provide login information)\n";
     print open3_get([-1, $agent_key, undef],
         "ssh $opts{ssh_q} -Ax -oPubkeyAuthentication=no $opts{ssh_l} $opts{p} mesh-keygen " . $opts{'keygen-user'});
@@ -568,12 +574,16 @@ if (scalar(@ARGV) > $argc) {
 ###################
 #### find sftp ####
 ###################
-my @sftps = glob("$opts{tmp_d}/mesh-*/sftp.*");
+# store $< or else getuid() will be run on every glob item
+my $uid = $<;
+# use multi-stage glob in less elegant, but more audit-friendly fashion
+my @sftps = grep {(stat $_)[4] == $uid} (glob("$opts{tmp_d}/mesh-*"));
+@sftps = map {glob("$_/sftp.*")} @sftps;
 my $sftp_time = -1;
 my $sftp_sock;
 foreach my $sftp (@sftps) {
     my @stat = stat $sftp;
-    next if ($stat[4] != $< || ! -S $sftp || $stat[9] < $sftp_time);
+    next if (! -S $sftp || $stat[9] < $sftp_time);
     print STDERR "Checking validity of sftp socket $sftp\n" if ($opts{v});
     my $sftpd = IO::Socket::UNIX->new(
         Peer => $sftp,
@@ -1198,8 +1208,12 @@ sub shift_ {
         if ($run =~ /shift/) {
             # send keepalive
             if ($opts{id}) {
-                my $out = shift_mgr("--alive --id=$opts{id} --host=$host");
-                shift_stop() if ($out =~ /stop/);
+                # skip if there is already a keepalive running
+                $run = open3_get([-1, undef, -1], "ps -xo command");
+                if ($run !~ /--alive --id=$opts{id} --host=$host/) {
+                    my $out = shift_mgr("--alive --id=$opts{id} --host=$host");
+                    shift_stop() if ($out =~ /stop/);
+                }
             }
             exit;
         }
@@ -1566,7 +1580,7 @@ sub shift_ {
         STDOUT->flush;
         POSIX::_exit(1) if ($out !~ /done/);
     } else {
-        print STDERR "Detaching process (use --status option to monitor progress)\n";
+        print STDERR "Detaching process (use --status or --monitor to track progress)\n";
     }
     # use _exit to avoid END block processing
     POSIX::_exit(0);
@@ -1892,18 +1906,34 @@ sub shift_latency {
     foreach my $host (keys %{$rtthost}) {
         next if ($host eq 'localhost' || $rtts{$host});
         # compute round trip times for tcp tuning
-        my $time;
-        if ($^O ne 'MSWin32') {
+        my ($rc, $time);
+        if ($^O eq 'MSWin32') {
+            # try icmp ping command first
+            my $fhpid = open3_run([-1, undef, -1],
+                "ping", "-n", "1", "-w", "2", $host);
+            while (defined $fhpid && defined ($_ = $fhpid->[1]->getline)) {
+                if (/Average\s*=\s*(\d+)\s*ms/) {
+                    # convert milliseconds to seconds
+                    $time = $1 / 1000;
+                    last if ($time > 0);
+                }
+            }
+            open3_wait($fhpid);
+            $rc = $? >> 8;
+            $rc = ($rc >= 1 && $rc <= 2) ? -1 : 0;
+        } else {
             # try icmp ping command first
             my $fhpid = open3_run([-1, undef, -1], "ping", "-c1", "-W2", $host);
             while (defined $fhpid && defined ($_ = $fhpid->[1]->getline)) {
                 if (/[^\/]([\d.]+)\//) {
                     # convert milliseconds to seconds
                     $time = $1 / 1000;
-                    last;
+                    last if ($time > 0);
                 }
             }
             open3_wait($fhpid);
+            $rc = $? >> 8;
+            $rc = ($rc >= 1 && $rc <= 2) ? -1 : 0;
         }
         if (!$time) {
             # use tcp echo port as backup to icmp ping
@@ -1916,13 +1946,13 @@ sub shift_latency {
                 };
                 next if (!$np);
             }
-            my $rc;
             eval {
                 # there may still be an exception from undefined subroutine
-                ($rc, $time) = $np->ping($host);
+                (undef, $time) = $np->ping($host);
+                $rc = $time ? 0 : -1;
             };
 
-            if (!$rc) {
+            if (!$time) {
                 # use ssh syn ping as backup to tcp echo port
                 if (!$nps) {
                     # redhat/centos do not have core Time::HiRes by default
@@ -1937,12 +1967,14 @@ sub shift_latency {
                 eval {
                     # there may still be an exception from undefined subroutine
                     $nps->ping($host);
-                    ($rc, $time) = $nps->ack;
+                    (undef, $time) = $nps->ack;
+                    $rc = $time ? 0 : -1;
                 };
-                $time /= 2;
             }
         }
-        $rtts{$host} = $time if ($time);
+        if ($time || $rc) {
+            $rtts{$host} = $time ? $time : $rc;
+        }
     }
 
     return scalar(keys %rtts) > 0 ? "args=latency " .  join(" ",
@@ -2028,13 +2060,16 @@ sub shift_loop {
     open(STDERR, ">/dev/null");
 
     # find agents loaded with a key from ~/.ssh/id* for other hosts
-    my @agents = glob("$opts{tmp_d}/ssh-*/agent.*");
-    push(@agents, glob("/tmp/ssh-*/agent.*")) if ($opts{tmp_d} ne "/tmp");
+    # store $< or else getuid() will be run on every glob item
+    my $uid = $<;
+    # use multi-stage glob in less elegant, but more audit-friendly fashion
+    my @agents = grep {(stat $_)[4] == $uid} (glob("/tmp/ssh-*"),
+        $opts{tmp_d} ne "/tmp" ? glob("$opts{tmp_d}/ssh-*") : ());
+    @agents = map {glob("$_/agent.*")} @agents;
     unshift(@agents, $ENV{SSH_AUTH_SOCK});
     my @host_agents;
     foreach my $agent (@agents) {
-        my @stat = stat $agent;
-        next if ($stat[4] != $< || ! -S $agent);
+        next if (! -S $agent);
         $ENV{SSH_AUTH_SOCK} = $agent;
         my $out = open3_get([-1, undef, -1], "ssh-add -l");
         push(@host_agents, $agent) if ($out =~ /\.ssh.id/);
@@ -2131,7 +2166,6 @@ sub shift_loop {
 
         my $run = time;
         my %ops;
-        my %counts;
         open($taskfh, '<', $task);
         while (my $line = <$taskfh>) {
             $line =~ s/\s+$//;
@@ -2246,8 +2280,6 @@ sub shift_loop {
                 shift_stop();
             } else {
                 $ops{$line} = \%op;
-                # keep track of counts for non-io rates
-                $counts{$cmd}++;
                 delete $op{state};
                 delete $op{text};
                 $op{tar_name} = unescape($op{tar_name}) if ($op{tar_name});
@@ -2361,15 +2393,27 @@ sub shift_loop {
         # handle cron after opts have been received from manager
         shift_cron() if (!$opts{crontab} && $opts{cron} && $opts{id} !~ /\D/);
 
-        $size = transport('end');
+        # subtract i/o not actually done due to rsync size/time match
+        $size = -transport('end');
         my $time = time - $run;
-        my $iorate = $rsize / max($time, 1);
+        my $count;
+        while (my ($op, $ref) = each %ops) {
+            # add i/o successfully completed
+            next if ($ref->{text} =~ /\\[EW]/);
+            if ($op =~ /(?:^|\s)args=(?:cp|cksum|sum)(?:,|\s|$)/) {
+                $size += $ref->{size};
+            } else {
+                $count++;
+            }
+        }
+        my $iorate = max(1, $size / max($time, 1));
+        my $metarate = max(1, $count / max($time, 1));
+
         my $fhpid;
         my %sumfh;
         while (my ($op, $ref) = each %ops) {
             my $cmd = $op =~ /(?:^|\s)args=(\w+)(?:,|\s|$)/ ? $1 : undef;
-            my $rate = $cmd =~ /^(?:cp|cksum|sum)$/ ? $iorate :
-                max(int($counts{$cmd} / max($time, 1)), 1);
+            my $rate = $cmd =~ /^(?:cp|cksum|sum)$/ ? $iorate : $metarate;
             $op =~ s/(?:state|text)=\S+\s?//g;
             $op =~ s/\s+$//;
             my $text = $ref->{text};
@@ -2378,7 +2422,6 @@ sub shift_loop {
             if ($text =~ s/\\H/,/g) {
                 $text =~ s/^,//;
                 print $logfh "$op state=done$tool time=$time rate=$rate hash=$text\n";
-                $size += $ref->{size};
                 if ($opts{'index-tar'} && $opts{verify}) {
                     if (!defined $fhpid) {
                         $fhpid = shift_mgr("--lock");
@@ -2408,14 +2451,15 @@ sub shift_loop {
             } elsif ($text =~ s/\\W//g) {
                 print $logfh "$op state=warn$tool text=" . escape($text) . "\n";
             } else {
-                print $logfh "$op state=done$tool time=$time rate=$rate\n";
-                # rsync size is already included in total
-                $size += $ref->{size} if ($ref->{tool} ne 'rsync' &&
-                    ($ref->{local} || $op =~ /(?:^|\s)args=(?:cp|sum)/));
+                print $logfh "$op state=done$tool time=$time";
+                print $logfh " rate=$rate" if ($size > 0 || $rate != $iorate);
+                print $logfh "\n";
             }
         }
         open3_wait($fhpid);
         close $_ foreach (values %sumfh);
+        # size may be negative if only rsync with no i/o
+        $size = 0 if ($size < 0);
     }
     exit;
 }
@@ -2595,12 +2639,21 @@ sub shift_mounts {
 ########################
 sub shift_networks {
     my $net;
-    foreach (qw(rmem_max wmem_max)) {
-        if (open(FILE, "/proc/sys/net/core/$_")) {
-            my $tmp = <FILE>;
+    if ($^O eq 'darwin') {
+        foreach my $d (qw(rcv snd)) {
+            my $tmp = open3_get([-1, undef, -1],
+                "sysctl -n net.inet.tcp.auto${d}bufmax");
             chomp $tmp;
             $net = $tmp if ($tmp > $net);
-            close FILE;
+        }
+    } else {
+        foreach (qw(rmem_max wmem_max)) {
+            if (open(FILE, "/proc/sys/net/core/$_")) {
+                my $tmp = <FILE>;
+                chomp $tmp;
+                $net = $tmp if ($tmp > $net);
+                close FILE;
+            }
         }
     }
     $net = ":tcpwin_$net" if ($net);
@@ -2694,7 +2747,8 @@ sub tar_extract {
         sftp_error($ref, "Unable to seek in tar file $src");
         return;
     }
-    binmode $fh;
+    # Net::Foreign::SFTP does not support binmode
+    binmode $fh if ($shost eq 'localhost');
 
     my %real;
     my ($eof, $head, $nfiles);
@@ -2810,7 +2864,8 @@ sub tar_extract {
         # include files
         if (defined $opts{include}) {
             my $found;
-            foreach my $re (@{$opts{include}}) {
+            foreach (@{$opts{include}}) {
+                my $re = /^\\Q/ ? quotemeta(substr($_, 2)) : $_;
                 next if (eval {$attrs[0] !~ /$re/});
                 $found = 1;
                 last;
@@ -2820,7 +2875,8 @@ sub tar_extract {
         # exclude files
         if (defined $opts{exclude}) {
             my $found;
-            foreach my $re (@{$opts{exclude}}) {
+            foreach (@{$opts{exclude}}) {
+                my $re = /^\\Q/ ? quotemeta(substr($_, 2)) : $_;
                 next if (eval {$attrs[0] !~ /$re/});
                 $found = 1;
                 last;
@@ -3438,7 +3494,7 @@ sub transport_bbftp {
     }
     return if (!$tmp);
 
-    my $dashe = $opts{ports} ? " -e $opts{ports}" : "";
+    my $dashe = $opts{ports} ? " -f -e $opts{ports}" : "";
     my $dashl = $host ne 'localhost' ? $opts{ssh} : "bbftpd -s$dashe";
     $dashe = "-E 'bbftpd $dashe'" if ($dashe);
     # remove user name (if applicable)
@@ -3552,7 +3608,7 @@ sub transport_chattr {
             } else {
                 my @attrs = split(/,/, $ref->{attrs});
                 # don't preallocate small files or files above given sparsity
-                next if ($attrs[7] < 4194304 || 
+                next if ($attrs[7] < 4194304 ||
                     1 - $attrs[8] / $attrs[7] >= $opts{preallocate} / 100);
                 $size = $attrs[7];
             }
@@ -3577,24 +3633,9 @@ sub transport_chattr {
             push(@chattrs, \@args);
             # ignore errors since systems may have different command/users
         }
-
-        $ref->{tool} = $host ne 'localhost' ? "shift-aux" :
-            ($opts{have}->{'shift-bin'} ? "shift-bin" : "shiftc");
     }
 
     return if (!scalar(@chattrs) && !scalar(@allocs));
-
-    my ($q, @threads);
-    if ($perl{threads} && $opts{threads} > 1) {
-        $q = Thread::Queue->new;
-        # mutual exclusion for stdout
-        @threads = map {threads->create(sub {
-            $opts{fhpid} = open3_run([undef, undef, -1], "shift-bin")
-                if ($opts{have}->{'shift-bin'});
-            transport_chattr1($_) while (defined ($_ = $q->dequeue));
-            open3_wait($opts{fhpid}) if (defined $opts{fhpid});
-        })} (1 .. $opts{threads});
-    }
 
     if ($host ne 'localhost') {
         my ($fh, $tmp) = sftp_tmp();
@@ -3604,20 +3645,29 @@ sub transport_chattr {
         close $fh;
         open3_get([$tmp, -1, -1], "$opts{ssh} $host $opts{caux} chattr");
         unlink $tmp;
-    } else {
-        if ($perl{threads} && $opts{threads} > 1) {
-            $q->enqueue(@chattrs, @allocs);
-            # force threads to exit
-            $q->enqueue(undef) foreach (1 .. scalar(@threads));
-            foreach (@threads) {
-                $_->join if ($_);
-            }
-        } else {
+        return;
+    }
+
+    if ($perl{threads} && $opts{threads} > 1) {
+        my $q = Thread::Queue->new(@chattrs, @allocs);
+        my $dqchattr = sub {
             $opts{fhpid} = open3_run([undef, undef, -1], "shift-bin")
                 if ($opts{have}->{'shift-bin'});
-            transport_chattr1($_) foreach (@chattrs, @allocs);
+            transport_chattr1($_) while (defined ($_ = $q->dequeue_nb));
             open3_wait($opts{fhpid}) if (defined $opts{fhpid});
+        };
+        my @threads = map {threads->create($dqchattr)} (1 .. $opts{threads} - 1);
+        # ensure work gets done even if thread creation fails
+        &$dqchattr();
+        foreach (@threads) {
+            $_->join if ($_);
         }
+    } else {
+        # threads not supported, threads is 1, or thread creation failed
+        $opts{fhpid} = open3_run([undef, undef, -1], "shift-bin")
+            if ($opts{have}->{'shift-bin'});
+        transport_chattr1($_) foreach (@chattrs, @allocs);
+        open3_wait($opts{fhpid}) if (defined $opts{fhpid});
     }
 }
 
@@ -3641,6 +3691,7 @@ sub transport_chattr1 {
 
     if (defined $opts{fhpid}) {
         $opts{fhpid}->[0]->print(join(" ", $cmd, $file, $attrs), "\n");
+        # read line even though never used to prevent pipe overflow
         $opts{fhpid}->[1]->getline;
         # ignore errors
     } else {
@@ -3680,6 +3731,7 @@ sub transport_dmf {
 
     # dmget processing
     my (%getfh, %gettmp);
+    my %tars;
     if ($opts{recall}) {
         foreach my $cmd (@{$tcmds}) {
             my ($op, $src, $dst, $ref) = @{$cmd};
@@ -3687,7 +3739,11 @@ sub transport_dmf {
             next if ($op !~ /^(?:find|get|put)$/ ||
                     !$ref->{srcfs} || $ref->{srcfs} !~ /,dmf/);
             ($getfh{$op}, $gettmp{$op}) = sftp_tmp() if (!$gettmp{$op});
-            print {$getfh{$op}} $src, "\n";
+            if (!$tars{$src}) {
+                print {$getfh{$op}} $src, "\n";
+            }
+            # do not add the same tar over and over again
+            $tars{$src} = 1 if ($opts{'extract-tar'});
         }
     }
 
@@ -3723,7 +3779,7 @@ sub transport_dmf {
     my $extra = $opts{'create-tar'} ? " -a" : "";
     foreach my $op (keys %gettmp) {
         close $getfh{$op};
-        my $ssh = $op eq 'get' && $host ne 'localhost' ? "$opts{ssh} $host" : "";
+        my $ssh = $op ne 'put' && $host ne 'localhost' ? "$opts{ssh} $host" : "";
         # ignore errors since files are automatically retrieved anyway
         open3_get([$gettmp{$op}, -1, -1], "$ssh dmget -nq$extra");
         unlink $gettmp{$op};
@@ -3799,7 +3855,7 @@ sub transport_find {
                 print $fh " $opt=$ref->{$opt}" if (defined $ref->{$opt});
             }
             print $fh " $ref\n";
-            $ref->{tool} = "shift-aux";
+            $ref->{tool} = "shift-find";
         }
         $refs{$ref} = [$src, $dst, $ref];
     }
@@ -3865,7 +3921,6 @@ sub transport_find {
         ($opts{dmfh}, $opts{dmtmp}) = tempfile();
     }
 
-    my @threads;
     if ($perl{threads} && $opts{threads} > 1) {
         $opts{findq} = Thread::Queue->new;
         $opts{findeq} = Thread::Queue->new;
@@ -3877,7 +3932,42 @@ sub transport_find {
         $opts{findo4} = Thread::Semaphore->new(1);
         # number of unprocessed items on queue
         $opts{findq4} = Thread::Semaphore->new(0);
-        @threads = map {threads->create(sub {
+    } else {
+        # need to define file count as used in both single/multi-threaded cases
+        $opts{findn4} = \0;
+        $opts{fhpid} = open3_run([undef, undef, -1], "shift-bin")
+            if ($opts{have}->{'shift-bin'} && ($opts{preserve} == 1 ||
+                    $opts{preserve} =~ /acl|stripe|xattr/));
+    }
+
+    foreach (values %refs) {
+        # compute local (or remote if shift-aux fails) files and sizes
+        my ($spath, $dst, $ref) = @{$_};
+        $ref->{tool} = "shift-find";
+        my $sdir = dirname($spath);
+        $sdir = "" if ($sdir eq '/');
+        my $ddir = dirname($dst);
+        $ddir = "" if ($ddir eq '/');
+        my $path = [[basename($spath), basename($dst), 
+            $perl{threads} && $opts{threads} > 1 ? "" . $ref : $ref],
+            $host, $sdir, $dst, $ddir, $ref->{srcfs}];
+        if ($opts{'create-tar'}) {
+            my $tdir = dirname(unescape($ref->{tar_name}));
+            $tdir = "" if ($tdir eq '.');
+            $tdir .= "/" if ($tdir && $tdir !~ /\/$/);
+            push(@{$path}, $tdir);
+        }
+        if ($perl{threads} && $opts{threads} > 1) {
+            $opts{findq4}->up;
+            $opts{findn4}->up;
+            $opts{findq}->enqueue($path);
+        } else {
+            transport_find1($path);
+        }
+    }
+
+    if ($perl{threads} && $opts{threads} > 1) {
+        my @threads = map {threads->create(sub {
             $opts{fhpid} = open3_run([undef, undef, -1], "shift-bin")
                 if ($opts{have}->{'shift-bin'} && ($opts{preserve} == 1 ||
                         $opts{preserve} =~ /acl|stripe|xattr/));
@@ -3907,41 +3997,7 @@ sub transport_find {
             }
             open3_wait($opts{fhpid}) if (defined $opts{fhpid});
         })} (1 .. $opts{threads});
-    } else {
-        # need to define file count as used in both single/multi-threaded cases
-        $opts{findn4} = \0;
-        $opts{fhpid} = open3_run([undef, undef, -1], "shift-bin")
-            if ($opts{have}->{'shift-bin'} && ($opts{preserve} == 1 ||
-                    $opts{preserve} =~ /acl|stripe|xattr/));
-    }
 
-    foreach (values %refs) {
-        # compute local (or remote if shift-aux fails) files and sizes
-        my ($spath, $dst, $ref) = @{$_};
-        $ref->{tool} = "shiftc";
-        my $sdir = dirname($spath);
-        $sdir = "" if ($sdir eq '/');
-        my $ddir = dirname($dst);
-        $ddir = "" if ($ddir eq '/');
-        my $path = [[basename($spath), basename($dst), 
-            $perl{threads} && $opts{threads} > 1 ? "" . $ref : $ref],
-            $host, $sdir, $dst, $ddir, $ref->{srcfs}];
-        if ($opts{'create-tar'}) {
-            my $tdir = dirname(unescape($ref->{tar_name}));
-            $tdir = "" if ($tdir eq '.');
-            $tdir .= "/" if ($tdir && $tdir !~ /\/$/);
-            push(@{$path}, $tdir);
-        }
-        if ($perl{threads} && $opts{threads} > 1) {
-            $opts{findq4}->up;
-            $opts{findn4}->up;
-            $opts{findq}->enqueue($path);
-        } else {
-            transport_find1($path);
-        }
-    }
-
-    if ($perl{threads} && $opts{threads} > 1) {
         foreach (@threads) {
             $_->join if ($_);
         }
@@ -3956,24 +4012,26 @@ sub transport_find {
         open3_wait($opts{fhpid}) if (defined $opts{fhpid});
     }
 
-    close $opts{dmfh} if (defined $opts{dmfh});
-    if (-s $opts{dmtmp}) {
-        # fork to avoid intermittent hangs of dmget
-        my $pid = fork_setsid();
-        if ($pid) {
-            waitpid($pid, 0);
-            delete $opts{dmfh};
-            delete $opts{dmtmp};
+    if ($opts{recall} && $opts{have}->{dmget}) {
+        close $opts{dmfh};
+        if (-s $opts{dmtmp}) {
+            # fork to avoid intermittent hangs of dmget
+            my $pid = fork_setsid();
+            if ($pid) {
+                waitpid($pid, 0);
+                delete $opts{dmfh};
+                delete $opts{dmtmp};
+            } else {
+                my $ssh = $host eq 'localhost' ? "" : "$opts{ssh} $host";
+                my $extra = $opts{'create-tar'} ? " -a" : "";
+                # ignore errors since files are automatically retrieved anyway
+                open3_get([$opts{dmtmp}, -1, -1], "$ssh dmget -nq$extra");
+                unlink $opts{dmtmp};
+                POSIX::_exit(0);
+            }
         } else {
-            my $ssh = $host eq 'localhost' ? "" : "$opts{ssh} $host";
-            my $extra = $opts{'create-tar'} ? " -a" : "";
-            # ignore errors since files are automatically retrieved anyway
-            open3_get([$opts{dmtmp}, -1, -1], "$ssh dmget -nq$extra");
             unlink $opts{dmtmp};
-            POSIX::_exit(0);
         }
-    } else {
-        unlink $opts{dmtmp};
     }
 }
 
@@ -4071,7 +4129,8 @@ sub transport_find1 {
 
     # exclude files (must be before dir processing)
     if (defined $opts{exclude}) {
-        foreach my $re (@{$opts{exclude}}) {
+        foreach (@{$opts{exclude}}) {
+            my $re = /^\\Q/ ? quotemeta(substr($_, 2)) : $_;
             return if (eval {$file =~ /$re/});
         }
     }
@@ -4080,8 +4139,8 @@ sub transport_find1 {
     if (scalar(@stat) == 0 || S_ISDIR($mode)) {
         # ensure $err defined unless explicitly set to undef
         my $err = "";
-        if (scalar(@stat) > 0 && (!$opts{dereference} || $top) && 
-                (!defined $opts{'find-files'} ||
+        if (scalar(@stat) > 0 && ($top || !$opts{dereference}) && 
+                ($top || !defined $opts{'find-files'} ||
                 ${$opts{findn4}} < $opts{'find-files'})) {
             # add subdirs of this directory for processing when below limit
             if ($shost eq 'localhost' ? opendir($dh, $file) :
@@ -4114,7 +4173,8 @@ sub transport_find1 {
     # include files
     if (defined $opts{include}) {
         my $found;
-        foreach my $re (@{$opts{include}}) {
+        foreach (@{$opts{include}}) {
+            my $re = /^\\Q/ ? quotemeta(substr($_, 2)) : $_;
             next if (eval {$file !~ /$re/});
             $found = 1;
             last;
@@ -4354,7 +4414,8 @@ sub transport_fish {
             sftp_error($ref, $rc0->{error});
             next;
         }
-        if (!$opts{'create-tar'} && !$ref->{bytes} && $ref->{dstfs} =~ /,dmf/) {
+        if (!$opts{'create-tar'} && !$ref->{bytes} && $opts{recall} &&
+                $ref->{dstfs} =~ /,dmf/) {
             # truncate dst on dmf to prevent file from being recalled
             if ($host eq 'localhost') {
                 truncate($dst, 0);
@@ -4398,6 +4459,9 @@ sub transport_fish {
         open3_wait($fhpid);
         unlink $cert if ($cert);
         return;
+    } elsif (ref $rc0) {
+        # unable to contact remote side (ops already marked with error)
+        return;
     }
     
     # original process is a thread when using ssh
@@ -4405,7 +4469,6 @@ sub transport_fish {
     # choose min of specified threads and amount of work
     $nstream = min($nstream, scalar(@fcmds));
     if ($tcp) {
-#TODO: need error checking or rc0 check here?
         transport_fish_io(undef, $out, @{$_->[1]}) foreach (@fcmds);
         $out->write("#streams $nstream\n");
         $out->write("#exit\n");
@@ -4486,7 +4549,7 @@ sub transport_fish {
             ($tout, $tin) = ($tfhpid->[0], $tfhpid->[1]);
             $trc0 = transport_fish_return($tin, "tinit");
         }
-        while (defined (my $fi = $q->dequeue)) {
+        while (defined (my $fi = $q->dequeue_nb)) {
             $tin = $fi . " " . Digest::HMAC::hmac_hex($fi . $nonce2++, $key,
                 \&Digest::SHA::PurePerl::sha512) if ($tcp);
             my $trc = transport_fish_io($tin, $tout, @{$fcmds[$fi]->[1]});
@@ -4504,11 +4567,9 @@ sub transport_fish {
         }
         return 0;
     })} (1 .. $nstream);
-    # force threads to exit (add extra for original process)
-    $q->enqueue(undef) foreach (1 .. $nstream + 1);
 
     if (!$tcp) {
-        while (defined (my $fi = $q->dequeue)) {
+        while (defined (my $fi = $q->dequeue_nb)) {
             my $trc = transport_fish_io($in, $out, @{$fcmds[$fi]->[1]});
             my $text = ref $trc ? $trc->{error} : undef;
             $text = "\\E" . $text if ($text && $text !~ /^\\H/);
@@ -4931,7 +4992,7 @@ sub transport_rsync {
     my ($dmf, $rsize);
     foreach my $cmd (@{$tcmds}) {
         my ($op, $src, $dst, $ref) = @{$cmd};
-        if (!$dmf && $ref->{dstfs} =~ /,dmf/) {
+        if (!$dmf && $opts{recall} && $ref->{dstfs} =~ /,dmf/) {
             $dmf = 1;
             # copy whole files to DMF to avoid destination reads/recalls
             $args .= " -W";
@@ -5014,8 +5075,8 @@ sub transport_rsync_batch {
         local $SIG{__WARN__} = sub {die};
         # escape remote src/dst metacharacters since interpreted by remote shell
         my ($esrc, $edst) = ($src, $dst);
-        $esrc =~ s/([^A-Za-z0-9\-_.:+\/])/\\$1/g if ($esrc =~ /^[^\/]/);
-        $edst =~ s/([^A-Za-z0-9\-_.:+\/])/\\$1/g if ($edst =~ /^[^\/]/);
+        $esrc =~ s/([^A-Za-z0-9\-_.\@:+\/])/\\$1/g if ($esrc =~ /^[^\/]/);
+        $edst =~ s/([^A-Za-z0-9\-_.\@:+\/])/\\$1/g if ($edst =~ /^[^\/]/);
         # use open3 to avoid executing a shell command based on the name
         # of a file being copied (which may contain metacharacters, etc.)
         # must keep write access to handle warnings/corruption
@@ -5038,10 +5099,16 @@ sub transport_rsync_batch {
             } elsif ($line =~ /\(code\s+(\d+)\)/) {
                 $code = $1;
                 $code_text = $line;
-            } elsif ($line =~ /Total bytes sent:\s*(\d+)/) {
-                $size += $1;
-            } elsif ($line =~ /Total bytes received:\s*(\d+)/) {
-                $size += $1;
+            } elsif ($line =~ /Total file size:\s*([\d,]+)/) {
+                # start with total amount of data
+                my $tmp = $1;
+                $tmp =~ s/,//g;
+                $size += $tmp;
+            } elsif ($line =~ /Total transferred file size:\s*([\d,]+)/) {
+                # subtract data actually transferred
+                my $tmp = $1;
+                $tmp =~ s/,//g;
+                $size -= $tmp;
             }
         }
     }
@@ -5058,6 +5125,7 @@ sub transport_rsync_batch {
             }
         }
     }
+    # return amount of data not actually transferred due to size/time match
     return $size;
 }
 
@@ -5069,7 +5137,7 @@ sub transport_shift {
     my @scmds;
     foreach my $cmd (@{$tcmds}) {
         my ($op, $src, $dst, $ref) = @{$cmd};
-        $ref->{tool} = "shiftc";
+        $ref->{tool} = $op eq 'chattr' ? "shift-chattr" : "shift-cp";
         if (!$perl{threads} || $opts{threads} <= 1) {
             transport_shift_1($host, $cmd);
             next;
@@ -5077,7 +5145,8 @@ sub transport_shift {
             push(@scmds, [undef, $cmd]);
             next;
         }
-        if (!$opts{'create-tar'} && !$ref->{bytes} && $ref->{dstfs} =~ /,dmf/) {
+        if (!$opts{'create-tar'} && !$ref->{bytes} && $opts{recall} &&
+                $ref->{dstfs} =~ /,dmf/) {
             # truncate dst on dmf or else it will be recalled on first write
             if ($host eq 'localhost') {
                 truncate($dst, 0);
@@ -5098,45 +5167,36 @@ sub transport_shift {
             push(@scmds, [$x == $x1 ? undef : $x . "-" . $x2, $cmd]);
         }
     }
-    if (scalar(@scmds) <= 1) {
-        transport_shift_1($host, $_->[1]) foreach (@scmds);
-        return;
-    }
 
     foreach my $o (keys %opts) {
         # must kill existing sftp connections or various things can hang
         next if ($o !~ /^sftp_[^d]/);
         $opts{$o}->disconnect;
         delete $opts{$o};
-    }                                                                                                     
+    }
 
     my $q = Thread::Queue->new;
     my $qret = Thread::Queue->new;
     my $qi = 0;
     $q->enqueue([$qi++, $_->[0], $_->[1]]) foreach (@scmds);
-    # choose min of specified threads and amount of work
+    # choose min of specified threads minus self and amount of work
     my $nthr = scalar(@scmds);
     my $maxthr = $host eq 'localhost' ? $opts{threads} : $opts{streams};
-    $nthr = $maxthr if ($maxthr < $nthr);
-    my @threads = map {threads->create(sub {
-        while (defined (my $ircmd = $q->dequeue)) {
+    $nthr = min($maxthr - 1, $nthr);
+    my $dqshift = sub {
+        while (defined (my $ircmd = $q->dequeue_nb)) {
             my ($i, $range, $cmd) = @{$ircmd};
             # no need to save original bytes value since ref is cloned by queue
             $cmd->[3]->{bytes} = $range if (defined $range);
             transport_shift_1($host, $cmd);
             $qret->enqueue([$i, $cmd->[3]->{text}]);
         }
-    })} (1 .. $nthr);
-    # force threads to exit
-    $q->enqueue(undef) foreach (1 .. $nthr);
-    if (first {defined($_)} @threads) {
-        foreach (@threads) {
-            $_->join if ($_);
-        }
-    } else {
-        # no threads could be started - fallback to unthreaded
-        transport_shift_1($host, $_->[1]) foreach (@scmds);
-        return;
+    };
+    my @threads = map {threads->create($dqshift)} (1 .. $nthr);
+    # ensure work gets done even if thread creation fails
+    &$dqshift();
+    foreach (@threads) {
+        $_->join if ($_);
     }
     # append any error messages back to original ref text
     while (defined (my $itext = $qret->dequeue_nb)) {
@@ -5240,11 +5300,15 @@ sub transport_shift_local {
         my $src = $dst;
         # tar_mv only happens when there is one split ending in "-1.tar"
         $dst =~ s/-1\.tar$//;
-        rename($src, $dst) or sftp_error($ref, "$!");
-        if ($opts{'index-tar'}) {
-            rename("$src.toc", "$dst.toc") or sftp_error($ref, "$!");
-            if ($opts{verify} && $ref->{tar_mv} > 1) {
-                rename("$src.sum", "$dst.sum") or sftp_error($ref, "$!");
+        if (-e $dst) {
+            sftp_error($ref, "Unable to rename tar: dst exists");
+        } else {
+            rename($src, $dst) or sftp_error($ref, "$!");
+            if ($opts{'index-tar'}) {
+                rename("$src.toc", "$dst.toc") or sftp_error($ref, "$!");
+                if ($opts{verify} && $ref->{tar_mv} > 1) {
+                    rename("$src.sum", "$dst.sum") or sftp_error($ref, "$!");
+                }
             }
         }
     } elsif ($opts{preserve} && $op eq 'chattr' && $ref->{ln} &&
@@ -5295,7 +5359,7 @@ sub transport_shift_local {
                 }
                 sftp_error($ref, "Source/destination file sizes differ")
                     if ($ssize != $dattrs[7]);
-            } elsif ($ref->{dstfs} =~ /,dmf/) {
+            } elsif ($opts{recall} && $ref->{dstfs} =~ /,dmf/) {
                 # trigger copy on dmf file systems to prevent recall
                 sftp_error($ref, "Ignoring attributes on DMF file system");
             } else {
@@ -5318,11 +5382,15 @@ sub transport_shift_remote {
     if ($op eq 'mkdir' && !$opts{'create-tar'}) {
         # create implicit directories
         sftp($host)->mkpath(dirname($dst));
+        # ignore if directory exists before/after mkdir
         my $attrs = sftp($host)->stat($dst);
         if ($attrs && !S_ISDIR($attrs->perm)) {
             sftp_error($ref, "File exists");
         } elsif (!$attrs && !sftp($host)->mkdir($dst)) {
-            sftp_error($ref, "Permission denied");
+            $attrs = sftp($host)->stat($dst);
+            if (!$attrs || !S_ISDIR($attrs->perm)) {
+                sftp_error($ref, "Unable to create directory");
+            }
         }
     } elsif ($op eq 'rget') {
         sftp($host)->rget($src, $dst) or
@@ -5458,9 +5526,10 @@ sub transport_shift_remote {
         my $src = $dst;
         # tar_mv only happens when there is one split ending in "-1.tar"
         $dst =~ s/-1\.tar$//;
-        sftp($host)->rename($src, $dst, overwrite => 1) or
+        my $rc = sftp($host)->rename($src, $dst);
+        if (!$rc) {
             sftp_error($ref, "" . sftp($host, 1)->error);
-        if ($opts{'index-tar'}) {
+        } elsif ($opts{'index-tar'}) {
             sftp($host)->rename("$src.toc", "$dst.toc", overwrite => 1) or
                 sftp_error($ref, "" . sftp($host, 1)->error);
             if ($opts{verify} && $ref->{tar_mv} > 1) {
@@ -5506,7 +5575,7 @@ sub transport_shift_remote {
                 my $ssize = (stat $ref->{src})[7];
                 sftp_error($ref, "Source/destination file sizes differ")
                     if ($ssize != $dattrs->size);
-            } elsif ($ref->{dstfs} =~ /,dmf/) {
+            } elsif ($opts{recall} && $ref->{dstfs} =~ /,dmf/) {
                 # trigger copy on dmf file systems to prevent recall
                 sftp_error($ref, "Ignoring attributes on DMF file system");
             } else {
@@ -5750,8 +5819,9 @@ sub verify_cksum {
             }
             unlink $out_tmp;
 
+            my $tool = $prog eq 'msum' ? $prog : "shift-sum";
             foreach my $refs (values %errs) {
-                $_->{tool} = $prog foreach (values %{$refs});
+                $_->{tool} = $tool foreach (values %{$refs});
             }
 
             # stop after the first program that runs
@@ -5925,7 +5995,7 @@ sub verify_sum_shift {
     my ($fh, $tmp) = sftp_tmp();
     foreach my $cmd (@{$cmds}) {
         my ($op, $src, $dst, $ref) = @{$cmd};
-        $ref->{tool} = "shiftc";
+        $ref->{tool} = "shift-sum";
         $ref->{partial} = 1;
         my $bytes = $ref->{sum_bytes};
         if (!defined $bytes) {
@@ -5958,17 +6028,18 @@ sub verify_sum_shift {
     }
 
     return if (!$perl{threads} || $opts{threads} <= 1);
-    # choose min of specified threads and amount of work
-    my $nthr = min($opts{threads}, $q->pending);
-    my @threads = map {threads->create(sub {
-        while (defined (my $sum = $q->dequeue)) {
+    # choose min of specified threads minus self and amount of work
+    my $nthr = min($opts{threads} - 1, $q->pending);
+    my $dqsum = sub {
+        while (defined (my $sum = $q->dequeue_nb)) {
             my ($qi, $range, $i, $file, $x1, $x2, $partial) = @{$sum};
             my $hash = verify_sum_shift1($file, $x1, $x2, $partial, 1);
             $qret->enqueue([$qi, $range, $i, $hash]);
         }
-    })} (1 .. $nthr);
-    # force threads to exit
-    $q->enqueue(undef) foreach (1 .. $nthr);
+    };
+    my @threads = map {threads->create($dqsum)} (1 .. $nthr);
+    # ensure work gets done even if thread creation fails
+    &$dqsum();
     foreach (@threads) {
         $_->join if ($_);
     }

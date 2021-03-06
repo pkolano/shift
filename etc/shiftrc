@@ -187,6 +187,10 @@ user_dir /home/%u/.shift
 #   (use suffix {k,m,g,t} for {KB,MB,GB,TB})
 #default_stripe 1g
 
+# maximum number of files to process in each batch
+#   (use suffix {k,m,b/g,t} for 10E{3,6,9,12})
+#max_files 100k
+
 # number of status entries at which some older done transfers may be omitted
 #status_lines 20
 
@@ -209,6 +213,9 @@ user_dir /home/%u/.shift
 
 # latency (seconds) assumed to remote LAN hosts when measurement fails
 #latency_lan 0.001
+
+# seconds to wait between latency measurements
+#latency_wait 600
 
 # latency (seconds) assumed to remote WAN hosts when measurement fails
 #latency_wan 0.05

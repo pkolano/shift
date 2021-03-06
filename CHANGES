@@ -308,7 +308,7 @@ CHANGES
     - Note that metadata is not backward compatible with previous versions
     - Fixed vulnerability in root --stats/--status due to use of Storable
         when metadata directly accessible by users (bug report by J. Neff)
-	- Fixed race condition causing permission denied during some remote mkdirs
+    - Fixed race condition causing permission denied during some remote mkdirs
     - Fixed built-in checksums when thread creation fails
     - Fixed chattrs when thread creation fails
     - Fixed leftover shift-bin processes due to unneeded chattr thread spawns
@@ -317,3 +317,27 @@ CHANGES
     - Fixed duplicated source tar lines in dmget input files
     - Fixed deceptive thread creation errors during fish-tcp initialization
 
+* Shift 7.1 (03/05/21)
+    - Note that the shiftc included with 7.0 was the wrong version (still 6.3)
+    - Added latency collection on windows systems
+    - Added tcp buffer size collection on osx
+    - Added periodic latency measurement to track network issues
+    - Added support of \Q metacharacter in --include/--exclude
+    - Added manager setting for maximum files per batch
+    - Added manager setting for time between latency measurement
+    - Added origin IP address to transfer metadata
+    - Added save of manager exceptions to associated user debug file
+    - Added --plot by file system
+    - Changed tracking of built-in operations for stats output
+    - Changed file metadata operations to report metadata rate
+    - Changed corruption tracking to not count file sizes differing
+    - Fixed globs while locating ssh agents to reduce system audit messages
+    - Fixed potential for multiple simultaneous keepalive invocations
+    - Fixed ephemeral port usage during remote bbftpd invocation
+    - Fixed missing handling of --no-recall in some scenarios
+    - Fixed accuracy of rsync rates during partial file transfers
+    - Fixed failure to detect completion properly in some tar scenarios
+    - Fixed parallelization due to overwrite of per user mount metadata
+    - Fixed manager exception during read of corrupt/incomplete gzi files
+    - Fixed handling of manager disk exhaustion to prevent finalized metadata
+    - Fixed potential divide by zero exceptions during throttling

@@ -1,6 +1,6 @@
 #!/usr/bin/perl -T
 #
-# Copyright (C) 2012-2019 United States Government as represented by the
+# Copyright (C) 2012-2021 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration
 # (NASA).  All Rights Reserved.
 #
@@ -66,7 +66,7 @@ use Symbol qw(gensym);
 use Sys::Hostname;
 use Text::ParseWords;
 
-our $VERSION = 7.0;
+our $VERSION = 7.05;
 
 # do not die when receiving sigpipe
 $SIG{PIPE} = 'IGNORE';
@@ -322,7 +322,6 @@ sub escape {
 # output list of files/dirs beneath paths given on STDIN with stat info
 my ($findq, $findb4, $findn4, $findq4);
 sub find {
-    my @threads;
     if (!$opts{'extract-tar'}) {
         # check for existence of various commands
         foreach my $bin (qw(dmget lfs getfacl getfattr shift-bin)) {
@@ -344,34 +343,6 @@ sub find {
             $findq4 = Thread::Semaphore->new(0);
             # mutual exclusion for stdout
             $buf4 = Thread::Semaphore->new(1);
-            @threads = map {threads->create(sub {
-                $opts{fhpid} = open3_run([undef, undef, -1], "shift-bin")
-                    if ($opts{have}->{'shift-bin'} && ($opts{preserve} == 1 ||
-                            $opts{preserve} =~ /acl|stripe|xattr/));
-                while (1) {
-                    my $path;
-                    if ($findq->can('dequeue_timed')) {
-                        $path = $findq->dequeue_timed(1);
-                    } else {
-                        $path = $findq->dequeue_nb;
-                        if (!defined $path) {
-                            # must fake timed dequeue - use thread-safe sleep
-                            select(undef, undef, undef, 1);
-                            $path = $findq->dequeue_nb;
-                        }
-                    }
-                    if (defined $path) {
-                        $findb4->up;
-                        $findq4->down;
-                        find1($path);
-                        $findb4->down;
-                    } elsif (!$$findq4 && !$$findb4) {
-                        buffer();
-                        last;
-                    }
-                }
-                open3_wait($opts{fhpid}) if (defined $opts{fhpid});
-            })} (1 .. $opts{threads});
         } else {
             # file count used in both single/multi-threaded cases
             $findn4 = \0;
@@ -423,6 +394,35 @@ sub find {
 
     buffer();
     if ($perl{threads} && $opts{threads} > 1) {
+        my @threads = map {threads->create(sub {
+            $opts{fhpid} = open3_run([undef, undef, -1], "shift-bin")
+                if ($opts{have}->{'shift-bin'} && ($opts{preserve} == 1 ||
+                        $opts{preserve} =~ /acl|stripe|xattr/));
+            while (1) {
+                my $path;
+                if ($findq->can('dequeue_timed')) {
+                    $path = $findq->dequeue_timed(1);
+                } else {
+                    $path = $findq->dequeue_nb;
+                    if (!defined $path) {
+                        # must fake timed dequeue - use thread-safe sleep
+                        select(undef, undef, undef, 1);
+                        $path = $findq->dequeue_nb;
+                    }
+                }
+                if (defined $path) {
+                    $findb4->up;
+                    $findq4->down;
+                    find1($path);
+                    $findb4->down;
+                } elsif (!$$findq4 && !$$findb4) {
+                    buffer();
+                    last;
+                }
+            }
+            open3_wait($opts{fhpid}) if (defined $opts{fhpid});
+        })} (1 .. $opts{threads});
+
         foreach (@threads) {
             $_->join if ($_);
         }
@@ -500,7 +500,8 @@ sub find1 {
     # exclude files (must be before dir processing)
     if (defined $opts{exclude}) {
         foreach my $re (@{$opts{exclude}}) {
-            my $ure = unescape($re);
+            $_ = unescape($re);
+            my $ure = /^\\Q/ ? quotemeta(substr($_, 2)) : $_;
             return if (eval {$file =~ /$ure/});
         }
     }
@@ -541,7 +542,8 @@ sub find1 {
     if (defined $opts{include}) {
         my $found;
         foreach my $re (@{$opts{include}}) {
-            my $ure = unescape($re);
+            $_ = unescape($re);
+            my $ure = /^\\Q/ ? quotemeta(substr($_, 2)) : $_;
             next if (eval {$file !~ /$ure/});
             $found = 1;
             last;
@@ -879,7 +881,8 @@ sub find_tar {
         if (defined $opts{include}) {
             my $found;
             foreach my $re (@{$opts{include}}) {
-                my $ure = unescape($re);
+                $_ = unescape($re);
+                my $ure = /^\\Q/ ? quotemeta(substr($_, 2)) : $_;
                 next if (eval {$attrs[0] !~ /$ure/});
                 $found = 1;
                 last;
@@ -890,7 +893,8 @@ sub find_tar {
         if (defined $opts{exclude}) {
             my $found;
             foreach my $re (@{$opts{exclude}}) {
-                my $ure = unescape($re);
+                $_ = unescape($re);
+                my $ure = /^\\Q/ ? quotemeta(substr($_, 2)) : $_;
                 next if (eval {$attrs[0] !~ /$ure/});
                 $found = 1;
                 last;

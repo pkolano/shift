@@ -1,5 +1,5 @@
 //
-// Copyright (C) 2012-2019 United States Government as represented by the
+// Copyright (C) 2012-2020 United States Government as represented by the
 // Administrator of the National Aeronautics and Space Administration
 // (NASA).  All Rights Reserved.
 //
@@ -225,16 +225,23 @@ int do_setfattr(char *file, char *s_xattr) {
 //////////////////////
 int do_getstripe(char *file) {
 #ifndef _NO_LUSTRE
-    int v1 = sizeof(struct lov_user_md_v1) +
-        LOV_MAX_STRIPE_COUNT * sizeof(struct lov_user_ost_data_v1);
-    int v3 = sizeof(struct lov_user_md_v3) +
-        LOV_MAX_STRIPE_COUNT * sizeof(struct lov_user_ost_data_v1);
-    struct lov_user_md *lum = malloc(v1 > v3 ? v1 : v3);
-    if (lum == NULL) return -1;
-    int rc = llapi_file_get_stripe(file, lum);
-    if (!rc) printf(" %d,%d", lum->lmm_stripe_count, lum->lmm_stripe_size);
-    free(lum);
-    return rc;
+    uint64_t count = 0;
+    struct llapi_layout *layout = llapi_layout_get_by_path(file, 0);
+    if (layout == NULL) return -1;
+    int rc = llapi_layout_comp_use(layout, LLAPI_LAYOUT_COMP_USE_FIRST);
+    if (rc) return -1;
+    uint64_t size = 0;
+    llapi_layout_stripe_size_get(layout, &size);
+    while (!rc) {
+        uint64_t c, index;
+        if (!llapi_layout_stripe_count_get(layout, &c) &&
+                !llapi_layout_ost_index_get(layout, count, &index)) {
+            count += c;
+        }
+        rc = llapi_layout_comp_use(layout, LLAPI_LAYOUT_COMP_USE_NEXT);
+    }
+    printf(" %d,%d", count, size);
+    return 0;
 #else
     return -1;
 #endif
