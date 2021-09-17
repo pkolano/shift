@@ -63,15 +63,10 @@ Shift Installation and Configuration
             (https://metacpan.org/pod/Data::MessagePack)
         o IO::Socket::SSL - allows fish-tcp encryption with --secure
             (https://metacpan.org/pod/IO::Socket::SSL)
-        o bbcp - high speed remote copy
-            (http://www.slac.stanford.edu/~abh/bbcp) 
-            (note latest v17.12.00.00.0 fails when overwriting existing files)
         o bbftp - high speed remote copy
             (http://doc.in2p3.fr/bbftp)
         o gnuplot >= 5.0 - allow display of --plot output
             (http://gnuplot.info)
-        o gridftp - high speed remote copy
-            (http://toolkit.globus.org/toolkit/data/gridftp)
         o mcp/msum >= 1.76.7 - high speed local copy/sum
             (http://mutil.sf.net)
         o mesh - lightweight single sign-on via ssh publickey authentication
@@ -97,7 +92,6 @@ Shift Installation and Configuration
         o su - become non-root process to access manager during root transfers
         o sysctl - determine number of cpus on BSD
         o touch - change symlink modification time
-        o unbuffer - interleave stdout/stderr when using gridftp
 
 
 3. Build (optional - linux only)

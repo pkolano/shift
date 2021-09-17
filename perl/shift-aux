@@ -66,7 +66,7 @@ use Symbol qw(gensym);
 use Sys::Hostname;
 use Text::ParseWords;
 
-our $VERSION = 7.05;
+our $VERSION = 8.0;
 
 # do not die when receiving sigpipe
 $SIG{PIPE} = 'IGNORE';
@@ -1260,7 +1260,7 @@ sub mount {
         $mnt{opts} = /[\(,]ro[\),]/ ? "ro" : "rw";
         # acl support is the default unless explicitly disabled
         $mnt{opts} .= ",acl" if (/[\(,]acl[\),]/ || $acl && !/[\(,]noacl[\),]/);
-        $mnt{opts} .= ",dmf" if (/[\(,]dm(ap)?i[\),]/);
+        $mnt{opts} .= ",dmf" if (/[\(,](dmapi|dmi|xdsm)[\),]/);
         $mnt{opts} .= ",xattr" if (/[\(,]user_xattr[\),]/);
         #TODO: need to escape local and remote?
         (my $dev, $mnt{local}, my $type) = ($1, $2, $3)
@@ -1291,17 +1291,19 @@ sub mount {
             $mnt{servers} =~ s/@\w*//g;
             $mnt{servers} = join("|", map {$_ = fqdn($_)} split(/:/, $mnt{servers}));
         } elsif ($type eq 'gpfs') {
-            # gpfs servers do not appear in mount output so call mmlsmgr
-            my $srv = open3_get([-1, undef, -1], "mmlsmgr $dev");
-            # try a default location if not in path
-            $srv = open3_get([-1, undef, -1],
-                "/usr/lpp/mmfs/bin/mmlsmgr $dev") if (!$srv);
-            next if (!defined $srv);
-            # output is file system then server ip address
-            if ($srv =~ /^(\w+)\s+(\d+\.\d+\.\d+\.\d+)/m) {
-                $mnt{remote} = "/$1";
-                $mnt{servers} = fqdn($2);
+            # gpfs servers do not appear in mount output so read config
+            if (open(FILE, "/var/mmfs/gen/mmfs.cfg")) {
+                while (<FILE>) {
+                    s/^\s+|\s+$//g;
+                    if (/^clustername\s+(\S+)/i) {
+                        $mnt{servers} = $1;
+                        $mnt{remote} = "/" . $mnt{servers};
+                        last;
+                    }
+                }
+                close FILE;
             }
+            next if (!$mnt{servers});
         } elsif ($mnt{opts} =~ /,dmf/) {
             # always report dmf file systems even if local
             $mnt{servers} = $mnt{host};

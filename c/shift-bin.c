@@ -1,5 +1,5 @@
 //
-// Copyright (C) 2012-2020 United States Government as represented by the
+// Copyright (C) 2012-2021 United States Government as represented by the
 // Administrator of the National Aeronautics and Space Administration
 // (NASA).  All Rights Reserved.
 //
@@ -252,6 +252,15 @@ int do_getstripe(char *file) {
 //////////////////////
 int do_setstripe(char *file, int scount, unsigned long long ssize, char *pool) {
 #ifndef _NO_LUSTRE
+    if (scount == 0 && ssize == 0) {
+        FILE *rc = fopen(file, "w");
+        if (rc != NULL) {
+            fclose(rc);
+            return 0;
+        } else {
+            return -1;
+        }
+    }
     return llapi_file_create_pool(file, ssize, -1, scount, 0, pool);
 #else
     return -1;

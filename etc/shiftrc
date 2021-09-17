@@ -78,19 +78,11 @@ user_dir /home/%u/.shift
 #   (example: mcp,shift,fish,fish-tcp,rsync,bbftp)
 #local_small shift,fish,fish-tcp
 
-# command-line options that will be used by bbcp on client hosts
-#   (example: opts_bbcp -s 4 -w 4194304)
-#opts_bbcp nodefault
-
 # behavior commands that will be used by bbftp on client hosts
 #   (see the "behavior commands" section of bbftp man page for details)
 #   (options must be separated by "\n" as shown in example below)
 #   (example: opts_bbftp setnbstream 4\nsetrecvwinsize 4096\nsetsendwinsize 4096)
 #opts_bbftp nodefault
-
-# command-line options that will be used by globus-url-copy on client hosts
-#   (example: opts_gridftp -p 4 -tcp-bs 4194304)
-#opts_gridftp nodefault
 
 # command-line options that will be used by mcp on client hosts
 #   (if mcp >= 1.822.1, a --preallocate setting is recommended for DMF on CXFS)

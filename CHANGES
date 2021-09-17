@@ -341,3 +341,22 @@ CHANGES
     - Fixed manager exception during read of corrupt/incomplete gzi files
     - Fixed handling of manager disk exhaustion to prevent finalized metadata
     - Fixed potential divide by zero exceptions during throttling
+    - Fixed lustre handling in shift-bin to current lustre API
+
+* Shift 8.0 (09/16/21)
+    - Note that metadata is not backward compatible with previous versions
+    - Added plots by tool, subnet, and batch size
+    - Added detection of BeeGFS file systems
+    - Changed plots from line to heatmap for improved scalability
+    - Changed processing so batches only contain single operation type
+    - Changed monitoring to support manager hosts across shared file system
+    - Changed naming of built-in tools in --stats and new --plot by tool
+    - Fixed detection of DMF file systems when using xdsm mount option
+    - Fixed detection of GPFS file systems when mmlsmgr not user-accessible
+    - Fixed --wait status retrieval when integrated with Mesh framework
+    - Fixed shift-bin striping with lustre progressive layouts when --stripe=0
+    - Fixed use of XS Data::MessagePack when embedded pure perl version differs
+    - Fixed scalability of built-in yEnc encoding/decoding
+    - Fixed unnecessary metadata traversal when showing detailed status
+    - Fixed application of lustre striping expression to directories
+    - Removed bbcp and gridftp support since reported fatal bugs never fixed

@@ -48,6 +48,11 @@ require Compress::BGZF::Reader;
 require Compress::BGZF::Writer;
 use Compress::Zlib;
 use Data::Dumper;
+eval {
+    # force use of XS variant in case XS version differs from embedded version
+    require XSLoader;
+    XSLoader::load('Data::MessagePack');
+};
 require Data::MessagePack;
 use DB_File;
 use Fcntl qw(:DEFAULT :flock :mode);
@@ -72,7 +77,7 @@ use Text::ParseWords;
 require Tie::DB_FileLock;
 require Text::FormatTable;
 
-our $VERSION = 7.08;
+our $VERSION = 8.0;
 
 $Data::Dumper::Pair = " = ";
 $Data::Dumper::Sortkeys = 1;
@@ -143,9 +148,7 @@ my %conf = (
     min_streams_wan => 4,
     min_window_lan => "1m",
     min_window_wan => "4m",
-    opts_bbcp => "",
     opts_bbftp => "",
-    opts_gridftp => "",
     opts_mcp => "--double-buffer",
     opts_msum => "--double-buffer",
     opts_ssh => "",
@@ -164,13 +167,15 @@ my $dbgfh;
 my $dblock;
 my $doing;
 my %ioall;
-my %nload;
 my $localtime = localtime;
 my @locks;
 my %meta;
+my $monfile;
 my %mounts;
+my %nload;
 my $self = (gethostbyname(hostname()))[0];
 $self = "localhost" if (!$self);
+my @stages = qw(chattr cksum cp find ln mkdir sum);
 my $time = time;
 my %umounts;
 my $ustore;
@@ -190,6 +195,8 @@ END {
     close $dbgfh if (defined $dbgfh);
     # unlock user and transfer directories at program termination
     lock_dir($_, 1) foreach (0, 1);
+    # remove monitor file in case user aborts
+    unlink $monfile if ($monfile);
 }
 
 # parse options
@@ -310,14 +317,13 @@ if (defined $opts{put} && !defined $opts{id}) {
     lock_dir(0, 1);
 
     # initialize tells
-    $meta{$_} = 0 foreach (qw(chattr cksum cp sum tree rtree));
+    $meta{$_} = 0 foreach (@stages, 'rmkdir');
 
     # initialize log sizes
-    $meta{"$_\_size"} = 0
-        foreach (qw(alert chattr cksum cp done error meta sum tree));
+    $meta{"$_\_size"} = 0 foreach (@stages, qw(alert done error meta));
 
     # initialize done, error, size, and total counts
-    foreach (qw(chattr cksum cp find ln mkdir sum)) {
+    foreach (@stages) {
         $meta{"d_$_"} = 0;
         $meta{"e_$_"} = 0;
         $meta{"s_$_"} = 0;
@@ -444,7 +450,7 @@ if ($opts{lock}) {
     exit;
 }
 
-# retrieve metadata from file
+# retrieve metadata from file after possibly (if needed) reverting
 %meta = %{get_meta()};
 
 # perform requested actions that require only metadata read access
@@ -456,7 +462,7 @@ if (defined $opts{status} && $opts{state} eq 'none') {
     id_status();
     exit;
 } elsif (defined $opts{restart} && !($meta{stop} || $meta{time1} &&
-        sum(map {$meta{"e_$_"}} qw(chattr cksum cp find ln mkdir sum)) > 0)) {
+        sum(map {$meta{"e_$_"}} @stages) > 0)) {
     die "Only transfers in stop or error states can be restarted\n";
 } elsif (defined $opts{restart} && -e "$opts{base}/no_restart") {
     open(FILE, '<', "$opts{base}/no_restart");
@@ -513,7 +519,7 @@ if ($opts{alive}) {
     print "args=stop\n" if ($meta{stop} || $meta{time1});
 } elsif (defined $opts{restart}) {
     # clear counts
-    $meta{"e_$_"} = 0 foreach (qw(chattr cksum cp find ln mkdir sum));
+    $meta{"e_$_"} = 0 foreach (@stages);
     $meta{$_} = 0 foreach (qw(stop s_run t_run w_run));
     delete $meta{time1};
     # clear host/client info so clients can be respawned
@@ -567,9 +573,6 @@ if ($opts{alive}) {
             $line = join(" ", map {"$_=$op{$_}"} sort(keys %op));
             $cmd = "alert";
             $meta{e_alert}++;
-        } else {
-            # find retries must go in tree during tar creation
-            $cmd = "tree" if ($meta{'create-tar'} && $cmd eq 'find');
         }
         # use corresponding queue for all other cases
         log_print($cmd, $gzs, $line . "\n");
@@ -586,7 +589,6 @@ if ($opts{alive}) {
         my $fdoing = get_doing($file);
         while (my ($key, $line) = each %{$fdoing}) {
             $line =~ s/\s*\r?\n$//;
-            # put operation in do/tree
             my %op = split(/[= ]+/, $line);
             my @args = split(/,/, $op{args});
             my $cmd = shift @args;
@@ -594,13 +596,11 @@ if ($opts{alive}) {
             # do not delete hash when retrying cksum
             delete $op{hash} if ($cmd ne 'cksum');
             $line = join(" ", map {"$_=$op{$_}"} sort(keys %op));
-            # find retries must go in tree during tar creation
-            $cmd = "tree" if ($meta{'create-tar'} && $cmd eq 'find');
             # use corresponding queue for all other cases
             log_print($cmd, $gzs, $line . "\n");
         }
         $file =~ s/.*\///;
-        log_print($file, $gzs, escape(Data::MessagePack->pack({})) . "\n");
+        log_print($file, $gzs, yenc_encode(Data::MessagePack->pack({})) . "\n");
     }
     log_close($_, $gzs) foreach (keys %{$gzs});
     # transfer may have finished after --restart=ignore
@@ -634,7 +634,7 @@ email_status()
 if ($opts{get} || defined $opts{put}) {
     # store doing to file
     my $gzs = {};
-    log_print($opts{doing}, $gzs, escape(Data::MessagePack->pack($doing)) . "\n");
+    log_print($opts{doing}, $gzs, yenc_encode(Data::MessagePack->pack($doing)) . "\n");
     log_close($opts{doing}, $gzs);
 
     # update running time average for manager get/put invocations
@@ -645,7 +645,7 @@ if ($opts{get} || defined $opts{put}) {
 
 # update log sizes
 foreach my $file (glob "$opts{base}/*") {
-    next if ($file =~ /\/(?:find|lock|\S+\.gzi)$/);
+    next if ($file =~ /\/(?:links|lock|mon_\S+|\S+\.gzi)$/);
     my $log = $file;
     $log =~ s/.*\///;
     $meta{"$log\_size"} = (stat $file)[7];
@@ -753,28 +753,28 @@ while (-d "$conf{user_dir}/$more") {
     $more .= "$opts{user}.more/";
 }
 
-####################
-#### build_find ####
-####################
-# build tied db of processed directories from entries in tree log
-sub build_find {
+#####################
+#### build_links ####
+#####################
+# build tied db of processed directories from entries in find log
+sub build_links {
     # remove old db
-    unlink "$opts{base}/find";
-    my %find;
-    tie(%find, 'DB_File', "$opts{base}/find", O_RDWR | O_CREAT, 0600);
+    unlink "$opts{base}/links";
+    my %links;
+    tie(%links, 'DB_File', "$opts{base}/links", O_RDWR | O_CREAT, 0600);
     my $gzs = {};
-    while (defined($_ = log_getline('tree', $gzs))) {
+    while (defined($_ = log_getline('find', $gzs))) {
         s/\s*\r?\n$//;
         my %op = split(/[= ]+/, $_);
         my @args = split(/,/, $op{args});
         # only initial finds are used during reconstruction
         next if ($args[0] ne 'find' || defined $op{try});
-        $find{unescape($args[1])} = 1;
+        $links{unescape($args[1])} = 1;
     }
-    log_close('tree', $gzs);
-    $find{t_find} = $meta{t_find};
-    untie %find;
-    #TODO: error handling if cannot tie or open tree
+    log_close('find', $gzs);
+    $links{t_find} = $meta{t_find};
+    untie %links;
+    #TODO: error handling if cannot tie or open find
 }
 
 #####################
@@ -1192,7 +1192,8 @@ sub format_bytes {
 sub get {
     # retrieve global and user database from file
     %mounts = %{mp_retrieve($conf{mount_db})};
-    %umounts = %{mp_retrieve($conf{umount_db})} if (!scalar(keys %mounts));
+    # do not reload umounts if already done in put() as may have ustore entries
+    %umounts = %{mp_retrieve($conf{umount_db})} if (!scalar(keys %umounts));
 
     my $warn = delete $meta{"warn_$opts{host}$opts{cid}"};
     if ($warn > 0) {
@@ -1266,13 +1267,13 @@ sub get {
             push(@order, splice(@order, 0,
                 ($ihost * $meta{clients} + $icli) % scalar(@order)));
             # always process chattrs first and dir chattrs last
-            push(@logs, "chattr", @order, "tree", "rtree");
+            push(@logs, qw(chattr ln), @order, qw(mkdir find rmkdir));
         } else {
             # process all copies before all sums before all cksums
-            push(@logs, qw(tree cp sum cksum chattr rtree)) 
+            push(@logs, qw(find mkdir cp sum cksum ln chattr rmkdir)) 
         }
     } else {
-        unshift(@logs, "tree");
+        unshift(@logs, "find");
     }
 
     # keep copy of original doing so changes don't affect its own processing
@@ -1280,7 +1281,7 @@ sub get {
     # reverse size so won't end in 0 (so .N0 not reduced to .N after ++)
     my $ndoing = "0." . reverse($meta{"$opts{doing}_size"});
     my $gzs = {};
-    my ($ldoing, $kdoing, $size, $files, $ops, $all, $secs, $skip);
+    my ($ldoing, $kdoing, $size, $files, $ops, $all, $secs, $skip, $gettry, $getcmd);
     my $max_files = parse_bytes($conf{max_files});
     my (%diskfs, %localfs, %rtthost);
     my %cli_load = split(/[= ]+/, $meta{"load_$opts{host}$opts{cid}"});
@@ -1289,7 +1290,7 @@ sub get {
     $opts{interval} = max($meta{interval}, $ncli * $meta{ra_mgr});
     LOG: foreach my $log (@logs) {
         # process dir attrs last by themselves
-        last if ($log eq 'rtree' && (!$meta{last} || $meta{t_run} || $ops ||
+        last if ($log eq 'rmkdir' && (!$meta{last} || $meta{t_run} || $ops ||
                 $skip || (!$meta{sanity} && !$meta{preserve})));
         my $line;
         if ($log eq $opts{doing}) {
@@ -1300,24 +1301,26 @@ sub get {
             log_getline($log, $gzs, 1);
             next if (!defined $gzs->{$log});
             #TODO: need error if cannot be opened or seeked
-            # seek from end for first rtree since don't have real size
-            my $whence = $log eq 'rtree' && $meta{$log} == -1 ? 2 : 0;
+            # seek from end for first rmkdir since don't have real size
+            my $whence = $log eq 'rmkdir' && $meta{$log} == -1 ? 2 : 0;
             $gzs->{$log}->seek($meta{$log}, $whence);
         }
 
         while ($all < $max_files && ($secs < $opts{interval} ||
                 $size < $meta{size} && $all < $meta{files}) &&
                 ($log =~ /^doing_/ && (($kdoing, $line) = each %{$ldoing}) ||
-                $log eq 'rtree' && defined($line = last_line($gzs->{rtree})) ||
-                $log !~ /^(?:doing_|rtree)/ &&
+                $log eq 'rmkdir' && defined($line = last_line($gzs->{rmkdir})) ||
+                $log !~ /^(?:doing_|rmkdir)/ &&
                     defined($line = log_getline($log, $gzs)))) {
             $line =~ s/\s*\r?\n$//;
-            # first line of rtree will be blank
+            # first line of rmkdir will be blank
             next if (!$line);
             my %op = split(/[= ]+/, $line);
             my @args = split(/,/, $op{args});
             my $cmd = shift @args;
             my $save_arg = $args[-1];
+            # ignore retried entries in rmkdir to avoid duplicate chattrs
+            next if ($log eq 'rmkdir' && defined $op{try});
             # never propagate suspend
             delete $op{suspend};
             if ($log eq $opts{doing}) {
@@ -1325,9 +1328,6 @@ sub get {
             } elsif ($log =~ /^doing_/) {
                 delete $ldoing->{$kdoing};
             }
-
-            # only mkdirs are used for dir chattrs
-            next if ($cmd ne 'mkdir' && $log eq 'rtree');
 
             if ($log =~ /^doing_/ && $op{try} >= $meta{retry}) {
                 # this operation was originally not completed so record failure
@@ -1410,6 +1410,13 @@ sub get {
                     next LOG;
                 }
             }
+
+            # ensure only one tool will be used per batch
+            if (!defined $getcmd) {
+                $getcmd = $cmd;
+                $gettry = $op{try};
+            }
+            next LOG if ($cmd ne $getcmd || $op{try} ne $gettry);
 
             # process paths again while allowing hash writes
             my $ir = $args[0] =~ /^\// ? 1 : 0;
@@ -1516,7 +1523,7 @@ sub get {
             # never count mkdir or chattr on dir against the file total
             $files++ if (scalar(@args) > 1);
             $size += $op{size} if ($cmd =~ /^(?:cp|sum|cksum)/);
-            $ops++ if ($log ne 'rtree');
+            $ops++ if ($log ne 'rmkdir');
             $all++;
             if ($meta{"ra_$cmd"} > 0) {
                 $secs += ($cmd =~ /^(?:cp|sum|cksum)/ ?
@@ -1535,8 +1542,8 @@ sub get {
                 $meta{$log} = tell $gzs->{$log};
             }
 
-            # rtree is for preserving directory attributes
-            $cmd = "chattr" if ($log eq 'rtree');
+            # rmkdir is for preserving directory attributes
+            $cmd = "chattr" if ($log eq 'rmkdir');
             # rejoin mapped arguments
             $op{args} = join(",", $cmd, @args);
             $op{host} = $opts{host};
@@ -1575,12 +1582,12 @@ sub get {
         }
         log_close($log, $gzs) if ($log !~ /^doing_/);
         if ($log ne $opts{doing} && $log =~ /^doing_/) {
-            log_print($log, $gzs, escape(Data::MessagePack->pack($ldoing)) . "\n");
+            log_print($log, $gzs, yenc_encode(Data::MessagePack->pack($ldoing)) . "\n");
             log_close($log, $gzs);
         }
     }
 
-    my $errs = sum(map {$meta{"e_$_"}} qw(chattr cksum cp find ln mkdir sum));
+    my $errs = sum(map {$meta{"e_$_"}} @stages);
     if (!$errs && $meta{last} && !$all && !$meta{t_run} && $meta{tar_mv}) {
         foreach my $file (grep(/^tar_split_/, keys %meta)) {
             next if ($meta{$file} != 1);
@@ -1629,7 +1636,7 @@ sub get {
     }
 
     # send individual transport options
-    foreach (qw(bbcp bbftp gridftp mcp msum),
+    foreach (qw(bbftp mcp msum),
             $meta{secure} ? "ssh_secure" : "ssh") {
         my $val = $conf{"opts_$_"};
         next if (!$val);
@@ -1706,8 +1713,7 @@ sub get {
     if (grep(/^env_/, keys %meta) < $meta{hosts} || $meta{"clients_$opts{host}"}) {
         # run client on other/same hosts if there are enough files
         my $qfiles = $meta{t_split} - $meta{t_run};
-        $qfiles += $meta{"t_$_"} - $meta{"d_$_"} - $meta{"e_$_"}
-            foreach (qw(chattr cksum cp find ln mkdir sum));
+        $qfiles += $meta{"t_$_"} - $meta{"d_$_"} - $meta{"e_$_"} foreach (@stages);
         my $qsize = $meta{s_total} - $meta{s_run} - $meta{s_error};
         $qsize += 2 * $meta{s_total} if ($meta{verify});
         $qsize -= $meta{"s_$_"} foreach (qw(cksum cp sum));
@@ -1795,7 +1801,7 @@ sub get_doing {
     $line = last_line($gz) while ($past-- > 0);
     my $log = basename($arg);
     log_close($log, {$log => $gz});
-    return Data::MessagePack->unpack(unescape($line)) if ($line);
+    return Data::MessagePack->unpack(yenc_decode($line)) if ($line);
     return {};
 }
 
@@ -1841,7 +1847,7 @@ sub get_meta {
     if ($meta && defined $mtell && $mtell > 0) {
         # metadata corrupted so revert to last known good state
         foreach my $file (glob "$opts{base}/*") {
-            next if ($file =~ /\/(?:find|lock|meta|\S+\.gzi)$/);
+            next if ($file =~ /\/(?:links|lock|meta|mon_\S+|\S+\.gzi)$/);
             my $log = $file;
             $log =~ s/.*\///;
             my $size = defined $meta->{"$log\_size"} ? $meta->{"$log\_size"} : 0;
@@ -1852,8 +1858,8 @@ sub get_meta {
             # remove associated index file
             unlink("$file.gzi");
         }
-        # rebuild find db since it may contain reverted operations
-        build_find() if ($meta{dereference} && !$meta{'extract-tar'});
+        # rebuild link db since it may contain reverted operations
+        build_links() if ($meta{dereference} && !$meta{'extract-tar'});
         # truncate last in case any other operations interrupted
         truncate($mfile, $mtell);
     }
@@ -1954,8 +1960,8 @@ sub id_status {
     my $t = dclone($t0);
 
     my %files = (
-        queue => [qw(cp sum cksum chattr)],
-        warn => [qw(cp sum cksum chattr)],
+        queue => [@stages],
+        warn => [@stages],
         run => [map {basename $_} glob("$opts{base}/doing_*")],
         error => ["error"],
         done => ["done"],
@@ -2071,7 +2077,7 @@ sub id_status {
 sub init_id {
     # initialize log files
     if (!defined $opts{restart}) {
-        log_print($_) foreach (qw(alert chattr cksum cp done error sum tree));
+        log_print($_) foreach (@stages, qw(alert done error));
     }
 
     # initialize options with default values
@@ -2177,15 +2183,13 @@ sub lock_dir {
 # close Compress::BGZF object for given log and remove from given hash
 sub log_close {
     my ($log, $gzs) = @_;
-    # find/ln/mkdir are stored in cp
-    $log = "cp" if ($log =~ /^(?:find|ln|mkdir)$/);
     if (defined $gzs->{$log}) {
         my $bgr = tied *{$gzs->{$log}};
         if (ref $bgr eq 'Compress::BGZF::Reader' &&
                 defined $bgr->{idx}->[-1]) {
             my ($coff, $uoff) = @{$bgr->{idx}->[-1]};
-            # rtree is just tree in reverse
-            my $f = $log eq 'rtree' ? 'tree' : $log;
+            # rmkdir is just mkdir in reverse
+            my $f = $log eq 'rmkdir' ? 'mkdir' : $log;
             $f = "$opts{base}/$f.gzi";
             local $SIG{__WARN__} = sub {};
             # ignore exceptions since gzi is only to increase performance
@@ -2207,11 +2211,9 @@ sub log_getline {
     my ($log, $gzs, $noread) = @_;
     # untaint $log
     $log = $1 if ($log =~ /^(\w+)$/);
-    # find/ln/mkdir are stored in cp
-    $log = "cp" if ($log =~ /^(?:find|ln|mkdir)$/);
     if (!defined $gzs->{$log}) {
-        # rtree is just tree in reverse
-        my $f = $log eq 'rtree' ? 'tree' : $log;
+        # rmkdir is just mkdir in reverse
+        my $f = $log eq 'rmkdir' ? 'mkdir' : $log;
         # open new reader and store in given hash
         $gzs->{$log} = Compress::BGZF::Reader->new_filehandle("$opts{base}/$f");
         # error conditions will trigger exception
@@ -2229,8 +2231,6 @@ sub log_print {
     my ($log, $gzs, $line) = @_;
     # untaint $log
     $log = $1 if ($log =~ /^(\w+)$/);
-    # find/ln/mkdir are stored in cp
-    $log = "cp" if ($log =~ /^(?:find|ln|mkdir)$/);
     if (!defined $line) {
         log_close($log, $gzs);
         unlink("$opts{base}/$log.gzi");
@@ -2445,19 +2445,24 @@ sub meta {
 sub monitor {
     if ($_[0]) {
         # find monitor processes
-        my $fhpid = open3_run([-1, undef, -1],
-            "ps -o pid,command -u $opts{user}");
-        if (defined $fhpid) {
-            while (defined ($_ = $fhpid->[1]->getline)) {
-                # do not signal monitors watching other ids
-                next if (/--id/ && !/--id(\s+|=)$opts{id}/);
-                # notify processes using SIGCHLD
-                kill('CHLD', $1) if (/^\s*(\d+).*shift-mgr.*--monitor/);
+        foreach my $ph (glob "$conf{user_dir}/mon_* $opts{base}/mon_*") {
+            my $base = basename($ph);
+            my ($pid, $host);
+            # untaint pid and host
+            if ($base =~ /^mon_(\d+)_([\w.-]+)$/) {
+                ($pid, $host) = ($1, $2);
             }
-            open3_wait($fhpid);
+            # notify processes using SIGCHLD
+            open3_get([-1, undef, -1], "ssh $host kill -s CHLD $pid");
         }
         return;
     }
+    # indicate monitoring for other processes
+    $monfile = $opts{id} ? $opts{base} : $conf{user_dir};
+    $monfile .= join("_", "/mon", $$, $self);
+    # a failure to create the file will revert to once a minute monitoring
+    open(FILE, '>', $monfile);
+    close FILE;
     # set parameters for status() calls
     $opts{status} = $opts{monitor};
     $opts{state} = "run";
@@ -2488,6 +2493,7 @@ sub monitor {
         # time is usually only set once upon invocation
         $time = time;
     }
+    # monitor file will be cleaned up by END
 }
 
 #####################
@@ -2617,40 +2623,29 @@ sub parse_bytes {
 ##############
 # print output suitable for gnuplot to stdout for selected transfers
 sub plot {
-    #TODO: fail={errors, warnings, corruptions, exceptions}, fs
-    #TODO: not all gnuplots have pdf terminal
-    #TODO: find not being shown properly?
-    my $by;
-    if ($opts{plot} =~ /^(client|fs|host|id|user)$/) {
+    #TODO: fail={errors, warnings, corruptions, exceptions}
+    my ($by, $batch);
+    if ($opts{plot} =~ /^(?:client|fs|host|id|net|user)$/) {
         ($by, $opts{plot}) = ($opts{plot}, "io");
-    } elsif ($opts{plot} =~ /(\S+):(\S+)/) {
-        ($by, $opts{plot}) = ($1, $2);
-        die "Can only plot by client, fs, host, id, or user\n"
-            if ($by !~ /^(client|fs|host|id|user)$/);
+    } elsif ($opts{plot} =~ /(\S+)([:\/])(\S+)/) {
+        ($by, $batch, $opts{plot}) = ($1, $2, $3);
+        $batch = $batch eq ':' ? 0 : 1;
+        die "Can only plot by client, fs, host, id, net, or user\n"
+            if ($by !~ /^(?:client|fs|host|id|net|user)$/);
     } elsif (!$opts{plot}) {
         $opts{plot} = "io,meta";
     }
-    my @io = $by eq 'fs' ? qw(get put sum cksum) : qw(cp sum cksum);
-    my $sep = $by ? "+" : ",";
-    $opts{plot} =~ s/io/join($sep,@io)/eg;
-    $opts{plot} =~ s/meta/join($sep,qw(find mkdir ln chattr))/eg;
-    die "Unsupported operation/operator found in plot expression\n"
-        if ($opts{plot} !~ /^((chattr|cksum|cp|find|get|ln|mkdir|put|sum)([+,]|$))+$/);
-    # remove trailing operators since above regex doesn't catch
-    $opts{plot} =~ s/[+,]+$//;
-    die "Cannot mix io and meta operations in sum expressions\n"
-        if ($opts{plot} =~ /(chattr|find|ln|mkdir)\+(cksum|cp|sum)/ ||
-                $opts{plot} =~ /(cksum|cp|sum)\+(chattr|find|ln|mkdir)/);
+    $opts{plot} =~ s/io/join(",",qw(cp sum cksum))/eg;
+    $opts{plot} =~ s/meta/join(",",qw(find mkdir ln chattr))/eg;
+    $opts{plot} =~ s/tool/join(",",qw(bbftp fish fish-tcp mcp msum rsync shift-cp shift-sum))/eg;
+    die "Unsupported term found in plot expression\n"
+        if ($opts{plot} !~ /^((?:chattr|cksum|cp|find|ln|mkdir|sum|bbftp|fish|fish-tcp|mcp|msum|rsync|shift-cp|shift-sum)(,|$))+$/);
+    # remove trailing commas since above regex doesn't catch
+    $opts{plot} =~ s/,+$//;
 
-    my %keys;
-    $keys{$_} = "s_" foreach (@io);
-    $keys{$_} = "d_" foreach (qw(chattr find ln mkdir));
-
-    my @cmds = qw(chattr cksum find ln mkdir sum);
-    push(@cmds, $by eq 'fs' ? qw(get put) : "cp");
     my %times;
     my @metas;
-    my %seen;
+    my %items;
     my $dir = $> != 0 ? $conf{user_dir} : $opts{user_dir};
     my $user = $> != 0 ? $opts{user} : "*";
     do {
@@ -2658,8 +2653,6 @@ sub plot {
         $dir .= "/*.more";
     } while (scalar(glob $dir));
     foreach my $file (@metas) {
-        my $user = $file;
-        $user =~ s/.*\/([\w-]+)\.\d+\/meta/$1/g;
         my $id = $file;
         if ($> != 0) {
             $id =~ s/.*\.|\/meta//g;
@@ -2675,201 +2668,270 @@ sub plot {
         %meta = %{get_meta($file)};
         # skip transfers that use --sync
         next if ($meta{sync});
-        my $state = "run";
-        # compute number of operations in various states
-        my $done = sum(map {$meta{"d_$_"}} qw(chattr cksum cp find ln mkdir sum));
-        my $error = sum(map {$meta{"e_$_"}} qw(chattr cksum cp find ln mkdir sum));
-        my $total = sum(map {$meta{"t_$_"}} qw(chattr cksum cp find ln mkdir sum));
-        # determine transfer state
-        if ($meta{last} && defined $meta{time1} && $done == $total) {
-            $state = "done";
-        } elsif ($meta{stop}) {
-            $state = "stop";
-        } elsif ($meta{time1}) {
-            $state = "error";
-        } else {
-            if ($meta{w_run} > 0) {
-                $state .= "+warn";
-            }
-            if ($error > 0) {
-                $state .= "+error";
-            }
-            if (grep(/^throttled_/, keys(%meta))) {
-                $state .= "+throttle";
-            }
-        }
-        $state .= "+alert" if ($meta{e_alert} || $meta{e_silent});
+        my $state = state();
         # skip transfers that do not match the given state
         next if (!$opts{id} && $opts{state} &&
                 $state !~ /(?:^|\+)\Q$opts{state}\E(?:$|\+)/);
+
+        my $group;
+        if ($by eq 'id') {
+            $group = $id;
+        } elsif ($by eq 'user') {
+            $group = $file;
+            $group =~ s/.*\/([\w-]+)\.\d+\/meta/$1/g;
+        }
+
         my %gets;
-        my $meta0;
+        my ($meta0, $meta);
+        my ($time0, $time1);
         my $fh;
         open($fh, '<', $file) or die;
         while (my $line = <$fh>) {
             last if (!defined $line);
             last if (substr($line, 0, 1) != '[' || substr($line, -1, 1) != ']');
+            $meta0 = $meta;
             # note that this doesn't handle Math::BigInt as is normally done
-            my $meta = eval {Data::MessagePack->unpack(uncompress(
+            $meta = eval {Data::MessagePack->unpack(uncompress(
                 yenc_decode(substr($line, 1, -1))))};
             next if (!$meta);
             my $client = $meta->{update_id};
             my $host = $client;
             $host =~ s/\.\d+$//;
             my $last = "last_$host";
-            next if ($meta0->{$last} == $meta->{$last});
-            my $time = $meta->{$last};
+            my $ltime = $meta->{$last};
+
+            if (!defined $time0) {
+                # skip times that were too far in the past and will clutter plot
+                next if ($> == 0 && $ltime + $conf{data_expire} < $time);
+                # ensure start time is added for difference to first operation
+                $time0 = $ltime;
+                $times{$time0} = [] if (!defined $times{$time0});
+            }
+            if (!defined $time1 && $meta->{time1}) {
+                # ensure start time is added for difference to last operation
+                $time1 = $meta->{time1};
+                $times{$time1} = [] if (!defined $times{$time1});
+            }
             # record rates when hosts have completed operations (put)
             if ($gets{$client} &&
-                    sum(map {$meta->{"$_\_size"}} qw(chattr cksum cp done error sum tree)) >
-                    sum(map {$meta0->{"$_\_size"}} qw(chattr cksum cp done error sum tree))) {
+                    sum(map {$meta->{"$_\_size"}} (@stages, qw(done error))) >
+                    sum(map {$meta0->{"$_\_size"}} (@stages, qw(done error)))) {
                 my %fs;
                 if ($by eq 'fs') {
-                    foreach my $cmd (@cmds) {
-                        foreach (grep(/^$keys{$cmd}${cmd}_/, keys %{$meta})) {
-                            s/^$keys{$cmd}${cmd}_//;
-                            # ignore <op>_size metadata
-                            next if ($_ eq 'size');
-                            $fs{$_} = 1;
-                        }
+                    # find all file systems in use
+                    foreach (grep(/^[ds]_(?:chattr|cksum|find|get|ln|mkdir|put|sum)_/,
+                            keys %{$meta})) {
+                        s/^\w+_\w+_//;
+                        $fs{$_} = 1;
                     }
                 } else {
                     $fs{""} = 1;
                 }
-                foreach my $fs (keys %fs) {
-                    my $data;
-                    foreach my $cmd (@cmds) {
-                        my $fscmd = $keys{$cmd} . $cmd;
-                        $fscmd .= "_$fs" if ($fs);
-                        my $rate = $meta->{$fscmd} - $meta0->{$fscmd};
-                        # io operations are shown in MB/s
-                        $rate /= 1E6 if ($keys{$cmd} eq 's_');
-                        # throw out negative results due to retries
-                        $rate = 0 if ($rate < 0);
-                        $data->{$cmd} = ceil($rate / ($time - $gets{$client}));
+                if ($by eq 'client') {
+                    $group = $client;
+                } elsif ($by eq 'host') {
+                    $group = $host;
+                } elsif ($by eq 'net') {
+                    $group = "unknown";
+                    if ($meta->{origin_ip}) {
+                        # change origin to subnet
+                        $group = $meta{origin_ip};
+                        $group =~ s/\.\d+$/\.0/;
                     }
-                    if (defined $data) {
-                        # add to operations if something done (i.e. not --alive)
-                        $times{$gets{$client}} = []
-                            if (!defined $times{$gets{$client}});
-                        $times{$time} = [] if (!defined $times{$time});
-                        $data->{user} = $user;
-                        $data->{id} = $id;
-                        $data->{host} = $host;
-                        $data->{client} = $client;
-                        $data->{fs} = $fs;
-                        # computed rates begin when the get occurred
-                        push(@{$times{$gets{$client}}}, $data);
+                }
+                foreach my $fs (keys %fs) {
+                    if ($by eq 'fs') {
+                        # remove all but server mount point
+                        my $f = $fs;
+                        $f =~ s/^[^\/]*//;
+                        $group = $fs ? $f : "unknown";
+                    }
+                    my $data;
+                    foreach my $cmd (split(/,/, $opts{plot})) {
+                        my ($count, $rate);
+                        if ($cmd eq 'find') {
+                            # use number of operations generated as rate basis
+                            # (this is inaccurate when #fs>1 in a find batch)
+                            $rate = sum(map {$meta->{"t_$_"} - $meta0->{"t_$_"}} qw(cp ln mkdir));
+                        } elsif ($cmd =~ /^(?:chattr|cksum|ln|mkdir|sum)$/) {
+                            my $fscmd = "d_$cmd";
+                            if ($cmd =~ /sum$/) {
+                                $count = $meta->{$fscmd} - $meta0->{$fscmd};
+                                $fscmd = "s_$cmd";
+                            }
+                            $fscmd .= "_$fs" if ($fs);
+                            $rate = $meta->{$fscmd} - $meta0->{$fscmd};
+                            # io operations are shown in MB/s
+                            $rate /= 1E6 if ($cmd =~ /sum$/);
+                        } else {
+                            $count = $meta->{"d_$cmd"} - $meta0->{"d_$cmd"};
+                            next if ($count <= 0);
+                            # this assumes one tool per batch (get() ensures)
+                            my @fscmds = $cmd =~ /sum$/ ? qw(cksum sum) :
+                                ($fs ? qw(get put) : qw(cp));
+                            # msum and shift-sum
+                            foreach my $fscmd (@fscmds) {
+                                $fscmd = "s_$fscmd";
+                                $fscmd .= "_$fs" if ($fs);
+                                $rate += $meta->{$fscmd} - $meta0->{$fscmd};
+                            }
+                            # io operations are shown in MB/s
+                            $rate /= 1E6;
+                        }
+                        # throw out negative results due to retries
+                        next if ($rate <= 0);
+                        my $tdiff = $ltime - $gets{$client};
+                        $tdiff = 1 if (!$tdiff);
+                        $data->{$cmd} = ceil($rate / $tdiff);
+                        # add batch size as negligible fraction
+                        $data->{$cmd} .= ".00$count" if ($batch && $count > 0);
+                    }
+                    next if (!defined $data);
+
+                    # add to operations if something done (i.e. not --alive)
+                    $times{$gets{$client}} = []
+                        if (!defined $times{$gets{$client}});
+                    $times{$ltime} = [] if (!defined $times{$ltime});
+
+                    foreach (keys %{$data}) {
+                        my $key = $_;
+                        $key = "$group [$key]" if ($by);
+                        $items{$key} = 1;
+                    }
+                    $data->{group} = $group if ($by);
+
+                    if ($batch) {
+                        $data->{time} = $ltime;
+                    } elsif (!$batch) {
                         # computed rates end when the put occurred
                         my $data2 = dclone($data);
-                        $data2->{$_} *= -1 foreach (@cmds);
-                        push(@{$times{$time}}, $data2);
-                        # record id/host/user for creation of header/data rows
-                        $seen{user}->{$user} = 1;
-                        $seen{id}->{$id} = 1;
-                        $seen{host}->{$host} = 1;
-                        $seen{client}->{$client} = 1;
-                        $seen{fs}->{$fs} = 1;
+                        foreach (split(/,/, $opts{plot})) {
+                            $data2->{$_} *= -1;
+                        }
+                        push(@{$times{$ltime}}, $data2);
                     }
+                    # computed rates begin when the get occurred
+                    push(@{$times{$gets{$client}}}, $data);
                 }
                 # no more outstanding operations by client
                 delete $gets{$client};
             }
             # record when clients have operations in progress (get)
-            $gets{$client} = $time
+            $gets{$client} = $ltime
                 if ($meta->{"doing_$client\_size"} >
                     $meta0->{"doing_$client\_size"});
-            $meta0 = $meta;
         }
         close $fh;
     }
 
-    my @header;
-    if ($by) {
-        foreach my $col (sort(split(/,/, $opts{plot}))) {
-            foreach my $group (sort(keys %{$seen{$by}})) {
-                push(@header, "[$col] $group");
-            }
-        }
-    } else {
-        @header = split(/,/, $opts{plot});
-    }
+    my @items = sort(keys %items);
+    die "No suitable transfers to plot\n" if (!scalar(@items));
 
     # embed data inline so output can be piped directly into gnuplot
     print "# This output requires gnuplot version 5 or higher\n";
-    print '$data << EOF', "\n";
-    print join(" ", "time", map {"\"$_\""} @header), "\n";
+    print '$data << EOD', "\n";
 
-    my ($time0, $time1);
-    my %vals = map {$_ => 0} @header;
-    # ensure all initial rates are zero
-    print join(" ", 0, values %vals), "\n";
-    foreach my $time (sort {$a <=> $b} keys(%times)) {
-        # record first time witnessed
-        $time0 = $time if (!defined $time0);
-        foreach my $val (@{$times{$time}}) {
-            for (my $i = 0; $i < scalar(@header); $i++) {
-                my $head = $header[$i];
-                my ($col, $group) = split(/\s/, $head);
-                next if ($by && $val->{$by} ne $group);
-                $col =~ s/^[[]|[]]$//g;
-                my @adds = split(/\+/, $col);
-                foreach my $add (@adds) {
-                    $vals{$head} += $val->{$add};
+    my $time1;
+    my %vals;
+    my %stats;
+    my $sum;
+    my %sums;
+    foreach my $ltime (sort {$a <=> $b} keys(%times)) {
+        if (!$batch && $time1) {
+            foreach my $group (keys %vals) {
+                while (my ($k, $v) = each %{$vals{$group}}) {
+                    next if ($v <= 0);
+                    $k = "$group [$k]" if ($group);
+                    print join(" ", $time1, $ltime, "\"$k\"", $v), "\n";
+                    $stats{n}++;
+                    $stats{s} += $v;
+                    $stats{sq} += $v * $v;
                 }
             }
         }
-        # populate adjusted time and data columns
-        print join(" ", $time - $time0, map {$vals{$_}} @header), "\n";
+        foreach my $val (@{$times{$ltime}}) {
+            my ($group, $t) = delete @{$val}{qw(group time)};
+            while (my ($k, $v) = each %{$val}) {
+                if ($batch) {
+                    $k = "$group [$k]" if ($group);
+                    print join(" ", $ltime, $t, "\"$k\"", $v), "\n";
+                    $stats{n}++;
+                    $stats{s} += $v;
+                    $stats{sq} += $v * $v;
+                } else {
+                    $vals{$group}->{$k} += $v;
+                    $sum->{$k} += $v;
+                }
+            }
+        }
+        $sums{$ltime} = dclone($sum) if (!$batch && ref $sum);
         # record last time witnessed
-        $time1 = $time;
+        $time1 = $ltime;
     }
-    # ensure all final rates are zero
-    print join(" ", $time1 - $time0, map {0} @header), "\n";
-    print "EOF\n";
+    print "EOD\n";
+
+    if (!$batch) {
+        print '$max << EOD', "\n";
+        my @sums = sort {$a <=> $b} keys(%sums);
+        my $t0 = $sums[0];
+        my $tdiff = int(($time1 - $t0) / 100);
+        $tdiff = 1 if (!$tdiff);
+        my @max = (0, 0);
+        foreach my $ltime (@sums) {
+            if ($ltime >= $t0 + $tdiff && $max[0] + $max[1] > 0) {
+                print "$t0 $max[0] $max[1]\n";
+                $t0 = $t0 + $tdiff;
+                @max = (0, 0);
+            }
+            my @max1;
+            while (my ($k, $v) = each %{$sums{$ltime}}) {
+                my $io = $k =~ /^(?:find|mkdir|ln|chattr)$/ ? 1 : 0;
+                $max1[$io] += $v;
+            }
+            foreach (0, 1) {
+                $max[$_] = $max1[$_] if ($max1[$_] > $max[$_]);
+            }
+        }
+        print "EOD\n";
+    }
+
+    if ($stats{n}) {
+        $stats{m} = $stats{s} / $stats{n};
+        $stats{dev} = sqrt($stats{sq} / $stats{n} - ($stats{s} / $stats{n})**2);
+    }
+    my $lw = "lw " . min(10, max(.75, (50 / scalar(@items))));
+    my $font = "font '," . max(2, min(10, ceil(300 / scalar(@items)))) . "'";
+    my $ps = "ps " . min(1, max(.075, (5 / scalar(@items))));
+    my $td = 3600 * ((24 + (gmtime($time))[2] - (localtime($time))[2]) % 24);
 
     # set basic plot characteristics
     print "set terminal pdf enhanced\n";
-    print "set xlabel 'Time (s)' textcolor rgb 'white'\n";
     print "set border linecolor rgb 'white'\n";
-    print "set key Left reverse font ',6' outside textcolor rgb 'white'\n";
+    print "set format x '%m/%d %H:%M:%S'\n";
+    print "set lmargin at screen .15\n";
     print "set obj 1 rect behind from screen 0,0 to screen 1,1 fillcolor rgb 'black' behind\n";
-    my $unit = $opts{plot} =~ /cksum|cp|sum/ ? "MB" : "ops";
-    my $type = $opts{plot} =~ /cksum|cp|sum/ ? "I/O" : "Meta";
-    print "set ylabel '$type performance ($unit/s)' textcolor rgb 'white'\n";
-
-    # set color of each data column (based on savors palette)
-    my @palette = qw(
-        FF0000 FF7F00 FFFF00 80FF00 00FF00 00FFFF 0080FF 0000FF 7F00FF FF00FF FF007F
-        CC0000 CC6600 CCCC00 66CC00 00CC00 00CCCC 0066CC 0000CC 6600CC CC00CC CC0066
-        990000 994C00 999900 4D9900 009900 009999 004C99 000099 4D0099 990099 99004D
-        FF7F7F FFBF80 FFFF7F BFFF80 80FF80 80FFFF 80BFFF 807FFF BF7FFF FF7FFF FF7FBF
-        CC6666 CC9966 CCCC66 99CC66 66CC66 66CCCC 6699CC 6666CC 9966CC CC66CC CC6699
-        994C4D 99734C 99994D 73994D 4D994D 4D9999 4D7399 4D4C99 734C99 994C99 994C73
-        FFBFBF FFDFBF FFFFBF DFFFBF BFFFBF BFFFFF BFDFFF BFBFFF DFBFFF FFBFFF FFBFDF
-        CC9999 CCB399 CCCC99 B3CC99 99CC99 99CCCC 99B2CC 9999CC B399CC CC99CC CC99B3
-    );
-    foreach my $i (2 .. scalar(@header) + 1) {
-        print "set style line $i linecolor rgb '#",
-            # reuse colors when more columns than palette colors
-            $palette[($i - 2) % scalar(@palette)], "'\n";
-    }
-
-    if ($opts{plot} =~ /chattr|find|ln|mkdir/ &&
-            $opts{plot} =~ /cksum|cp|sum/) {
-        # set up dual y-axes when plotting both io and meta operations
-        print "set ytics nomirror\n";
-        print "set y2tics nomirror\n";
-        print "set y2range [0:]\n";
-        print "set y2label 'Meta performance (ops/s)' textcolor rgb 'white'\n";
-    }
+    print "set palette defined ( 0 '#2f0087', 1 '#6200a4', 2 '#9200a6', 3 '#ba2f8a', 4 '#d85b69', 5 '#ee8949', 6 '#f6bd27', 7 '#e4fa15' )\n";
+    print "set style arrow 1 nohead lc palette $lw\n";
+    print "set timefmt '%s'\n";
+    print "set xdata time\n";
+    print "set xlabel 'Time' textcolor rgb 'white' offset screen 0,.05\n";
+    print "set xtics nomirror rotate by 60 right font ',6'\n";
+    print "set ytics nomirror $font\n";
+    print "unset key\n";
+    print "set ylabel 'Rate (I/O: MB/s, Meta: ops/s)' textcolor rgb 'white'\n";
+    print "set y2tics nomirror\n" if (!$batch);
+    my $lc = $stats{m}+2 * $stats{dev};
+    print "lc(x) = x > $lc ? $lc : x\n";
+    print "set yrange [.5:", scalar(@items) + .5, "]\n";
+    print "item(i) = ", join(" : ", map {"(i eq \"$items[-$_]\" ? $_"}
+        (1..scalar(@items))), " : -1", ")" x scalar(@items), "\n";
     print "plot \\\n";
-    my $i = 2;
-    foreach my $head (@header) {
-        my $axis = $head =~ /cksum|cp|sum/ ? "" : " axes x1y2";
-        print "  \$data using 1:$i ti columnheader($i) with steps ls $i$axis";
-        $i++;
-        print ",\\\n" if ($i < scalar(@header) + 2);
+    if ($batch) {
+        print "  \$data using (\$1-$td):(item(strcol(3))):(lc(\$4)):ytic(3) with points lc palette pt 7 $ps\n";
+    } else {
+        print "  \$data using (\$1-$td):(item(strcol(3))):(\$2-\$1):(0):(lc(\$4)):ytic(3) with vector as 1, \\\n";
+        print "  \$max using (\$1-$td):2 axes x1y2 with points lc \"green\" pt 7 ps .075, \\\n";
+        print "  \$max using (\$1-$td):3 axes x1y2 with points lc \"blue\" pt 7 ps .075\n";
     }
     print "\n";
 }
@@ -2880,7 +2942,7 @@ sub plot {
 # record the state of file operations that were processed by a client
 sub put {
     # only process a put when the corresponding get was from this host
-    return if ($opts{put} && $opts{put} ne $self);
+    return if ($opts{put} && $opts{put} ne $self && $conf{sync_host});
     # retrieve global and user database from file
     %mounts = %{mp_retrieve($conf{mount_db})};
     %umounts = %{mp_retrieve($conf{umount_db})};
@@ -2888,7 +2950,7 @@ sub put {
     my $gzs = {};
     my $more_finds = $opts{more_finds} + $meta{d_find} + $meta{e_find} ==
         $meta{t_find} ? 0 : 1;
-    my %find;
+    my %links;
     my %mnts;
     my %rates;
     $meta{"warn_$opts{host}$opts{cid}"} = -1;
@@ -3071,9 +3133,7 @@ sub put {
                 $cmd = "cksum";
                 $op{args} =~ s/^[^,]+/$cmd/;
             } elsif (($meta{sanity} || $meta{preserve}) &&
-                    ($cmd =~ /^(?:cksum|cp|ln)/ ||
-                    # tar mkdirs are not put in tree so are not handled by rtree
-                    $cmd eq 'mkdir' && $meta{'create-tar'})) {
+                    $cmd =~ /^(?:cksum|cp|ln)/) {
                 if ($meta{silent} && $cmd eq 'cksum' &&
                         detect_silent(\%op, $args[0], $args[1])) {
                     $line =~ s/(?:text|tool)=\S+//g;
@@ -3313,9 +3373,7 @@ sub put {
             # do not delete hash when retrying cksum
             delete $op{hash} if ($op{args} !~ /^cksum/);
             $line = join(" ", map {"$_=$op{$_}"} sort(keys %op));
-            # find retries must go in tree during tar creation
-            my $log = $cmd eq 'find' && $meta{'create-tar'} ? "tree" : $cmd;
-            log_print($log, $gzs, "$line\n");
+            log_print($cmd, $gzs, "$line\n");
         } elsif (defined $op{size}) {
             $meta{"t_$cmd"}++;
             $meta{t_chattr}++ if ($meta{sanity} || $meta{preserve});
@@ -3391,8 +3449,8 @@ sub put {
                         $meta{"tar_size_$tar"} >= $meta{'split-tar'}) {
                     # indicate last tar entry so final padding can be added
                     $op{tar_last} = 1;
-                    # insert chattr op in tree to preallocate and stripe
-                    log_print('tree', $gzs, "args=chattr,$tar-" .
+                    # insert chattr op in find to preallocate and stripe
+                    log_print('find', $gzs, "args=chattr,$tar-" .
                         $meta{"tar_split_$tar"} . ".tar host=$opts{host}" .
                         " tar_creat=" . $meta{"tar_size_$tar"} . "\n");
                     $meta{t_chattr}++;
@@ -3405,9 +3463,8 @@ sub put {
                 $line = join(" ", map {"$_=$op{$_}"} sort(keys %op));
             }
 
-            if ($cmd eq 'mkdir') {
-                my $log = $meta{'create-tar'} ? $cmd : "tree";
-                log_print($log, $gzs, "$line\n");
+            if ($cmd eq 'ln' || $cmd eq 'mkdir') {
+                log_print($cmd, $gzs, "$line\n");
             } elsif ($cmd eq 'cp') {
                 $meta{s_total} += $op{size};
                 if ($meta{verify}) {
@@ -3464,23 +3521,23 @@ sub put {
         } elsif ($cmd eq 'find') {
             if ($meta{dereference} && !$meta{'extract-tar'}) {
                 # these conditions are only valid after getopt lines processed
-                if (!defined $find{t_find}) {
-                    tie(%find, 'DB_File', "$opts{base}/find", O_RDWR, 0600);
-                    if (!defined $find{t_find} || $find{t_find} != $meta{t_find}) {
+                if (!defined $links{t_find}) {
+                    tie(%links, 'DB_File', "$opts{base}/links", O_RDWR, 0600);
+                    if (!defined $links{t_find} || $links{t_find} != $meta{t_find}) {
                         # this can happen when mgr fails over as find not sync'd
-                        untie %find;
-                        build_find();
-                        tie(%find, 'DB_File', "$opts{base}/find", O_RDWR, 0600);
+                        untie %links;
+                        build_links();
+                        tie(%links, 'DB_File', "$opts{base}/links", O_RDWR, 0600);
                     }
                     #TODO: need error if cannot be tied
                 }
                 # skip src directories already processed due to symlinks
-                next if ($find{$args[0]});
-                $find{$args[0]} = 1;
-                $find{t_find}++;
+                next if ($links{$args[0]});
+                $links{$args[0]} = 1;
+                $links{t_find}++;
             }
             $meta{"t_$cmd"}++;
-            log_print('tree', $gzs, "$line\n");
+            log_print('find', $gzs, "$line\n");
         } elsif ($cmd eq 'mount') {
             $mnts{$line} = \%op;
         } elsif ($cmd eq 'shell') {
@@ -3503,8 +3560,8 @@ sub put {
                 # use chattr to track additional move
                 $meta{t_chattr}++;
             }
-            # insert chattr op in tree to preallocate and stripe
-            log_print('tree', $gzs, "args=chattr,$file-$split.tar " .
+            # insert chattr op in find to preallocate and stripe
+            log_print('find', $gzs, "args=chattr,$file-$split.tar " .
                 "host=$opts{host} tar_creat=$size\n");
             $meta{t_chattr}++;
             $meta{tar_creat}++;
@@ -3513,15 +3570,15 @@ sub put {
 
     # close log files
     log_close($_, $gzs) foreach (keys %{$gzs});
-    untie %find if (defined $find{t_find});
+    untie %links if (defined $links{t_find});
 
     if ($more_finds && $meta{d_find} + $meta{e_find} == $meta{t_find}) {
         # non-tar transition from finds outstanding to no finds outstanding
         if ($meta{e_find} + $meta{t_cp} + $meta{t_ln} + $meta{t_mkdir} == 0) {
             # force error if no files (e.g. non-matching --include)
-            # use first tree line (should be find) for error line
-            my $line = log_getline('tree', $gzs);
-            log_close('tree', $gzs);
+            # use first find line for error line
+            my $line = log_getline('find', $gzs);
+            log_close('find', $gzs);
             chomp $line;
             # this should never happen if client/manager versions match
             $line = "args=find,no_src,no_dst host=no_host" if (!$line);
@@ -3532,8 +3589,8 @@ sub put {
         } elsif (!$meta{e_find}) {
             # mark initialization done
             $meta{last} = 1;
-            # initialize rtree size (use -1 for later special seek)
-            $meta{rtree} = -1;
+            # initialize rmkdir size (use -1 for later special seek)
+            $meta{rmkdir} = -1;
         }
         # mark transfers complete if no files after find
         $meta{time1} = $time if (!run());
@@ -3616,18 +3673,52 @@ sub run {
         $expect += $meta{"d_$_"} foreach (qw(cp ln));
         # expect dir chattrs only when tar create or no other errors
         my $errs = sum(map {$meta{"e_$_"}} qw(cp find ln mkdir));
-        # when errs > 0 and rtree == 0, any chattr errors are from dirs
+        # when errs > 0 and rmkdir == 0, any chattr errors are from dirs
         # and not files, so should still expect t_mkdir dir chattrs
-        $expect += $echattr + $errs && $meta{rtree} && !$meta{'create-tar'} ?
+        $expect += $echattr + $errs && $meta{rmkdir} && !$meta{'create-tar'} ?
             0 : $meta{t_mkdir};
     }
-    my $actual = sum(map {$meta{"d_$_"}} qw(chattr cksum cp find ln mkdir sum));
-    my $errs = sum(map {$meta{"e_$_"}} qw(chattr cksum cp find ln mkdir sum));
+    my $actual = sum(map {$meta{"d_$_"}} @stages);
+    my $errs = sum(map {$meta{"e_$_"}} @stages);
     $actual += $errs;
     # expect tar_mv chattrs only when no other errors
     $expect += $echattr + $errs - $meta{e_chattr} ? 0 : $meta{tar_mv};
     # running if actual operations differ from expected operations
     return ($expect != $actual);
+}
+
+###############
+#### state ####
+###############
+# return state of current/given transfer
+sub state {
+    my $meta0 = shift;
+    $meta0 = \%meta if (!defined $meta0);
+    my $state = "run";
+    # compute number of operations in various states
+    my $done = sum(map {$meta{"d_$_"}} @stages);
+    my $error = sum(map {$meta{"e_$_"}} @stages);
+    my $total = sum(map {$meta{"t_$_"}} @stages);
+    # determine transfer state
+    if ($meta{last} && defined $meta{time1} && $done == $total) {
+        $state = "done";
+    } elsif ($meta{stop}) {
+        $state = "stop";
+    } elsif ($meta{time1}) {
+        $state = "error";
+    } else {
+        if ($meta{w_run} > 0) {
+            $state .= "+warn";
+        }
+        if ($error > 0) {
+            $state .= "+error";
+        }
+        if (grep(/^throttled_/, keys(%meta))) {
+            $state .= "+throttle";
+        }
+    }
+    $state .= "+alert" if ($meta{e_alert} || $meta{e_silent});
+    return $state;
 }
 
 ###############
@@ -3648,8 +3739,8 @@ sub stats {
             [qw(local_min local_max local_avg lan_min lan_max lan_avg wan_min
                 wan_max wan_avg all_min all_max all_avg)],
         Tools =>
-            [qw(bbcp bbftp fish fish-tcp gridftp mcp msum rsync shift-chattr
-                shift-cp shift-find shift-sum)],
+            [qw(bbftp fish fish-tcp mcp msum rsync shift-chattr shift-cp
+                shift-find shift-sum)],
         Options_1 =>
             [qw(bandwidth buffer clients cpu create-tar exclude extract-tar
                 files force host-list hosts include index-tar interval)],
@@ -3721,18 +3812,18 @@ sub stats {
 
         # skip transfers that have not completed
         next if (!$meta{time1});
-        my %totals;
-
         # transfer totals
-        $totals{attrs} = $meta{d_chattr};
-        $totals{hosts} = grep(/^last_/, keys %meta);
-        $totals{dirs} = $meta{d_mkdir};
-        $totals{files} = $meta{d_cp} + $meta{d_ln};
-        $totals{size} = $meta{s_cp};
-        $totals{ssize} = $meta{s_sum} + $meta{s_cksum};
-        $totals{sums} = $meta{d_sum} + $meta{d_cksum};
-        $totals{xfers} = 1;
-        $totals{$type} = 1;
+        my %totals = (
+            attrs => $meta{d_chattr},
+            hosts => scalar(grep(/^last_/, keys %meta)),
+            dirs => $meta{d_mkdir},
+            files => $meta{d_cp} + $meta{d_ln},
+            size => $meta{s_cp},
+            ssize => $meta{s_sum} + $meta{s_cksum},
+            sums => $meta{d_sum} + $meta{d_cksum},
+            xfers => 1,
+            $type => 1,
+        );
 
         # tool operation totals and tool error totals
         foreach (@{$heads{Tools}}) {
@@ -3766,9 +3857,7 @@ sub stats {
         }
 
         # error totals (corruption/exception/silent handled earlier)
-        foreach (qw(chattr cksum cp find ln mkdir sum)) {
-            $totals{"e_$_"} = $meta{"e_$_"};
-        }
+        $totals{"e_$_"} = $meta{"e_$_"} foreach (@stages);
         $totals{e_host} = grep(/^nohost_/, keys %meta);
 
         # add transfer stats to totals per user, per type, and overall
@@ -3982,12 +4071,16 @@ sub status {
     my @metas;
     my @rows;
     my $dones;
-    my $dir = $> != 0 ? $conf{user_dir} : $opts{user_dir};
-    my $user = $> != 0 ? $opts{user} : "*";
-    do {
-        push(@metas, glob "$dir/$user.[0-9]*/meta");
-        $dir .= "/*.more";
-    } while (scalar(glob $dir));
+    if ($opts{id}) {
+        @metas = ("$opts{base}/meta");
+    } else {
+        my $dir = $> != 0 ? $conf{user_dir} : $opts{user_dir};
+        my $user = $> != 0 ? $opts{user} : "*";
+        do {
+            push(@metas, glob "$dir/$user.[0-9]*/meta");
+            $dir .= "/*.more";
+        } while (scalar(glob $dir));
+    }
     foreach my $file (sort {$> != 0 && !defined $opts{monitor} ?
             # sort by user name when root or --monitor invocation
             (stat $a)[9] <=> (stat $b)[9] : $a <=> $b} @metas) {
@@ -4000,51 +4093,27 @@ sub status {
             # leave user name in id
             $id =~ s/.*\/([\w-]+\.\d+)\/meta/$1/g;
         }
-        if ($opts{id}) {
-            # ignore other ids when id is defined
-            next if ($id != $opts{id});
-        } else {
-            # retrieve metadata from file
-            %meta = %{get_meta($file)};
-        }
-        my $time1 = defined $meta{time1} ? $meta{time1} : $time;
-        my $state = "run";
+        # retrieve metadata from file
+        %meta = %{get_meta($file)} if (!$opts{id} || $opts{monitor});
+        my $state = state();
         my $color = "green";
-        # compute number of operations in various states
-        my $done = sum(map {$meta{"d_$_"}} qw(chattr cksum cp find ln mkdir sum));
-        my $error = sum(map {$meta{"e_$_"}} qw(chattr cksum cp find ln mkdir sum));
-        my $total = sum(map {$meta{"t_$_"}} qw(chattr cksum cp find ln mkdir sum));
-        # determine transfer state
-        if ($meta{last} && defined $meta{time1} && $done == $total) {
-            $state = "done";
-            $color = "reset";
+        if ($state =~ /done/) {
+            $color = $state eq 'done+alert' ? "magenta" : "reset";
             $dones++;
-        } elsif ($meta{stop}) {
-            $state = "stop";
+        } elsif ($state eq 'error') {
+            $color = "red";
+        } elsif ($state eq 'stop') {
             my $base = $file;
             $base =~ s/(\/[^\/]+.more|meta)//g;
             $color = (-e "${base}no_restart" ? "bold " : "") . "cyan";
-        } elsif ($meta{time1}) {
-            $state = "error";
-            $color = "red";
-        } else {
-            if ($meta{w_run} > 0) {
-                $state .= "+warn";
-                $color = "yellow";
-            }
-            if ($error > 0) {
-                $state .= "+error";
-                $color = "yellow";
-            }
-            if (grep(/^throttled_/, keys(%meta))) {
-                $state .= "+throttle";
-                $color = "blue" if ($color ne 'yellow');
-            }
+        } elsif ($state =~ /warn|error/) {
+            $color = "yellow";
+        } elsif ($state =~ /throttle/) {
+            $color = "blue";
         }
-        $state .= "+alert" if ($meta{e_alert} || $meta{e_silent});
-        $color = "magenta" if ($state eq 'done+alert');
         # skip transfers that do not match the given state
         next if ($opts{state} && $state !~ /(?:^|\+)\Q$opts{state}\E(?:$|\+)/);
+        my $time1 = defined $meta{time1} ? $meta{time1} : $time;
         # add first row for each transfer with bulk of info
         my $rate = $time1 - $meta{time0} ?
                 $meta{s_cp} / ($time1 - $meta{time0}) : $meta{s_cp};
@@ -4242,8 +4311,8 @@ sub sync_local {
 
 #TODO: add meta to end of this and remove final meta part
             foreach my $file (keys %files) {
-                # find must be rebuilt and meta is done separately
-                next if ($file =~ /(?:find|meta)$/);
+                # links must be rebuilt and meta is done separately
+                next if ($file =~ /(?:links|meta|mon_\S+)$/);
                 my $off = $fmeta->{basename($file) . "_size"};
                 $off = 0 if (!defined $off);
                 my ($mode, $size) = @{$files{$file}};
@@ -4807,43 +4876,23 @@ sub unescape {
 #####################
 #### yenc_decode ####
 #####################
-# based on Data::BISON::yEnc by Andy Armstrong (artistic license)
+# based on Convert::BulkDecoder by Johan Vromans (artistic license)
 sub yenc_decode {
-    my $data = shift;
-    my @data = map {ord $_} split(//, $data);
-    my @out;
-    while (defined(my $byte = shift @data)) {
-        next if ($byte == 0x00 || $byte == 0x0A || $byte == 0x0D ||
-                # add [ and ] to normal yEnc encoding
-                $byte == 0x5B || $byte == 0x5D);
-        if ($byte == 0x3D) {
-            my $next = shift @data;
-            $byte = ($next - 64) & 0xFF;
-        }
-        push(@out, ($byte - 42) & 0xFF);
-    }
-    return join("", map {chr $_} @out);
+    $_ = shift;
+    s/=(.)/chr(ord($1) + (256 - 64) & 255)/ge;
+    tr{\000-\377}{\326-\377\000-\325};
+    return $_;
 }
 
 #####################
 #### yenc_encode ####
 #####################
-# based on Data::BISON::yEnc by Andy Armstrong (artistic license)
+# based on Convert::BulkDecoder by Johan Vromans (artistic license)
 sub yenc_encode {
-    my $data = shift;
-    my @data = map {ord $_} split(//, $data);
-    my @out;
-    while (defined(my $byte = shift @data)) {
-        my $rep = ($byte + 42) & 0xFF;
-        if ($rep == 0x00 || $rep == 0x0A || $rep == 0x0D || $rep == 0x3D ||
-                # add [ and ] to normal yEnc encoding
-                $rep == 0x5B || $rep == 0x5D) {
-            push @out, 0x3D;
-            $rep = ($rep + 64) & 0xFF;
-        }
-        push(@out, $rep);
-    }
-    return join("", map {chr $_} @out);
+    $_ = shift;
+    tr{\326-\377\000-\325}{\000-\377};
+    s/([\x00\x0A\x0D\x3D\x5B\x5D])/"=" . chr(ord($1) + 64 & 255)/ge;
+    return $_;
 }
 
 # This chunk of stuff was generated by App::FatPacker. To find the original
@@ -4864,7 +4913,7 @@ $fatpacked{"Compress/BGZF/Writer.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\
 COMPRESS_BGZF_WRITER
 
 $fatpacked{"Data/MessagePack.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'DATA_MESSAGEPACK';
-  package Data::MessagePack;use strict;use warnings;use 5.008001;our$VERSION='1.00';sub true () {require Data::MessagePack::Boolean;no warnings 'once';return$Data::MessagePack::Boolean::true}sub false () {require Data::MessagePack::Boolean;no warnings 'once';return$Data::MessagePack::Boolean::false}if (!__PACKAGE__->can('pack')){my$backend=$ENV{PERL_DATA_MESSAGEPACK}|| ($ENV{PERL_ONLY}? 'pp' : '');if ($backend !~ /\b pp \b/xms){eval {require XSLoader;XSLoader::load(__PACKAGE__,$VERSION)};die $@ if $@ && $backend =~ /\b xs \b/xms}if (!__PACKAGE__->can('pack')){require 'Data/MessagePack/PP.pm'}}sub new {my($class,%args)=@_;return bless \%args,$class}for my$name(qw(canonical prefer_integer utf8)){my$setter=sub {my($self,$value)=@_;$self->{$name}=defined($value)? $value : 1;return$self};my$getter=sub {my($self)=@_;return$self->{$name}};no strict 'refs';*{$name}=$setter;*{'get_' .$name}=$getter}sub encode;*encode=__PACKAGE__->can('pack');sub decode;*decode=__PACKAGE__->can('unpack');1;
+  package Data::MessagePack;use strict;use warnings;use 5.008001;our$VERSION='1.01';sub true () {require Data::MessagePack::Boolean;no warnings 'once';return$Data::MessagePack::Boolean::true}sub false () {require Data::MessagePack::Boolean;no warnings 'once';return$Data::MessagePack::Boolean::false}if (!__PACKAGE__->can('pack')){my$backend=$ENV{PERL_DATA_MESSAGEPACK}|| ($ENV{PERL_ONLY}? 'pp' : '');if ($backend !~ /\b pp \b/xms){eval {require XSLoader;XSLoader::load(__PACKAGE__,$VERSION)};die $@ if $@ && $backend =~ /\b xs \b/xms}if (!__PACKAGE__->can('pack')){require 'Data/MessagePack/PP.pm'}}sub new {my($class,%args)=@_;return bless \%args,$class}for my$name(qw(canonical prefer_integer utf8)){my$setter=sub {my($self,$value)=@_;$self->{$name}=defined($value)? $value : 1;return$self};my$getter=sub {my($self)=@_;return$self->{$name}};no strict 'refs';*{$name}=$setter;*{'get_' .$name}=$getter}sub encode;*encode=__PACKAGE__->can('pack');sub decode;*decode=__PACKAGE__->can('unpack');1;
 DATA_MESSAGEPACK
 
 $fatpacked{"Data/MessagePack/Boolean.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'DATA_MESSAGEPACK_BOOLEAN';

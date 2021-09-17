@@ -83,7 +83,7 @@ use constant SFTP_TRUNC => 0x10;
 use constant SFTP_WRITE => 0x02;
 use constant SFTP_EXCL => 0x20;
 
-our $VERSION = 7.08;
+our $VERSION = 8.0;
 
 $Data::Dumper::Indent = 0;
 $Data::Dumper::Purity = 1;
@@ -233,7 +233,7 @@ if ($opts{h}) {
 if (scalar(@ARGV) > 0) {
     # ignore command if key generation forced and no arguments given
     my $cmd = shift @ARGV;
-    if ($cmd !~ /(?:^|\W)(?:bbcp|bbftp|bbscp|globus-url-copy|mesh-keykill|mesh-keytime|pcp\+|rm|rsync|scp|sftp|shiftc?|ssh|ssh-balance)$/ && $< != 0) {
+    if ($cmd !~ /(?:^|\W)(?:bbcp|bbftp|bbscp|mesh-keykill|mesh-keytime|pcp\+|rm|rsync|scp|sftp|shiftc?|ssh|ssh-balance)$/ && $< != 0) {
         # resolve all symlinks to support links to host:/path in VFS
         #   (exclude rm so linked targets are not removed)
         #   (exclude root to prevent unintended exposure/modification)
@@ -245,7 +245,7 @@ if (scalar(@ARGV) > 0) {
     if ($cmd =~ /(?:^|\W)pwd$/) {
         print "$ENV{PWD}\n";
         exit;
-    } elsif ($cmd !~ /(?:^|\W)(?:bbcp|bbftp|bbscp|globus-url-copy|mesh-keykill|mesh-keytime|pcp\+|rsync|scp|sftp|ssh|ssh-balance)$/ &&
+    } elsif ($cmd !~ /(?:^|\W)(?:bbcp|bbftp|bbscp|mesh-keykill|mesh-keytime|pcp\+|rsync|scp|sftp|ssh|ssh-balance)$/ &&
             !$argv_hostpath && (!hostpath($ENV{PWD}) ||
             grep(!/^[-\/]/, @ARGV) == 0 || $cmd =~ /(?:^|\W)complete$/ &&
             $ARGV[1] =~ /^\//)) {
@@ -532,16 +532,6 @@ if ($ARGV[0] =~ /(?:^|\W)(?:scp|sftp)$/) {
     splice(@ARGV, 1, 0, ("-S", "$opts{ssh} %H bbcp", "-T", "$opts{ssh} %H bbcp"));
 } elsif ($ARGV[0] =~ /(?:^|\W)(?:bbftp|bbscp)$/) {
     splice(@ARGV, 1, 0, ("-L", $opts{ssh}));
-} elsif ($ARGV[0] =~ /(?:^|\W)globus-url-copy$/) {
-    my $dir = glob("~/.globus");
-    mkdir $dir if (! -d $dir);
-    my $file = "$dir/gridftp-ssh";
-    open(FILE, '>', $file);
-    print FILE "#!/bin/sh\n$opts{ssh} \$2 sshftp";
-    close FILE;
-    chmod(0700, $file);
-    # reduce $argc since no additional args are spliced onto @ARGV
-    $argc--;
 } elsif ($ARGV[0] =~ /(?:^|\W)pcp\+$/) {
     splice(@ARGV, 1, 0, ("-s", "$opts{ssh_l} $opts{p}"));
 } elsif ($ARGV[0] =~ /(?:^|\W)rsync$/) {
@@ -1372,10 +1362,11 @@ sub shift_ {
         print "      --mgr-user=USER       access manager host as USER\n";
         print "      --monitor[=FORMAT]    monitor progress of running transfers\n";
         print "                              (FORMAT one of {color,csv,pad})\n";
-        print "      --plot[=[BY:]LIST]    plot detailed performance when piped to gnuplot\n";
-        print "                              (BY one of {client,host,id,user})\n";
-        print "                              (LIST subset of {chattr,cksum,cp,find,io,ln,meta,\n";
-        print "                                               mkdir,sum})\n";
+        print "      --plot[=[BY[:/]]LIST] plot detailed performance when piped to gnuplot\n";
+        print "                              (BY one of {client,fs,host,id,net,user})\n";
+        print "                              (LIST subset of {bbftp,chattr,cksum,cp,find,fish,\n";
+        print "                                               fish-tcp,io,ln,mcp,meta,mkdir,msum,\n";
+        print "                                               rsync,shift-cp,shift-sum,sum,tool})\n";
         print "      --restart[=ignore]    restart transfer with given --id [ignoring errors]\n";
         print "      --search=REGEX        show only status/history matching REGEX\n";
         print "      --state=STATE         show status of only those operations in STATE\n";
@@ -1395,12 +1386,10 @@ sub shift_ {
         print "                              (use suffix {k,m,b/g,t} for 1E{3,6,9,12}) [1k]\n";
         print "      --interval=NUM        adjust batches to run for around NUM seconds [30]\n";
         print "      --local=LIST          set local transport mechanism to one of LIST\n";
-        print "                              (LIST subset of {bbcp,bbftp,fish,fish-tcp,gridftp,\n";
-        print "                                               mcp,rsync,shift})\n";
+        print "                              (LIST subset of {bbftp,fish,fish-tcp,mcp,rsync,shift})\n";
         print "      --preallocate=NUM     preallocate files when sparsity under NUM percent\n";
         print "      --remote=LIST         set remote transport mechanism to one of LIST\n";
-        print "                              (LIST subset of {bbcp,bbftp,fish,fish-tcp,gridftp,\n";
-        print "                                               rsync,shift})\n";
+        print "                              (LIST subset of {bbftp,fish,fish-tcp,rsync,shift})\n";
         print "      --retry=NUM           retry failed operations up to NUM times [2]\n";
         print "      --size=SIZE           process transfer in batches of at least SIZE bytes\n";
         print "                              (use suffix {k,m,g,t} for {KB,MB,GB,TB}) [4g]\n";
@@ -1569,10 +1558,22 @@ sub shift_ {
         }
         waitpid($pid, 0);
 =for mesh
-        # use agent key directly since agent will have been killed by child
-        $opts{sshmp} =~ s/^(ssh)/$1 -i $agent_key/;
+        # use new agent since initial agent will have been killed by child
+        $agent_sock = open3_get([-1, undef, -1], "ssh-agent -c");
+        if ($agent_sock =~ /SSH_AGENT_PID\s+(\d+);/) {
+            $opts{k} = $1;
+        }
+        $agent_sock = $1 if ($agent_sock =~ /SSH_AUTH_SOCK\s+([^;]+);/);
+        $ENV{SSH_AUTH_SOCK} = $agent_sock;
+        open3_get([-1, undef], "ssh-add $agent_key");
 =cut mesh
         my $out = shift_mgr("--status --state=none --id=$opts{id}");
+=for mesh
+        if ($opts{k}) {
+            # kill new agent
+            kill(SIGTERM, $opts{k}) && waitpid($opts{k}, 0);
+        }
+=cut mesh
         if (defined $opts{monitor}) {
             print "\e[1A\e[K" foreach (1 .. 5);
         }
@@ -2201,7 +2202,6 @@ sub shift_loop {
                         next if ($t =~ /^(shift|fish(-tcp)?)$/);
                         foreach my $path (split(/:/, $ENV{PATH})) {
                             if (-x "$path/$t" ||
-                                    $t eq 'gridftp' && -x "$path/globus-url-copy" ||
                                     $t =~ /^fish(-tcp)$/ && -x "$path/$opts{caux}") {
                                 $have{$t} = 1;
                                 last;
@@ -2230,7 +2230,7 @@ sub shift_loop {
                     $rtthost->{$1} = 1;
                 } elsif ($args[0] =~ /^(?:exclude|include)$/) {
                     $opts{$args[0]} = thaw(unescape($op{text}));
-                } elsif ($args[0] =~ /^(?:bandwidth|buffer|create-tar|cron|dereference|extract-tar|find-files|force|get_host|ignore-times|index-tar|newer|offline|older|opts_bbcp|opts_bbftp|opts_gridftp|opts_mcp|opts_msum|opts_ssh|ports|preallocate|preserve|recall|sanity|secure|streams|stripe|stripe-pool|stripe-size|sum_split|sum_type|sync|sync_host|threads|window|verify|verify-fast)$/) {
+                } elsif ($args[0] =~ /^(?:bandwidth|buffer|create-tar|cron|dereference|extract-tar|find-files|force|get_host|ignore-times|index-tar|newer|offline|older|opts_bbftp|opts_mcp|opts_msum|opts_ssh|ports|preallocate|preserve|recall|sanity|secure|streams|stripe|stripe-pool|stripe-size|sum_split|sum_type|sync|sync_host|threads|window|verify|verify-fast)$/) {
                     $opts{$args[0]} = defined $op{text} ?
                         unescape($op{text}) : 1;
                 }
@@ -2549,7 +2549,7 @@ sub shift_mounts {
         $mnt{opts} = /[\(,]ro[\),]/ ? "ro" : "rw";
         # acl support is the default unless explicitly disabled
         $mnt{opts} .= ",acl" if (/[\(,]acl[\),]/ || $acl && !/[\(,]noacl[\),]/);
-        $mnt{opts} .= ",dmf" if (/[\(,]dm(ap)?i[\),]/);
+        $mnt{opts} .= ",dmf" if (/[\(,](dmapi|dmi|xdsm)[\),]/);
         $mnt{opts} .= ",xattr" if (/[\(,]user_xattr[\),]/);
         #TODO: need to escape local and remote?
         (my $dev, $mnt{local}, my $type) = ($1, $2, $3)
@@ -2590,18 +2590,32 @@ sub shift_mounts {
             # lustre may have extra @id and multiple colon-separated servers
             $mnt{servers} =~ s/@\w*//g;
             $mnt{servers} = join("|", map {$_ = fqdn($_)} split(/:/, $mnt{servers}));
-        } elsif ($type eq 'gpfs') {
-            # gpfs servers do not appear in mount output so call mmlsmgr
-            my $srv = open3_get([-1, undef, -1], "mmlsmgr $dev");
-            # try a default location if not in path
-            $srv = open3_get([-1, undef, -1],
-                "/usr/lpp/mmfs/bin/mmlsmgr $dev") if (!$srv);
+        } elsif ($type eq 'beegfs') {
+            # beegfs servers do not appear in mount output so call beegfs-ctl
+            my $srv = open3_get([-1, undef, -1],
+                "beegfs-ctl --listnodes --nodetype=management --mount=$mnt{local}");
             next if (!defined $srv);
-            # output is file system then server ip address
-            if ($srv =~ /^(\w+)\s+(\d+\.\d+\.\d+\.\d+)/m) {
-                $mnt{remote} = "/$1";
-                $mnt{servers} = fqdn($2);
+            chomp $srv;
+            # output is host name then id
+            my @hosts;
+            push(@hosts, fqdn($1)) while ($srv =~ /^([\w-.]+)(\s|$)/mg);
+            next if (!scalar(@hosts));
+            $mnt{servers} = join("|", @hosts);
+            $mnt{remote} = "/" . $mnt{servers};
+        } elsif ($type eq 'gpfs') {
+            # gpfs servers do not appear in mount output so read config
+            if (open(FILE, "/var/mmfs/gen/mmfs.cfg")) {
+                while (<FILE>) {
+                    s/^\s+|\s+$//g;
+                    if (/^clustername\s+(\S+)/i) {
+                        $mnt{servers} = $1;
+                        $mnt{remote} = "/" . $mnt{servers};
+                        last;
+                    }
+                }
+                close FILE;
             }
+            next if (!$mnt{servers});
         } elsif ($mnt{opts} =~ /,dmf/) {
             # always report dmf file systems even if local
             $mnt{servers} = $mnt{host};
@@ -3254,16 +3268,10 @@ sub transport {
             my $tool = $opts{$type}->[
                 ($i + $ref->{try}) % scalar(@{$opts{$type}})];
             next if (
-                # bbcp does not encrypt and cannot handle partial transfers or
-                # (using --infiles) colon/ff/cr/lf/tab/vt in file names
-                $tool eq 'bbcp' && ($opts{secure} || $ref->{bytes} ||
-                    "$src$dst" =~ /[:\f\n\r\t\x0b]/) ||
                 # bbftp does not encrypt and cannot handle partial transfers or
                 # whitespace/vt in file names
                 $tool eq 'bbftp' && ($opts{secure} || $ref->{bytes} ||
                     "$src$dst" =~ /[\s\x0b]/) ||
-                # gridftp cannot handle tar ops due to differing src/dst offsets
-                $tool eq 'gridftp' && defined $ref->{tar_bytes} ||
                 # rsync cannot handle partial transfers, and
                 # (using --files-from) cannot handle cr/lf in file names
                 $tool eq 'rsync' && ($ref->{bytes} || "$src$dst" =~ /[\n\r]/));
@@ -3298,16 +3306,12 @@ sub transport {
 
     foreach my $tool (keys %tools) {
         next if (!scalar(@{$tools{$tool}}));
-        if ($tool eq 'bbcp') {
-            transport_bbcp($host, $tools{$tool});
-        } elsif ($tool eq 'bbftp') {
+        if ($tool eq 'bbftp') {
             transport_bbftp($host, $tools{$tool});
         } elsif ($tool eq 'fish') {
             transport_fish($host, $tools{$tool});
         } elsif ($tool eq 'fish-tcp') {
             transport_fish($host, $tools{$tool}, 1);
-        } elsif ($tool eq 'gridftp') {
-            transport_gridftp($host, $tools{$tool});
         } elsif ($tool eq 'mcp') {
             transport_mcp($host, $tools{$tool});
         } elsif ($tool eq 'rsync') {
@@ -3328,139 +3332,6 @@ sub transport {
 
     # return is only defined during an end when rsync is used
     return $rsize;
-}
-
-########################
-#### transport_bbcp ####
-########################
-sub transport_bbcp {
-    my ($host, $tcmds) = @_;
-    my %errs;
-    my ($fh, $tmp) = sftp_tmp();
-    my $sep = chr(0);
-    my ($shost, $spath, $dhost, $dpath, $args);
-    if ($host eq 'localhost') {
-        $shost = "";
-        # bbcp assumes host name instead of localhost when host not given
-        $dhost = "localhost:";
-        $args = " -S bbcp -T bbcp";
-    } else {
-        my $ssh_l;
-        if ($host =~ /@/) {
-            ($ssh_l, $host) = split(/@/, $host);
-            $ssh_l = " -l " . $ssh_l if ($ssh_l);
-        }
-        $args = " -S '$opts{ssh}$ssh_l %H bbcp' -T '$opts{ssh}$ssh_l %H bbcp'";
-    }
-
-    foreach my $cmd (@{$tcmds}) {
-        my ($op, $src, $dst, $ref) = @{$cmd};
-        $ref->{tool} = "bbcp";
-        if (!defined $shost) {
-            $shost = $op eq 'get' ? $host . ":" : "";
-            $dhost = $op eq 'put' ? $host . ":" : "";
-        }
-
-        # find longest common suffix starting with "/"
-        if ("$src$sep$dst" =~ /^.*?(\/.*)$sep.*\1$/) {
-            my $lcs = $1;
-            # bbcp batch mode does not use leading slashes like rsync
-            $lcs =~ s/^\/+//;
-            if ($spath && $src eq "$spath/$lcs" && $dst eq "$dpath/$lcs") {
-                print $fh ($shost ? $shost . ":" : ""), "$lcs\n";
-                $errs{"$spath/$lcs"}->{$ref} = $ref;
-                $errs{"$dpath/$lcs"}->{$ref} = $ref;
-                next;
-            } elsif ($spath) {
-                # next file has different prefix so process current batch
-                close $fh;
-                transport_bbcp_batch($args . ($shost ? " -z" : ""), $tmp,
-                    "$shost$spath", "$dhost$dpath", \%errs, $host);
-                %errs = ();
-                open($fh, '>', $tmp);
-            }
-            print $fh ($shost ? $shost . ":" : ""), "$lcs\n";
-            $spath = $src;
-            # escape lcs in case it contains regex characters
-            $spath =~ s/\/\Q$lcs\E$//;
-            $dpath = $dst;
-            $dpath =~ s/\/\Q$lcs\E$//;
-            $errs{"$spath/$lcs"}->{$ref} = $ref;
-            $errs{"$dpath/$lcs"}->{$ref} = $ref;
-        } else {
-            # no common suffix implies single file copy with rename
-            # or symlink dereference
-            my %errs_tmp;
-            # use different hash as other files may already be in there
-            $errs_tmp{$src}->{$ref} = $ref;
-            $errs_tmp{$dst}->{$ref} = $ref;
-            transport_bbcp_batch($args . ($shost ? " -z" : ""), "",
-                "$shost$src", "$dhost$dst", \%errs_tmp, $host);
-        }
-    }
-
-    close $fh;
-    if ($spath) {
-        transport_bbcp_batch($args . ($shost ? " -z" : ""), $tmp,
-            "$shost$spath", "$dhost$dpath", \%errs, $host);
-    }
-    unlink $tmp;
-}
-
-##############################
-#### transport_bbcp_batch ####
-##############################
-sub transport_bbcp_batch {
-    my ($args, $from, $src, $dst, $errs, $host) = @_;
-    my ($pid, $in, $out, $size);
-    $from = " --infiles $from -d" if ($from);
-    eval {
-        local $SIG{__WARN__} = sub {die};
-        # escape remote src/dst metacharacters since interpreted by remote shell
-        my ($esrc, $edst) = ($src, $dst);
-        $esrc =~ s/([^A-Za-z0-9\-_.:+\/])/\\$1/g if ($esrc =~ /^[^\/]/);
-        $edst =~ s/([^A-Za-z0-9\-_.:+\/])/\\$1/g if ($edst =~ /^[^\/]/);
-        my $nstream = $host eq 'localhost' ? $opts{threads} : $opts{streams};
-        my $extra;
-        $extra .= " -B " . $opts{buffer} if ($opts{buffer});
-        $extra .= " -s " . $nstream if ($nstream);
-        $extra .= " -w " . $opts{window} if ($opts{window});
-        $extra .= " -Z " . $opts{ports} if ($opts{ports});
-        # apply opts_bbcp last to override other settings
-        $extra .= " " . $opts{opts_bbcp};
-        # use open3 to avoid executing a shell command based on the name
-        # of a file being copied (which may contain metacharacters, etc.)
-        # must keep write access to handle warnings/corruption
-        $pid = IPC::Open3::open3($in, $out, $out,
-            # make sure quotewords string does not end in space
-            quotewords('\s+', 0, "bbcp $extra -AfKv -m 0600$args$from"),
-            $esrc, $edst);
-    };
-    if (!$@) {
-        while (my $line = <$out>) {
-            $line =~ s/\s+$//;
-            if ($line =~ /^File (.*) created(?!.*created)/) {
-                my $file = $1;
-                foreach my $key (grep(/^\Q$file\E$/, keys(%{$errs}))) {
-                    $_->{text} = 0 foreach (values %{$errs->{$key}});
-                }
-            } elsif ($line =~ /^bbcp: [^\/]*(\/.*)/) {
-                my $file = $1;
-                foreach my $key (grep(/^\Q$file\E$/, keys(%{$errs}))) {
-                    sftp_error($_, $line) foreach (values %{$errs->{$key}});
-                }
-            }
-        }
-    }
-    close $in;
-    close $out;
-    waitpid($pid, 0) if ($pid);
-
-    foreach my $key (keys %{$errs}) {
-        foreach (values %{$errs->{$key}}) {
-            sftp_error($_, "unknown bbcp failure") if (!defined $_->{text});
-        }
-    }
 }
 
 #########################
@@ -3564,7 +3435,8 @@ sub transport_chattr {
     foreach my $cmd (@{$tcmds}) {
         my ($op, $src, $dst, $ref) = @{$cmd};
         # lfs setstripe (must be done before fallocate)
-        if ((!$opts{'create-tar'} && $op =~ /^(?:get|mkdir|put)$/ ||
+        if ((!$opts{'create-tar'} && ($op =~ /^(?:get|put)$/ ||
+                $op eq 'mkdir' && $ref->{lustre_attrs}) ||
                 $op eq 'chattr' && $ref->{tar_creat}) &&
                 $ref->{dstfs} && $ref->{dstfs} =~ /^lustre/ && !$ref->{ln} &&
                 ($opts{stripe} ne '0' || defined $opts{'stripe-size'} ||
@@ -3573,23 +3445,28 @@ sub transport_chattr {
             my @stripe = (0, 0);
             # preserve existing striping when available
             @stripe = split(/,/, $ref->{lustre_attrs}) if ($ref->{lustre_attrs});
-            my @attrs = split(/,/, $ref->{attrs});
-            # define variables that are allowed in striping expressions
-            my ($nm, $sz, $sc, $ss) = ($dst, $attrs[7], @stripe);
-            # base striping on tar size instead of file size during tar creation
-            $sz = $ref->{tar_creat} if ($ref->{tar_creat});
-            my @evals = ($opts{stripe}, $opts{'stripe-size'});
-            push(@evals, $opts{'stripe-pool'})
-                if ($opts{'stripe-pool'} !~ /^[\w.-]+$/);
-            # evaluate all striping expressions
-            foreach my $i (0 .. 2) {
-                my $eval = $evals[$i];
-                next if (!$eval);
-                $eval =~ s/(NM|SZ|SC|SS)/q($).lc($1)/eg;
-                $stripe[$i] = eval $eval;
+            # preserve but do not apply striping expressions to directories
+            if ($op ne 'mkdir') {
+                my @attrs = split(/,/, $ref->{attrs});
+                # define variables that are allowed in striping expressions
+                my ($nm, $sz, $sc, $ss) = ($dst, $attrs[7], @stripe);
+                # base striping on tar size instead of file size during tar creation
+                $sz = $ref->{tar_creat} if ($ref->{tar_creat});
+                my @evals = ($opts{stripe}, $opts{'stripe-size'});
+                push(@evals, $opts{'stripe-pool'})
+                    if ($opts{'stripe-pool'} !~ /^[\w.-]+$/);
+                # evaluate all striping expressions
+                foreach my $i (0 .. 2) {
+                    my $eval = $evals[$i];
+                    next if (!$eval);
+                    $eval =~ s/(NM|SZ|SC|SS)/q($).lc($1)/eg;
+                    $stripe[$i] = eval $eval;
+                }
+                # count >= 64k indicates a size per stripe
+                $stripe[0] = ceil($sz / $stripe[0]) if ($stripe[0] >= 65536);
             }
-            # count >= 64k indicates a size per stripe
-            $stripe[0] = ceil($sz / $stripe[0]) if ($stripe[0] >= 65536);
+            # size should never be < 64k (llapi inexplicably returns 2 for dirs)
+            $stripe[1] = 0 if ($stripe[1] < 65536);
             my @args = ("setstripe", escape($dst) . ($op eq 'mkdir' ? "/" : ""),
                 join(" ", @stripe));
             push(@chattrs, \@args);
@@ -4722,116 +4599,6 @@ sub transport_fish_return {
     return {error => "Invalid protocol return ($msg)"};
 }
 
-###########################
-#### transport_gridftp ####
-###########################
-sub transport_gridftp {
-    my ($host, $tcmds) = @_;
-    my $ssh_l;
-    if ($host =~ /@/) {
-        ($ssh_l, $host) = split(/@/, $host);
-        $ssh_l = " -l " . $ssh_l if ($ssh_l);
-    }
-    # make sure gridftp-ssh is set up properly
-    my $prefix = $host ne 'localhost' ? "sshftp://$host" : "file://";
-    my $dir = glob("~/.globus");
-    mkdir $dir if (! -d $dir);
-    my $file = "$dir/gridftp-ssh";
-    open(FILE, '>', $file);
-    # note that sshftp must exist in path (normally resides in .globus/sshftp)
-    print FILE "#!/bin/sh\n$opts{ssh}$ssh_l \$2 sshftp";
-    close FILE;
-    chmod(0700, $file);
-
-    my %errs;
-    my ($fh, $tmp);
-    foreach my $cmd (@{$tcmds}) {
-        my ($op, $src, $dst, $ref) = @{$cmd};
-        ($fh, $tmp) = sftp_tmp() if (!$tmp);
-        if ($op eq 'put') {
-            $src = "file://" . escape($src);
-            $dst = $prefix . escape($dst);
-            $errs{"$src $dst"} = $ref;
-        } else {
-            $src = $prefix . escape($src);
-            $dst = "file://" . escape($dst);
-            $errs{"$src $dst"} = $ref;
-        }
-        if ($ref->{bytes}) {
-            my @ranges = split(/,/, $ref->{bytes});
-            foreach my $range (@ranges) {
-                my ($x1, $x2) = split(/-/, $range);
-                print $fh "$src $dst $x1,", $x2 - $x1, "\n";
-            }
-        } else {
-            print $fh "$src $dst\n";
-        }
-        $ref->{tool} = "gridftp";
-    }
-    return if (!$tmp);
-    close $fh;
-
-    my $nstream = $host eq 'localhost' ? $opts{threads} : $opts{streams};
-    my $extra;
-    $extra .= " -bs " . $opts{buffer} if ($opts{buffer});
-    $extra .= " -p " . $nstream if ($nstream);
-    $extra .= " -tcp-bs " . $opts{window} if ($opts{window});
-    # encrypt data channel during secure transfers
-    $extra .= " -dcpriv" if ($opts{secure});
-    # apply opts_gridftp last to override other settings
-    $extra .= " " . $opts{opts_gridftp};
-    if ($opts{ports}) {
-        #TODO: test that this really works (both on open3 side and globus side)
-        my $ports = $opts{ports};
-        $ports =~ s/:/,/;
-        $ENV{GLOBUS_TCP_RANGE} = $ports;
-        $ENV{GLOBUS_TCP_PORT_RANGE} = $ports;
-        $ENV{GLOBUS_TCP_SOURCE_RANGE} = $ports;
-        $ENV{GLOBUS_UDP_PORT_RANGE} = $ports;
-        $ENV{GLOBUS_UDP_SOURCE_RANGE} = $ports;
-    }
-    if (open(OUT, '-|',
-            # unbuffer must be used to interleave stdout/stderr
-            "unbuffer globus-url-copy $extra -c -cd -r -v -f $tmp 2>&1")) {
-        my ($src, $dst, $text);
-        while (my $line = <OUT>) {
-            $line =~ s/\s+$//;
-            if ($line =~ /^Source:\s*(\S+)/) {
-                if ($dst && $text && $errs{"$src $dst"}) {
-                    sftp_error($errs{"$src $dst"}, $text);
-                } elsif ($dst && $errs{"$src $dst"}) {
-                    $errs{"$src $dst"}->{text} = 0;
-                }
-                $text = undef;
-                $src = $1;
-            } elsif ($line =~ /^Dest:\s*(\S+)/) {
-                $dst = $1;
-            } elsif ($line =~ /^\s*(\S+)\s*->\s*(\S+)$/) {
-                $src .= $1;
-                $dst .= $2;
-            } elsif ($line =~ /^\s*(\S+)$/) {
-                $src .= $1;
-                $dst .= $1;
-            } elsif ($line && $line !~ /^error: There was an error with/) {
-                $text .= $line . " ";
-            }
-        }
-        if ($dst && $text && $errs{"$src $dst"}) {
-            sftp_error($errs{"$src $dst"}, $text);
-        } elsif ($dst && $errs{"$src $dst"}) {
-            $errs{"$src $dst"}->{text} = 0;
-        }
-    }
-    close OUT;
-
-    foreach my $key (keys %errs) {
-        if (!defined $errs{$key}->{text}) {
-            sftp_error($errs{$key}, "unknown gridftp failure");
-        }
-    }
-    unlink $tmp;
-}
-
 #######################
 #### transport_mcp ####
 #######################
@@ -5167,6 +4934,8 @@ sub transport_shift {
             push(@scmds, [$x == $x1 ? undef : $x . "-" . $x2, $cmd]);
         }
     }
+    # return when no work (mainly when single-threaded)
+    return if (!scalar(@scmds));
 
     foreach my $o (keys %opts) {
         # must kill existing sftp connections or various things can hang

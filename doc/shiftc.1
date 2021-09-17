@@ -58,8 +58,7 @@ automatic striping of files transferred to Lustre file systems
 fully self-contained besides perl core and ssh
 .IP -
 automatic detection and selection of higher performance transports and
-hash utilities when available including bbcp, bbftp, gridftp, mcp,
-msum, and rsync
+hash utilities when available including bbftp, mcp, msum, and rsync
 .IP -
 automatic many-to-many parallelization of single and multi-file
 transfers with file system equivalence detection and rewriting
@@ -130,10 +129,11 @@ given in following sections.
 \-\-mgr\-user=USER      access manager host as USER
 \-\-monitor[=FORMAT]   monitor progress of running transfers
                        (FORMAT one of {color,csv,pad})
-\-\-plot[=[BY:]LIST]   plot detailed performance when piped to gnuplot
-                       (BY one of {client,host,id,user})
-                       (LIST subset of {chattr,cksum,cp,find,io,ln,meta,
-                                        mkdir,sum})
+\-\-plot[=[BY[:/]]LIST] plot detailed performance when piped to gnuplot
+                       (BY one of {client,fs,host,id,net,user})
+                       (LIST subset of {bbftp,chattr,cksum,cp,find,fish,fish-tcp,
+                                        io,ln,mcp,meta, mkdir,msum,rsync,shift-cp,
+                                        shift-sum,sum,tool})
 \-\-restart[=ignore]   restart transfer with given \-\-id [ignoring errors]
 \-\-search=REGEX       show only status/history matching REGEX
 \-\-state=STATE        show status of only those operations in STATE
@@ -153,12 +153,10 @@ given in following sections.
                        (use suffix {k,m,b/g,t} for 1E{3,6,9,12}) [1k]
 \-\-interval=NUM       adjust batches to run for around NUM seconds [30]
 \-\-local=LIST         set local transport mechanism to one of LIST
-                       (LIST subset of {bbcp,bbftp,fish,fish-tcp,gridftp,
-                                        mcp,rsync,shift})
+                       (LIST subset of {bbftp,fish,fish-tcp,mcp,rsync,shift})
 \-\-preallocate=NUM    preallocate files when sparsity under NUM percent
 \-\-remote=LIST        set remote transport mechanism to one of LIST
-                       (LIST subset of {bbcp,bbftp,fish,fish-tcp,gridftp,
-                                        rsync,shift})
+                       (LIST subset of {bbftp,fish,fish-tcp,rsync,shift})
 \-\-retry=NUM          retry failed operations up to NUM times [2]
 \-\-size=SIZE          process transfer in batches of at least SIZE bytes
                        (use suffix {k,m,g,t} for {KB,MB,GB,TB}) [4g]
@@ -356,10 +354,9 @@ there is actually a need to process destination files during the
 transfer.
 .IP "\fB\-\-ports=NUM1:NUM2\fP"
 Use ports from the range NUM1-NUM2 for the data streams of TCP-based
-transports (currently, bbcp, bbftp, fish-tcp, and gridftp).  All
-connections originate from the client host so the given port range must
-be allowed on the network path to the remote host and by the remote host
-itself.
+transports (currently, bbftp and fish-tcp).  All connections
+originate from the client host so the given port range must be allowed
+on the network path to the remote host and by the remote host itself.
 .IP "\fB\-R, \-r, \-\-recursive\fP"
 Transfer directories recursively.  This option implies
 \fB\-\-no\-dereference\fP.Note that any symbolic links pointing
@@ -521,24 +518,39 @@ coloring, respectively.  When \fB\-\-id\fP is specified, only the given
 transfer will be shown.  When all transfers (or the one specified)
 have completed, the command will exit.  This option may be used with
 \fB\-\-wait\fP to monitor progress while waiting.
-.IP "\fB\-\-plot=[=[BY:]LIST]\fP"
+.IP "\fB\-\-plot=[=[BY[:/]]LIST]\fP"
 Produce output suitable for piping into gnuplot (version 5 or above)
 that shows detailed performance over time across all transfers.  The
 \fB\-\-id\fP and \fB\-\-state\fP options may be used to plot only a
 single transfer or transfers in a particular state, respectively.  The
 default plot will show the aggregate performance of each I/O operation
 (i.e. cp, sum, and cksum) and the aggregate performance of each metadata
-operation (i.e. find, mkdir, ln, and chattr).  I/O operations are
-plotted against the left y-axis while metadata operations are plotted
-against the right y-axis.  The list of plotted items may be changed by
-giving a comma-separated list consisting of one of more of {chattr,
-cksum, cp, find, io, ln, meta, mkdir, sum}.  Note that "io" is a
-shorthand for "cp,sum,cksum" and "meta" is a shorthand for
-"find,mkdir,ln,chattr".  The list of items may be grouped by any of
-{host, id, user} by prefixing one of these terms to the list.  For
-example, \fB\-\-plot=id:cp\fP would show a curve for the copy
-performance of each tranfer id.  When a grouping is given without a
-specific list of metrics (e.g. \fB\-\-plot=id\fP), "io" is assumed.
+operation (i.e. find, mkdir, ln, and chattr) across all of the user's
+transfers.  Operations and/or additional groupings are shown on the
+left y-axis axis across time on the x-axis with heat-based coloring
+indicating MB/s for I/O operations or operations per second for metadata
+operations.  In addition, aggregate I/O and metadata performance will be
+shown as an overlayed point plot with green and blue points,
+respectively.
+.IP
+The list of plotted items may be changed by giving a comma-separated
+list consisting of one or more of the stages {chattr, cksum, cp, find,
+io, ln, meta, mkdir, sum} and/or one or more of the tools {bbftp, fish,
+fish-tcp, mcp, msum, rsync, shift-cp, shift-sum}.  Note that "io" is a
+shorthand for "cp,sum,cksum", "meta" is a shorthand for
+"find,mkdir,ln,chattr", and "tool" is a shorthand for
+"bbftp,fish,fish-tcp,mcp,msum,rsync,shift-cp,shift-sum".
+.IP
+The list of items may be grouped by any of {client, fs, host, id, net,
+user} by prefixing one of these terms to the list.  For example,
+\fB\-\-plot=id:cp\fP would show a plot of the copy performance achieved
+by each transfer id.  When a grouping is given without a specific list
+of metrics (e.g. \fB\-\-plot=id\fP), "io" is assumed.  When a slash "/"
+is used instead of colon ":", a heatmap-based bubble plot will be
+created with the size of each circle indicating the relative size of the
+batch of operations.  For example, \fB\-\-plot=fs/tool\fP would show a
+plot of the performance that each tool achieved on each file system
+with relative batch size.
 .IP "\fB\-\-restart[=ignore]\fP"
 Restart the transfer associated with the given \fB\-\-id\fP that was
 stopped due to unrecoverable errors or stopped explicitly via
@@ -623,12 +635,12 @@ Some advanced options are available to tune various aspects of shiftc
 behavior.  These options are not needed by most users.
 .IP "\fB\-\-bandwidth=BITS\fP"
 Choose the TCP window size and number of TCP streams of TCP-based
-transports (currently, bbcp, bbftp, fish-tcp, and gridftp) based on
-the given bits per second.  The suffixes k, m, g, and t may be used for
-Kb, Mb, Gb, and Tb, respectively.  The default bandwidth is estimated to
-be 10 Gb/s if a 10 GE adapter is found on the client host, 1 Gb/s if the
-client host can be resolved to an organization domain (by default, one
-of the six original generic top-level domains), and 100 Mb/s otherwise.
+transports (currently, bbftp and fish-tcp) based on the given bits per
+second.  The suffixes k, m, g, and t may be used for Kb, Mb, Gb, and Tb,
+respectively.  The default bandwidth is estimated to be 10 Gb/s if a 10
+GE adapter is found on the client host, 1 Gb/s if the client host can be
+resolved to an organization domain (by default, one of the six original
+generic top-level domains), and 100 Mb/s otherwise.
 .IP "\fB\-\-buffer=SIZE\fP"
 Use memory buffer(s) of the given size when configurable in the
 underlying tranport being utilized (currently, all but rsync).  The
@@ -662,13 +674,13 @@ for manager locks.  To make batch selection completely static, use
 .IP "\fB\-\-local=LIST\fP"
 Specify one or more local transports to be used for the transfer in
 order of preference, separated by commas.  Valid transports for this
-option currently include bbcp, bbftp, cp, fish, fish-tcp, gridftp,
-mcp, and rsync.  Note that the given transport(s) will be given
-priority, but may not be used in some cases (e.g. rsync is not capable
-of transferring a specific portion of a file as needed by verification
-mode).  In such cases, the default transport based on File::Copy will be
-used.  The tool actually used for each file operation can be shown using
-\fB\-\-status\fP with \fB\-\-id\fP set to the given transfer identifier.
+option currently include bbftp, cp, fish, fish-tcp, mcp, and rsync.
+Note that the given transport(s) will be given priority, but may not be
+used in some cases (e.g. rsync is not capable of transferring a specific
+portion of a file as needed by verification mode).  In such cases, the
+default transport based on File::Copy will be used.  The tool actually
+used for each file operation can be shown using \fB\-\-status\fP with
+\fB\-\-id\fP set to the given transfer identifier.
 .IP "\fB\-\-preallocate=NUM\fP"
 Preallocate files when their sparsity is under the given percent, where
 sparsity is defined as the number of bytes a file takes up on disk
@@ -681,14 +693,13 @@ transport due to their use of temporary files.
 .IP "\fB\-\-remote=LIST\fP"
 Specify one or more remote transports to be used for the transfer in
 order of preference, separated by commas.  Valid transports for this
-option currently include bbcp, bbftp, fish, fish-tcp, gridftp, rsync,
-and sftp.  Note that the given transport(s) will be given priority, but
-may not be used in some cases (e.g. bbftp is not capable of transferring
-files with spaces in their names and is also incompatible with
-\fB\-\-secure\fP).  In such cases, the default transport based on sftp
-will be used.  The tool actually used for each file operation can be
-shown using \fB\-\-status\fP with \fB\-\-id\fP set to the given transfer
-identifier.
+option currently include bbftp, fish, fish-tcp, rsync, and sftp.  Note
+that the given transport(s) will be given priority, but may not be used
+in some cases (e.g. bbftp is not capable of transferring files with
+spaces in their names and is also incompatible with \fB\-\-secure\fP).
+In such cases, the default transport based on sftp will be used.  The
+tool actually used for each file operation can be shown using
+\fB\-\-status\fP with \fB\-\-id\fP set to the given transfer identifier.
 .IP "\fB\-\-retry=NUM\fP"
 Retry operations deemed recoverable up to the given number of attempts
 per file.  The default number of retries is 2.  A value of zero disables
@@ -733,13 +744,13 @@ resulting tar files may still be larger than specified when source files
 exist that are larger than the given size.
 .IP "\fB\-\-streams=NUM\fP"
 Use the given number of TCP streams in TCP-based transports (currently,
-bbcp, bbftp, fish-tcp, and gridftp).  The default is the number of
-streams necessary to fully utilize the specified/estimated bandwidth
-using the maximum TCP window size.  Note that it is usually preferable
-to specify \fB\-\-bandwidth\fP, which allows an appropriate number of
-streams to be set automatically.  Increasing the number of streams can
-increase performance when the maximum window size is set too low or
-there is cross-traffic on the network, but too high a value can decrease
+bbftp and fish-tcp).  The default is the number of streams necessary
+to fully utilize the specified/estimated bandwidth using the maximum TCP
+window size.  Note that it is usually preferable to specify
+\fB\-\-bandwidth\fP, which allows an appropriate number of streams to be
+set automatically.  Increasing the number of streams can increase
+performance when the maximum window size is set too low or there is
+cross-traffic on the network, but too high a value can decrease
 performance due to increased congestion and packet loss.
 .IP "\fB\-\-stripe=[CEXP][::[SEXP][::PEXP]]\fP"
 By default, a file transferred to a Lustre file system will be striped
@@ -797,15 +808,14 @@ to 33%, but does not allow bits corrupted during the initial read to be
 detected.
 .IP "\fB\-\-window=SIZE\fP"
 Use a TCP send/receive window of the given size in TCP-based transports
-(currently, bbcp, bbftp, fish-tcp, and gridftp).  The suffixes k, m,
-g, and t may be used for KB, MB, GB, and TB, respectively.  The default
-is the product of the specified/estimated bandwidth and the round-trip
-time between source and destination.  Note that it is usually preferable
-to specify \fB\-\-bandwidth\fP, which allows an appropriate window size
-to be set automatically.  Increasing the window size allows TCP to
-operate more efficiently over high bandwidth and/or high latency
-networks, but too high a value can overrun the receiver and cause packet
-loss.
+(currently, bbftp and fish-tcp).  The suffixes k, m, g, and t may be
+used for KB, MB, GB, and TB, respectively.  The default is the product
+of the specified/estimated bandwidth and the round-trip time between
+source and destination.  Note that it is usually preferable to specify
+\fB\-\-bandwidth\fP, which allows an appropriate window size to be set
+automatically.  Increasing the window size allows TCP to operate more
+efficiently over high bandwidth and/or high latency networks, but too
+high a value can overrun the receiver and cause packet loss.
 ./"################################################################
 .SH "TRANSFER THROTTLING"
 ./"################################################################
@@ -1142,5 +1152,5 @@ shiftc was written by Paul Kolano.
 ./"################################################################
 .SH "SEE ALSO"
 ./"################################################################
-bbcp(1), bbftp(1), cp(1), Date::Parse(3), globus-url-copy(1), mcp(1),
-msum(1), perlre(1), perlsyn(1), rsync(1), scp(1), sftp(1)
+bbftp(1), cp(1), Date::Parse(3), mcp(1), msum(1), perlre(1),
+perlsyn(1), rsync(1), scp(1), sftp(1)

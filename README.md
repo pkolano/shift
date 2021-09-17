@@ -59,8 +59,7 @@ Shift includes the following features, among others:
     - fully self-contained besides perl core and ssh
 
     - automatic detection and selection of higher performance transports and
-      hash utilities when available including bbcp, bbftp, gridftp, mcp, msum,
-      and rsync
+      hash utilities when available including bbftp, mcp, msum, and rsync
 
     - automatic many-to-many parallelization of single and multi-file
       transfers with file system equivalence detection and rewriting
