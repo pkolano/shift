@@ -57,6 +57,7 @@ require Data::MessagePack;
 use DB_File;
 use Fcntl qw(:DEFAULT :flock :mode);
 use File::Basename;
+require File::NFSLock;
 use File::Path;
 use File::Spec;
 use Getopt::Long qw(:config bundling no_auto_abbrev no_ignore_case require_order);
@@ -77,11 +78,12 @@ use Text::ParseWords;
 require Tie::DB_FileLock;
 require Text::FormatTable;
 
-our $VERSION = 8.0;
+our $VERSION = 8.1;
 
 $Data::Dumper::Pair = " = ";
 $Data::Dumper::Sortkeys = 1;
 $Data::Dumper::Terse = 1;
+$File::NFSLock::LOCK_EXTENSION = ".nfs";
 $Term::ANSIColor::EACHLINE = "\n";
 
 # binary byte string conversions
@@ -148,6 +150,7 @@ my %conf = (
     min_streams_wan => 4,
     min_window_lan => "1m",
     min_window_wan => "4m",
+    nfs_lock => 0,
     opts_bbftp => "",
     opts_mcp => "--double-buffer",
     opts_msum => "--double-buffer",
@@ -188,16 +191,9 @@ $ENV{PATH} = "/bin:/usr/bin:/usr/local/bin";
 # untaint insecure environment variables
 delete $ENV{$_} foreach (qw(BASH_ENV CDPATH ENV IFS)); 
 
-END {
-    # save exceptions to user's debug file
-    our @exception;
-    debug_print('DBG', "@exception") if (@exception);
-    close $dbgfh if (defined $dbgfh);
-    # unlock user and transfer directories at program termination
-    lock_dir($_, 1) foreach (0, 1);
-    # remove monitor file in case user aborts
-    unlink $monfile if ($monfile);
-}
+# clean up on exit
+END {exit_clean()};
+use sigtrap qw(handler exit_clean normal-signals);
 
 # parse options
 my %opts;
@@ -588,6 +584,8 @@ if ($opts{alive}) {
         $file = $1 if ($file =~ /^(.*)$/);
         my $fdoing = get_doing($file);
         while (my ($key, $line) = each %{$fdoing}) {
+            # reset number of attempts
+            $line =~ s/((^|\s)try=)\d+/${1}0/;
             $line =~ s/\s*\r?\n$//;
             my %op = split(/[= ]+/, $line);
             my @args = split(/,/, $op{args});
@@ -645,7 +643,7 @@ if ($opts{get} || defined $opts{put}) {
 
 # update log sizes
 foreach my $file (glob "$opts{base}/*") {
-    next if ($file =~ /\/(?:links|lock|mon_\S+|\S+\.gzi)$/);
+    next if ($file =~ /\/(?:links|lock(\.nfs)?|mon_\S+|\S+\.gzi)$/);
     my $log = $file;
     $log =~ s/.*\///;
     $meta{"$log\_size"} = (stat $file)[7];
@@ -753,6 +751,18 @@ while (-d "$conf{user_dir}/$more") {
     $more .= "$opts{user}.more/";
 }
 
+# remove monitor files older than expiration time
+foreach my $file (glob "$conf{user_dir}/mon_*") {
+    # untaint file
+    $file = $1 if ($file =~ /^(\Q$conf{user_dir}\E\/mon_\d+_[\w.-]+)$/);
+    my $mtime = (stat($file))[9];
+    if ($mtime + $conf{data_expire} < $time) {
+        unlink $file;
+        # synchronize deleted file
+        sync_queue(basename($file)) if ($conf{sync_host});
+    }
+}
+
 #####################
 #### build_links ####
 #####################
@@ -834,6 +844,16 @@ sub last_sum {
     my %sums;
     tie(%sums, 'DB_File', "$conf{user_dir}/$opts{user}.sums",
         O_RDONLY, 0600);
+    if ($opts{search}) {
+        while (my ($key, $pack) = each %sums) {
+            if ($key =~ qr/$opts{search}/) {
+                my ($dbtime, $dbhash) = unpack("LH*", $pack);
+                print $dbhash, " ", strftime("%D-%T", localtime $dbtime),
+                    " ", $key, "\n";
+            }
+        }
+        return;
+    }
     my $tar;
     while (<STDIN>) {
         chomp;
@@ -886,13 +906,25 @@ sub detect_silent {
     if ($op->{hash0}) {
         # replace subsets of full hash with new values
         $ophash = $op->{hash0};
+        my $start = ($op->{tar_bytes} =~ /(\d+)-\d+/) ? $1 : 0;
+        my $rsrc = $src =~ /^[^\/]+%3A/ ? 1 : 0;
+        if ($meta{'create-tar'} && !$rsrc || $meta{'extract-tar'} && $rsrc) {
+            # create offset only non-zero when remote source
+            # extract offset only zero when remote source
+            $start = 0;
+        }
         foreach my $hash (split(/,/, $op->{hash})) {
             if ($hash =~ /^#mutil#(\d+)-(\d+)#\\?(\S+)/) {
                 my ($x1, $x2, $h) = ($1, $2, $3);
                 # find hash size based on how many hashes needed in byte range
                 $hsize = int(length($h) /
                     max(1, ceil(($x2 - $x1) / $conf{sum_split})));
-                my $hoff = $hsize * $x1 / $conf{sum_split};
+                # adjust offset by start of tar byte range
+                my $hoff = $hsize * ($x1 - $start) / $conf{sum_split};
+                if (length($ophash) < $hsize) {
+                    # hash0 too small (file size changed?) - pad with zeros
+                    $ophash .= "0" x ($hsize - length($ophash));
+                }
                 substr($ophash, $hoff, length $h) = $h;
             } else {
                 # normal hash without mutil prefix
@@ -1033,8 +1065,8 @@ sub email_status {
 
     # show original command so will be correct for user's installation
     my $ucmd = $meta{command};
-    # customized escape to allow ' ', ':', '=', and '\'
-    $ucmd =~ s/([^A-Za-z0-9\- :=\\_.!~*'()\/])/sprintf("%%%02X", ord($1))/eg;
+    # customized escape to allow ' ', ':', '=', ',', and '\'
+    $ucmd =~ s/([^A-Za-z0-9\- :=\\_.,!~*'()\/])/sprintf("%%%02X", ord($1))/eg;
     # limit length of command line for performance/usability
     my $dindex = rindex($ucmd, " ");
     $ucmd = substr($ucmd, 0, rindex($ucmd, " ", 1024)) . "..." .
@@ -1138,6 +1170,32 @@ sub escape {
     $text =~ s/([^A-Za-z0-9\-\._~\/])/sprintf("%%%02X", ord($1))/eg
         if (defined $text);
     return $text;
+}
+
+####################
+#### exit_clean ####
+####################
+# store exceptions, remove locks, and remove monitor files
+sub exit_clean {
+    my $rc = $?;
+
+    # save exceptions to user's debug file
+    our @exception;
+    debug_print('DBG', "@exception") if (@exception);
+    close $dbgfh if (defined $dbgfh);
+    # unlock user and transfer directories at program termination
+    lock_dir($_, 1) foreach (0, 1);
+    # remove monitor file in case user aborts
+    if ($monfile) {
+        unlink $monfile;
+        if ($conf{sync_host}) {
+            my $file = basename($monfile);
+            $file = "$opts{user}.$opts{id}/$file" if ($opts{id});
+            sync_queue($file);
+        }
+    }
+
+    exit $rc;
 }
 
 ########################
@@ -1364,7 +1422,10 @@ sub get {
                         $ref->{last} = $op{cache_client};
                     }
                     $args[$i] = map_remote($opts{host}, $args[$i], $ref);
-                    last LOG if (!defined $args[$i]);
+                    if (!defined $args[$i]) {
+                        debug_print('DBG', "map_remote($opts{host}, $args[$i]) undefined\n");
+                        last LOG;
+                    }
                     # record if cksum arg has flipped from remote to local
                     $op{"map$i"} = 1 if ($cmd eq 'cksum' && $args[$i] =~ /^\//);
                 } else {
@@ -1374,6 +1435,7 @@ sub get {
                     } elsif ($meta{"env_$opts{host}"}) {
                         # host does not have access to appropriate
                         # file system and host name hasn't changed
+                        debug_print('DBG', "map_local($op{host}, $args[$i], $opts{host}) undefined\n");
                         last LOG;
                     }
                 }
@@ -1847,7 +1909,7 @@ sub get_meta {
     if ($meta && defined $mtell && $mtell > 0) {
         # metadata corrupted so revert to last known good state
         foreach my $file (glob "$opts{base}/*") {
-            next if ($file =~ /\/(?:links|lock|meta|mon_\S+|\S+\.gzi)$/);
+            next if ($file =~ /\/(?:links|lock(\.nfs)?|meta|mon_\S+|\S+\.gzi)$/);
             my $log = $file;
             $log =~ s/.*\///;
             my $size = defined $meta->{"$log\_size"} ? $meta->{"$log\_size"} : 0;
@@ -2169,10 +2231,26 @@ sub lock_dir {
     my ($id, $unlock) = @_;
     if (!$unlock) {
         my $f = $id ? "$opts{base}/lock" : "$conf{user_dir}/$opts{user}.lock";
-        open($locks[$id], '>>', $f) || return;
-        flock($locks[$id], LOCK_EX);
+        if ($conf{nfs_lock}) {
+            my $lock;
+            while (!$lock) {
+                $lock = File::NFSLock->new({
+                    file => $f,
+                    lock_type => LOCK_EX,
+                });
+                sleep 1 if (!$lock);
+            }
+            $locks[$id] = $lock;
+        } else {
+            open($locks[$id], '>>', $f) || return;
+            flock($locks[$id], LOCK_EX);
+        }
     } elsif (defined $locks[$id]) {
-        close $locks[$id];
+        if ($conf{nfs_lock}) {
+            $locks[$id]->unlock;
+        } else {
+            close $locks[$id];
+        }
         $locks[$id] = undef;
     }
 }
@@ -2459,10 +2537,12 @@ sub monitor {
     }
     # indicate monitoring for other processes
     $monfile = $opts{id} ? $opts{base} : $conf{user_dir};
-    $monfile .= join("_", "/mon", $$, $self);
+    my $base = join("_", "mon", $$, $self);
+    $monfile .= "/" . $base;
     # a failure to create the file will revert to once a minute monitoring
     open(FILE, '>', $monfile);
     close FILE;
+    sync_queue($base) if ($conf{sync_host} && !$opts{id});
     # set parameters for status() calls
     $opts{status} = $opts{monitor};
     $opts{state} = "run";
@@ -3284,11 +3364,19 @@ sub put {
                             # eliminate mutil prefix (if any)
                             $op{hash0} =~ s/^#mutil#(\d+-\d+)?#\\?//;
                         } else {
+                            my $start = ($op{tar_bytes} =~ /(\d+)-\d+/) ? $1 : 0;
+                            my $rsrc = $args[0] =~ /^[^\/]+%3A/ ? 1 : 0;
+                            if ($meta{'create-tar'} && !$rsrc || $meta{'extract-tar'} && $rsrc) {
+                                # create offset only non-zero when remote source
+                                # extract offset only zero when remote source
+                                $start = 0;
+                            }
                             # replace subsets of full hash with new values
                             foreach my $hash (split(/,/, $op{hash})) {
                                 if ($hash =~ /^#mutil#(\d+)-(\d+)#\\?(\S+)/) {
                                     my ($x1, $x2, $h) = ($1, $2, $3);
-                                    my $hoff = $x1 / $conf{sum_split};
+                                    # adjust offset by start of tar byte range
+                                    my $hoff = ($x1 - $start) / $conf{sum_split};
                                     substr($op{hash0}, $hoff, length $h) = $h;
                                 }
                             }
@@ -4923,6 +5011,10 @@ DATA_MESSAGEPACK_BOOLEAN
 $fatpacked{"Data/MessagePack/PP.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'DATA_MESSAGEPACK_PP';
   package Data::MessagePack::PP;use 5.008001;use strict;use warnings;no warnings 'recursion';use Carp ();use B ();use Config;BEGIN {my$unpack_int64_slow;my$unpack_uint64_slow;if(!eval {pack 'Q',1}){$unpack_int64_slow=sub {require Math::BigInt;my$high=unpack_uint32($_[0],$_[1]);my$low=unpack_uint32($_[0],$_[1]+ 4);if($high < 0xF0000000){$high=Math::BigInt->new($high);$low=Math::BigInt->new($low);return +($high << 32 | $low)->bstr}else {$high=Math::BigInt->new(~$high);$low=Math::BigInt->new(~$low);return +(-($high << 32 | $low + 1))->bstr}};$unpack_uint64_slow=sub {require Math::BigInt;my$high=Math::BigInt->new(unpack_uint32($_[0],$_[1]));my$low=Math::BigInt->new(unpack_uint32($_[0],$_[1]+ 4));return +($high << 32 | $low)->bstr}}*unpack_uint16=sub {return unpack 'n',substr($_[0],$_[1],2)};*unpack_uint32=sub {return unpack 'N',substr($_[0],$_[1],4)};my$bo_is_me=unpack ('d',"\x00\x00\xf0\x3f\x00\x00\x00\x00")==1;my$pack_double_oabi;my$unpack_double_oabi;if ($] < 5.010){my$bo_is_le=($Config{byteorder}=~ /^1234/);if ($bo_is_me){$pack_double_oabi=sub {my@v=unpack('V2',pack('d',$_[0]));return pack 'CN2',0xcb,@v[0,1]};$unpack_double_oabi=sub {my@v=unpack('V2',substr($_[0],$_[1],8));return unpack('d',pack('N2',@v[0,1]))}}*unpack_int16=sub {my$v=unpack 'n',substr($_[0],$_[1],2);return$v ? $v - 0x10000 : 0};*unpack_int32=sub {no warnings;my$v=unpack 'N',substr($_[0],$_[1],4);return$v ? $v - 0x100000000 : 0};if($bo_is_le){*pack_uint64=sub {my@v=unpack('V2',pack('Q',$_[0]));return pack 'CN2',0xcf,@v[1,0]};*pack_int64=sub {my@v=unpack('V2',pack('q',$_[0]));return pack 'CN2',0xd3,@v[1,0]};*pack_double=$pack_double_oabi || sub {my@v=unpack('V2',pack('d',$_[0]));return pack 'CN2',0xcb,@v[1,0]};*unpack_float=sub {my@v=unpack('v2',substr($_[0],$_[1],4));return unpack('f',pack('n2',@v[1,0]))};*unpack_double=$unpack_double_oabi || sub {my@v=unpack('V2',substr($_[0],$_[1],8));return unpack('d',pack('N2',@v[1,0]))};*unpack_int64=$unpack_int64_slow || sub {my@v=unpack('V*',substr($_[0],$_[1],8));return unpack('q',pack('N2',@v[1,0]))};*unpack_uint64=$unpack_uint64_slow || sub {my@v=unpack('V*',substr($_[0],$_[1],8));return unpack('Q',pack('N2',@v[1,0]))}}else {*pack_uint64=sub {return pack 'CQ',0xcf,$_[0]};*pack_int64=sub {return pack 'Cq',0xd3,$_[0]};*pack_double=$pack_double_oabi || sub {return pack 'Cd',0xcb,$_[0]};*unpack_float=sub {return unpack('f',substr($_[0],$_[1],4))};*unpack_double=$unpack_double_oabi || sub {return unpack('d',substr($_[0],$_[1],8))};*unpack_int64=$unpack_int64_slow || sub {unpack 'q',substr($_[0],$_[1],8)};*unpack_uint64=$unpack_uint64_slow || sub {unpack 'Q',substr($_[0],$_[1],8)}}}else {if ($bo_is_me){$pack_double_oabi=sub {my@v=unpack('V2',pack('d',$_[0]));my$d=unpack('d',pack('V2',@v[1,0]));return pack 'Cd>',0xcb,$d};$unpack_double_oabi=sub {my$first_word=substr($_[0],$_[1],4);my$second_word=substr($_[0],$_[1]+ 4,4);my$d_bin=$second_word .$first_word;return unpack('d>',$d_bin)}}*pack_uint64=sub {return pack 'CQ>',0xcf,$_[0]};*pack_int64=sub {return pack 'Cq>',0xd3,$_[0]};*pack_double=$pack_double_oabi || sub {return pack 'Cd>',0xcb,$_[0]};*unpack_float=sub {return unpack('f>',substr($_[0],$_[1],4))};*unpack_double=$unpack_double_oabi || sub {return unpack('d>',substr($_[0],$_[1],8))};*unpack_int16=sub {return unpack('n!',substr($_[0],$_[1],2))};*unpack_int32=sub {return unpack('N!',substr($_[0],$_[1],4))};*unpack_int64=$unpack_int64_slow || sub {return unpack('q>',substr($_[0],$_[1],8))};*unpack_uint64=$unpack_uint64_slow || sub {return unpack('Q>',substr($_[0],$_[1],8))}}no warnings 'once';@Data::MessagePack::ISA=qw(Data::MessagePack::PP);@Data::MessagePack::Unpacker::ISA=qw(Data::MessagePack::PP::Unpacker);*true=\&Data::MessagePack::true;*false=\&Data::MessagePack::false}sub _unexpected {Carp::confess("Unexpected " .sprintf(shift,@_)." found")}our$_max_depth;sub pack :method {my($self,$data,$max_depth)=@_;Carp::croak('Usage: Data::MessagePack->pack($dat [,$max_depth])')if @_ < 2;$_max_depth=defined$max_depth ? $max_depth : 512;if(not ref$self){$self=$self->new(prefer_integer=>$Data::MessagePack::PreferInteger || 0,canonical=>$Data::MessagePack::Canonical || 0,)}return$self->_pack($data)}sub _pack {my ($self,$value)=@_;local$_max_depth=$_max_depth - 1;if ($_max_depth < 0){Carp::croak("perl structure exceeds maximum nesting level (max_depth set too low?)")}return CORE::pack('C',0xc0)if (not defined$value);if (ref($value)eq 'ARRAY'){my$num=@$value;my$header=$num < 16 ? CORE::pack('C',0x90 + $num): $num < 2 ** 16 - 1 ? CORE::pack('Cn',0xdc,$num): $num < 2 ** 32 - 1 ? CORE::pack('CN',0xdd,$num): _unexpected("number %d",$num);return join('',$header,map {$self->_pack($_)}@$value)}elsif (ref($value)eq 'HASH'){my$num=keys %$value;my$header=$num < 16 ? CORE::pack('C',0x80 + $num): $num < 2 ** 16 - 1 ? CORE::pack('Cn',0xde,$num): $num < 2 ** 32 - 1 ? CORE::pack('CN',0xdf,$num): _unexpected("number %d",$num);if ($self->{canonical}){return join('',$header,map {$self->_pack($_),$self->_pack($value->{$_})}sort {$a cmp $b}keys %$value)}else {return join('',$header,map {$self->_pack($_)}%$value)}}elsif (ref($value)eq 'Data::MessagePack::Boolean'){return CORE::pack('C',${$value}? 0xc3 : 0xc2)}my$b_obj=B::svref_2object(\$value);my$flags=$b_obj->FLAGS;if ($flags & B::SVp_POK){if ($self->{prefer_integer}){if ($value =~ /^-?[0-9]+$/){my$ivalue=0 + $value;if (!($ivalue > 0xFFFFFFFF or $ivalue < ('-' .0x80000000)or $ivalue!=B::svref_2object(\$ivalue)->int_value)){return$self->_pack($ivalue)}}}utf8::encode($value)if utf8::is_utf8($value);my$num=length$value;my$header;if ($self->{utf8}){$header=$num < 32 ? CORE::pack('C',0xa0 + $num): $num < 2 ** 8 - 1 ? CORE::pack('CC',0xd9,$num): $num < 2 ** 16 - 1 ? CORE::pack('Cn',0xda,$num): $num < 2 ** 32 - 1 ? CORE::pack('CN',0xdb,$num): _unexpected('number %d',$num)}else {$header=$num < 2 ** 8 - 1 ? CORE::pack('CC',0xc4,$num): $num < 2 ** 16 - 1 ? CORE::pack('Cn',0xc5,$num): $num < 2 ** 32 - 1 ? CORE::pack('CN',0xc6,$num): _unexpected('number %d',$num)}return$header .$value}elsif($flags & B::SVp_NOK){return pack_double($value)}elsif ($flags & B::SVp_IOK){if ($value >= 0){return$value <= 127 ? CORE::pack 'C',$value : $value < 2 ** 8 ? CORE::pack 'CC',0xcc,$value : $value < 2 ** 16 ? CORE::pack 'Cn',0xcd,$value : $value < 2 ** 32 ? CORE::pack 'CN',0xce,$value : pack_uint64($value)}else {return -$value <= 32 ? CORE::pack 'C',($value & 255): -$value <= 2 ** 7 ? CORE::pack 'Cc',0xd0,$value : -$value <= 2 ** 15 ? CORE::pack 'Cn',0xd1,$value : -$value <= 2 ** 31 ? CORE::pack 'CN',0xd2,$value : pack_int64($value)}}else {_unexpected("data type %s",$b_obj)}}our$_utf8=0;my$p;sub _insufficient {Carp::confess("Insufficient bytes (pos=$p, type=@_)")}sub unpack :method {$p=0;$_utf8=(ref($_[0])&& $_[0]->{utf8})|| $_utf8;my$data=_unpack($_[1]);if($p < length($_[1])){Carp::croak("Data::MessagePack->unpack: extra bytes")}return$data}my$T_STR=0x01;my$T_ARRAY=0x02;my$T_MAP=0x04;my$T_BIN=0x08;my$T_DIRECT=0x10;my@typemap=((0x00)x 256);$typemap[$_]|=$T_ARRAY for 0x90 .. 0x9f,0xdc,0xdd,;$typemap[$_]|=$T_MAP for 0x80 .. 0x8f,0xde,0xdf,;$typemap[$_]|=$T_STR for 0xa0 .. 0xbf,0xd9,0xda,0xdb,;$typemap[$_]|=$T_BIN for 0xc4,0xc5,0xc6,;my@byte2value;for my$pair([0xc3,true],[0xc2,false],[0xc0,undef],(map {[$_,$_ ]}0x00 .. 0x7f),(map {[$_,$_ - 0x100 ]}0xe0 .. 0xff),){$typemap[$pair->[0]]|=$T_DIRECT;$byte2value[$pair->[0]]=$pair->[1]}sub _fetch_size {my($value_ref,$byte,$x8,$x16,$x32,$x_fixbits)=@_;if (defined($x8)&& $byte==$x8){$p += 1;$p <= length(${$value_ref})or _insufficient('x/8');return unpack 'C',substr(${$value_ref},$p - 1,1)}elsif ($byte==$x16){$p += 2;$p <= length(${$value_ref})or _insufficient('x/16');return unpack 'n',substr(${$value_ref},$p - 2,2)}elsif ($byte==$x32){$p += 4;$p <= length(${$value_ref})or _insufficient('x/32');return unpack 'N',substr(${$value_ref},$p - 4,4)}else {return$byte & ~$x_fixbits}}sub _unpack {my ($value)=@_;$p < length($value)or _insufficient('header byte');my$byte=ord(substr$value,$p,1);$p++;return$byte2value[$byte]if$typemap[$byte]& $T_DIRECT;if ($typemap[$byte]& $T_STR){my$size=_fetch_size(\$value,$byte,0xd9,0xda,0xdb,0xa0);my$s=substr($value,$p,$size);length($s)==$size or _insufficient('raw');$p += $size;utf8::decode($s);return$s}elsif ($typemap[$byte]& $T_ARRAY){my$size=_fetch_size(\$value,$byte,undef,0xdc,0xdd,0x90);my@array;push@array,_unpack($value)while --$size >= 0;return \@array}elsif ($typemap[$byte]& $T_MAP){my$size=_fetch_size(\$value,$byte,undef,0xde,0xdf,0x80);my%map;while(--$size >= 0){no warnings;my$key=_unpack($value);my$val=_unpack($value);$map{$key }=$val}return \%map}elsif ($typemap[$byte]& $T_BIN){my$size=_fetch_size(\$value,$byte,0xc4,0xc5,0xc6,0x80);my$s=substr($value,$p,$size);length($s)==$size or _insufficient('bin');$p += $size;utf8::decode($s)if$_utf8;return$s}elsif ($byte==0xcc){$p++;$p <= length($value)or _insufficient('uint8');return CORE::unpack('C',substr($value,$p - 1,1))}elsif ($byte==0xcd){$p += 2;$p <= length($value)or _insufficient('uint16');return unpack_uint16($value,$p - 2)}elsif ($byte==0xce){$p += 4;$p <= length($value)or _insufficient('uint32');return unpack_uint32($value,$p - 4)}elsif ($byte==0xcf){$p += 8;$p <= length($value)or _insufficient('uint64');return unpack_uint64($value,$p - 8)}elsif ($byte==0xd3){$p += 8;$p <= length($value)or _insufficient('int64');return unpack_int64($value,$p - 8)}elsif ($byte==0xd2){$p += 4;$p <= length($value)or _insufficient('int32');return unpack_int32($value,$p - 4)}elsif ($byte==0xd1){$p += 2;$p <= length($value)or _insufficient('int16');return unpack_int16($value,$p - 2)}elsif ($byte==0xd0){$p++;$p <= length($value)or _insufficient('int8');return CORE::unpack 'c',substr($value,$p - 1,1)}elsif ($byte==0xcb){$p += 8;$p <= length($value)or _insufficient('double');return unpack_double($value,$p - 8)}elsif ($byte==0xca){$p += 4;$p <= length($value)or _insufficient('float');return unpack_float($value,$p - 4)}else {_unexpected("byte 0x%02x",$byte)}}package Data::MessagePack::PP::Unpacker;sub new {bless {pos=>0,utf8=>0,buff=>'',},shift}sub utf8 {my$self=shift;$self->{utf8}=(@_ ? shift : 1);return$self}sub get_utf8 {my($self)=@_;return$self->{utf8}}sub execute_limit {execute(@_)}sub execute {my ($self,$data,$offset,$limit)=@_;$offset ||=0;my$value=substr($data,$offset,$limit ? $limit : length$data);my$len=length$value;$self->{buff}.= $value;local$self->{stack}=[];$p=0;while (length($self->{buff})> $p){_count($self,$self->{buff})or last;while (@{$self->{stack}}> 0 && --$self->{stack}->[-1]==0){pop @{$self->{stack}}}if (@{$self->{stack}}==0){$self->{is_finished}++;last}}$self->{pos}=$p;return$p + $offset}sub _count {my ($self,$value)=@_;no warnings;my$byte=unpack('C',substr($value,$p++,1));Carp::croak('invalid data')unless defined$byte;return 1 if$typemap[$byte]& $T_DIRECT;if ($typemap[$byte]& $T_STR){my$num;if ($byte==0xd9){$num=unpack 'C',substr($value,$p,1);$p += 1}elsif ($byte==0xda){$num=unpack 'n',substr($value,$p,2);$p += 2}elsif ($byte==0xdb){$num=unpack 'N',substr($value,$p,4);$p += 4}else {$num=$byte & ~0xa0}$p += $num;return 1}elsif ($typemap[$byte]& $T_ARRAY){my$num;if ($byte==0xdc){$num=unpack 'n',substr($value,$p,2);$p += 2}elsif ($byte==0xdd){$num=unpack 'N',substr($value,$p,4);$p += 4}else {$num=$byte & ~0x90}if ($num){push @{$self->{stack}},$num + 1}return 1}elsif ($typemap[$byte]& $T_MAP){my$num;if ($byte==0xde){$num=unpack 'n',substr($value,$p,2);$p += 2}elsif ($byte==0xdf){$num=unpack 'N',substr($value,$p,4);$p += 4}else {$num=$byte & ~0x80}if ($num){push @{$self->{stack}},$num * 2 + 1}return 1}elsif ($typemap[$byte]& $T_BIN){my$num;if ($byte==0xc4){$num=unpack 'C',substr($value,$p,1);$p += 1}elsif ($byte==0xc5){$num=unpack 'n',substr($value,$p,2);$p += 2}elsif ($byte==0xc6){$num=unpack 'N',substr($value,$p,4);$p += 4}$p += $num;return 1}elsif ($byte >= 0xcc and $byte <= 0xcf){$p += $byte==0xcc ? 1 : $byte==0xcd ? 2 : $byte==0xce ? 4 : $byte==0xcf ? 8 : Data::MessagePack::PP::_unexpected("byte 0x%02x",$byte);return 1}elsif ($byte >= 0xd0 and $byte <= 0xd3){$p += $byte==0xd0 ? 1 : $byte==0xd1 ? 2 : $byte==0xd2 ? 4 : $byte==0xd3 ? 8 : Data::MessagePack::PP::_unexpected("byte 0x%02x",$byte);return 1}elsif ($byte==0xca or $byte==0xcb){$p += $byte==0xca ? 4 : 8;return 1}else {Data::MessagePack::PP::_unexpected("byte 0x%02x",$byte)}return 0}sub data {my($self)=@_;local$Data::MessagePack::PP::_utf8=$self->{utf8};return Data::MessagePack->unpack(substr($self->{buff},0,$self->{pos}))}sub is_finished {my ($self)=@_;return$self->{is_finished}}sub reset :method {$_[0]->{buff}='';$_[0]->{pos}=0;$_[0]->{is_finished}=0}1;
 DATA_MESSAGEPACK_PP
+
+$fatpacked{"File/NFSLock.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'FILE_NFSLOCK';
+  package File::NFSLock;use strict;use warnings;use Carp qw(croak confess);our$errstr;use base 'Exporter';our@EXPORT_OK=qw(uncache);our$VERSION='1.29';use constant {LOCK_SH=>1,LOCK_EX=>2,LOCK_NB=>4,};our$TYPES={BLOCKING=>LOCK_EX,BL=>LOCK_EX,EXCLUSIVE=>LOCK_EX,EX=>LOCK_EX,NONBLOCKING=>LOCK_EX | LOCK_NB,NB=>LOCK_EX | LOCK_NB,SHARED=>LOCK_SH,SH=>LOCK_SH,};our$LOCK_EXTENSION='.NFSLock';our$HOSTNAME=undef;our$SHARE_BIT=1;my$graceful_sig=sub {print STDERR "Received SIG$_[0]\n" if @_;exit 1};our@CATCH_SIGS=qw(TERM INT);sub new {$errstr=undef;my$type=shift;my$class=ref($type)|| $type || __PACKAGE__;my$self={};if(@_ && ref $_[0]){$self=shift}else{$self->{file}=shift;$self->{lock_type}=shift;$self->{blocking_timeout}=shift;$self->{stale_lock_timeout}=shift}$self->{file}||="";$self->{lock_type}||=0;$self->{blocking_timeout}||=0;$self->{stale_lock_timeout}||=0;$self->{lock_pid}=$$;$self->{unlocked}=1;for my$signal (@CATCH_SIGS){if (!$SIG{$signal}|| $SIG{$signal}eq "DEFAULT"){$SIG{$signal}=$graceful_sig}}if($self->{lock_type}&& $self->{lock_type}!~ /^\d+/ && exists$TYPES->{$self->{lock_type}}){$self->{lock_type}=$TYPES->{$self->{lock_type}}}if(!$HOSTNAME){require Sys::Hostname;$HOSTNAME=Sys::Hostname::hostname()}croak ($errstr="Usage: my \$f = $class->new('/pathtofile/file',\n" ."'BLOCKING|EXCLUSIVE|NONBLOCKING|SHARED', [blocking_timeout, stale_lock_timeout]);\n" ."(You passed \"$self->{file}\" and \"$self->{lock_type}\")")unless length($self->{file});croak ($errstr="Unrecognized lock_type operation setting [$self->{lock_type}]")unless$self->{lock_type}&& $self->{lock_type}=~ /^\d+$/;bless$self,$class;$self->{rand_file}=rand_file($self->{file});$self->{lock_file}=$self->{file}.$LOCK_EXTENSION;my$quit_time=$self->{blocking_timeout}&& !($self->{lock_type}& LOCK_NB)? time()+ $self->{blocking_timeout}: 0;if(-e $self->{lock_file}&& $self->{stale_lock_timeout}> 0 && time()- (stat _)[9]> $self->{stale_lock_timeout}){unlink$self->{lock_file}}while (1){$self->create_magic or return undef;if ($self->{lock_type}& LOCK_EX){last if$self->do_lock}elsif ($self->{lock_type}& LOCK_SH){last if$self->do_lock_shared}else {$errstr="Unknown lock_type [$self->{lock_type}]";return undef}my$fh;if (-e $self->{lock_file}&& open ($fh,'+<',$self->{lock_file})){my@mine=();my@them=();my@dead=();my$has_lock_exclusive=!((stat _)[2]& $SHARE_BIT);my$try_lock_exclusive=!($self->{lock_type}& LOCK_SH);while(defined(my$line=<$fh>)){if ($line =~ /^\Q$HOSTNAME\E (-?\d+) /){my$pid=$1;if ($pid==$$){push@mine,$line}elsif(kill 0,$pid){push@them,$line}else{push@dead,$line}}else {push@them,$line}}if (@dead){local$LOCK_EXTENSION=".shared";my$lock=new File::NFSLock {file=>$self->{lock_file},lock_type=>LOCK_EX,blocking_timeout=>62,stale_lock_timeout=>60,};seek ($fh,0,0);my$content='';while(defined(my$line=<$fh>)){if ($line =~ /^\Q$HOSTNAME\E (-?\d+) /){my$pid=$1;next if (!kill 0,$pid)}$content .= $line}if(length($content)){seek$fh,0,0;print$fh $content;truncate$fh,length($content);close$fh}else{close$fh;unlink$self->{lock_file}}}else {close$fh}if ($try_lock_exclusive eq $has_lock_exclusive && @mine){return$self}}if ($self->{lock_type}& LOCK_NB){$errstr ||="NONBLOCKING lock failed!";return undef}sleep(1);if($quit_time && (time > $quit_time)){$errstr="Timed out waiting for blocking lock";return undef}}$self->uncache;delete$self->{unlocked};return$self}sub DESTROY {shift()->unlock()}sub unlock ($) {my$self=shift;if (!$self->{unlocked}){unlink($self->{rand_file})if -e $self->{rand_file};if($self->{lock_type}& LOCK_SH){$self->do_unlock_shared}else{$self->do_unlock}$self->{unlocked}=1;for my$signal (@CATCH_SIGS){if ($SIG{$signal}&& ($SIG{$signal}eq $graceful_sig)){delete$SIG{$signal}}}}return 1}sub rand_file ($) {my$file=shift;"$file.tmp.".time()%10000 .'.'.$$ .'.'.int(rand()*10000)}sub create_magic ($;$) {$errstr=undef;my$self=shift;my$append_file=shift || $self->{rand_file};$self->{lock_line}||="$HOSTNAME $self->{lock_pid} ".time()." ".int(rand()*10000)."\n";open (my$fh,'>>',$append_file)or do {$errstr="Couldn't open \"$append_file\" [$!]";return undef};print$fh $self->{lock_line};close$fh;return 1}sub do_lock {$errstr=undef;my$self=shift;my$lock_file=$self->{lock_file};my$rand_file=$self->{rand_file};my$chmod=0600;chmod($chmod,$rand_file)|| die "I need ability to chmod files to adequatetly perform locking";my$success=link($rand_file,$lock_file)&& -e $rand_file && (stat _)[3]==2;unlink$rand_file;return$success}sub do_lock_shared {$errstr=undef;my$self=shift;my$lock_file=$self->{lock_file};my$rand_file=$self->{rand_file};my$chmod=0600;$chmod |=$SHARE_BIT;chmod($chmod,$rand_file)|| die "I need ability to chmod files to adequatetly perform locking";local$LOCK_EXTENSION=".shared";my$lock=new File::NFSLock {file=>$lock_file,lock_type=>LOCK_EX,blocking_timeout=>62,stale_lock_timeout=>60,};my$success=link($rand_file,$lock_file);unlink$rand_file;if (!$success && -e $lock_file && ((stat _)[2]& $SHARE_BIT)!=$SHARE_BIT){$errstr='Exclusive lock exists.';return undef}elsif (!$success){$self->create_magic ($self->{lock_file})}return 1}sub do_unlock ($) {return unlink shift->{lock_file}}sub do_unlock_shared ($) {$errstr=undef;my$self=shift;my$lock_file=$self->{lock_file};my$lock_line=$self->{lock_line};local$LOCK_EXTENSION='.shared';my$lock=new File::NFSLock ($lock_file,LOCK_EX,62,60);my$fh;if(!open ($fh,'+<',$lock_file)){if(!-e $lock_file){return 1}else{die "Could not open for writing shared lock file $lock_file ($!)"}}my$content='';while(defined(my$line=<$fh>)){next if$line eq $lock_line;$content .= $line}if(length($content)){seek$fh,0,0;print$fh $content;truncate$fh,length($content);close$fh}else{close$fh;unlink$lock_file}}sub uncache ($;$) {my$file=pop;ref$file && ($file=$file->{file});my$rand_file=rand_file($file);return (link($file,$rand_file)&& unlink($rand_file))}sub newpid {my$self=shift;if ($self->{lock_pid}==$$){my$patience=time + 10;while (time < $patience){if (rename("$self->{lock_file}.fork",$self->{rand_file})){unlink$self->{rand_file};last}select(undef,undef,undef,0.1)}unless ($self->{lock_type}& LOCK_SH){$self->{lock_type}|=LOCK_SH}}else {$self->{lock_pid}=$$;delete$self->{lock_line};$self->create_magic($self->{lock_file});unless ($self->{lock_type}& LOCK_SH){$self->{lock_type}|=LOCK_SH}open (my$fh,'>',"$self->{lock_file}.fork");close($fh)}}sub fork {my$self=shift;my$pid=CORE::fork();if (defined$pid and!$self->{unlocked}){$self->newpid}return$pid}1;
+FILE_NFSLOCK
 
 $fatpacked{"IPC/Open3.pm"} = '#line '.(1+__LINE__).' "'.__FILE__."\"\n".<<'IPC_OPEN3';
   package IPC::Open3;use strict;no strict 'refs';our ($VERSION,@ISA,@EXPORT);require Exporter;use Carp;use Symbol qw(gensym qualify);$VERSION='1.20';@ISA=qw(Exporter);@EXPORT=qw(open3);our$Me='open3 (bug)';sub xpipe {pipe $_[0],$_[1]or croak "$Me: pipe($_[0], $_[1]) failed: $!"}sub xopen {open $_[0],$_[1],@_[2..$#_]and return;local $"=', ';carp "$Me: open(@_) failed: $!"}sub xclose {$_[0]=~ /\A=?(\d+)\z/ ? do {my$fh;open($fh,$_[1].'&=' .$1)and close($fh)}: close $_[0]or croak "$Me: close($_[0]) failed: $!"}sub xfileno {return $1 if $_[0]=~ /\A=?(\d+)\z/;return fileno $_[0]}use constant FORCE_DEBUG_SPAWN=>0;use constant DO_SPAWN=>$^O eq 'os2' || $^O eq 'MSWin32' || FORCE_DEBUG_SPAWN;sub _open3 {local$Me=shift;splice @_,0,1,undef if \$_[0]==\undef;splice @_,1,1,undef if \$_[1]==\undef;unless (eval {$_[0]=gensym unless defined $_[0]&& length $_[0];$_[1]=gensym unless defined $_[1]&& length $_[1];1}){$@ =~ s/(?<=value attempted) at .*//s;croak "$Me: $@"}my@handles=({mode=>'<',handle=>\*STDIN },{mode=>'>',handle=>\*STDOUT },{mode=>'>',handle=>\*STDERR },);for (@handles){$_->{parent}=shift;$_->{open_as}=gensym}if (@_ > 1 and $_[0]eq '-'){croak "Arguments don't make sense when the command is '-'"}$handles[2]{parent}||=$handles[1]{parent};$handles[2]{dup_of_out}=$handles[1]{parent}eq $handles[2]{parent};my$package;for (@handles){$_->{dup}=($_->{parent}=~ s/^[<>]&//);if ($_->{parent}!~ /\A=?(\d+)\z/){$package=caller 1 if (!defined$package);$_->{parent}=qualify $_->{parent},$package}next if $_->{dup}or $_->{dup_of_out};if ($_->{mode}eq '<'){xpipe $_->{open_as},$_->{parent}}else {xpipe $_->{parent},$_->{open_as}}}my$kidpid;if (!DO_SPAWN){xpipe my$stat_r,my$stat_w;$kidpid=fork;croak "$Me: fork failed: $!" unless defined$kidpid;if ($kidpid==0){eval {untie*STDIN;untie*STDOUT;untie*STDERR;close$stat_r;require Fcntl;my$flags=fcntl$stat_w,&Fcntl::F_GETFD,0;croak "$Me: fcntl failed: $!" unless$flags;fcntl$stat_w,&Fcntl::F_SETFD,$flags|&Fcntl::FD_CLOEXEC or croak "$Me: fcntl failed: $!";if (!$handles[2]{dup_of_out}&& $handles[2]{dup}&& xfileno($handles[2]{parent})==fileno \*STDOUT){my$tmp=gensym;xopen($tmp,'>&',$handles[2]{parent});$handles[2]{parent}=$tmp}for (@handles){if ($_->{dup_of_out}){xopen \*STDERR,">&STDOUT" if defined fileno STDERR && fileno STDERR!=fileno STDOUT}elsif ($_->{dup}){xopen $_->{handle},$_->{mode}.'&',$_->{parent}if fileno $_->{handle}!=xfileno($_->{parent})}else {xclose $_->{parent},$_->{mode};xopen $_->{handle},$_->{mode}.'&=',fileno $_->{open_as}}}return 1 if ($_[0]eq '-');exec @_ or do {local($")=(" ");croak "$Me: exec of @_ failed: $!"}}and do {close$stat_w;return 0};my$bang=0+$!;my$err=$@;utf8::encode$err if $] >= 5.008;print$stat_w pack('IIa*',$bang,length($err),$err);close$stat_w;eval {require POSIX;POSIX::_exit(255)};exit 255}else {close$stat_w;my$to_read=length(pack('I',0))* 2;my$bytes_read=read($stat_r,my$buf='',$to_read);if ($bytes_read){(my$bang,$to_read)=unpack('II',$buf);read($stat_r,my$err='',$to_read);waitpid$kidpid,0;if ($err){utf8::decode$err if $] >= 5.008}else {$err="$Me: " .($!=$bang)}$!=$bang;die($err)}}}else {my@close;for (@handles){if ($_->{dup_of_out}){$_->{open_as}=$handles[1]{open_as}}elsif ($_->{dup}){$_->{open_as}=$_->{parent}=~ /\A[0-9]+\z/ ? $_->{parent}: \*{$_->{parent}};push@close,$_->{open_as}}else {push@close,\*{$_->{parent}},$_->{open_as}}}require IO::Pipe;$kidpid=eval {spawn_with_handles(\@handles,\@close,@_)};die "$Me: $@" if $@}for (@handles){next if $_->{dup}or $_->{dup_of_out};xclose $_->{open_as},$_->{mode}}xclose$handles[0]{parent},$handles[0]{mode}if$handles[0]{dup};select((select($handles[0]{parent}),$|=1)[0]);$kidpid}sub open3 {if (@_ < 4){local $"=', ';croak "open3(@_): not enough arguments"}return _open3 'open3',@_}sub spawn_with_handles {my$fds=shift;my$close_in_child=shift;my ($fd,%saved,@errs);for$fd (@$fds){$fd->{tmp_copy}=IO::Handle->new_from_fd($fd->{handle},$fd->{mode});$saved{fileno$fd->{handle}}=$fd->{tmp_copy}if$fd->{tmp_copy}}for$fd (@$fds){bless$fd->{handle},'IO::Handle' unless eval {$fd->{handle}->isa('IO::Handle')};my$open_as=$fd->{open_as};my$fileno=fileno($open_as);$fd->{handle}->fdopen(defined($fileno)? $saved{$fileno}|| $open_as : $open_as,$fd->{mode})}unless ($^O eq 'MSWin32'){require Fcntl;for$fd (@$close_in_child){next unless fileno$fd;fcntl($fd,Fcntl::F_SETFD(),1)or push@errs,"fcntl $fd: $!" unless$saved{fileno$fd}}}my$pid;unless (@errs){if (FORCE_DEBUG_SPAWN){pipe my$r,my$w or die "Pipe failed: $!";$pid=fork;die "Fork failed: $!" unless defined$pid;if (!$pid){{no warnings;exec @_}print$w 0 + $!;close$w;require POSIX;POSIX::_exit(255)}close$w;my$bad=<$r>;if (defined$bad){$!=$bad;undef$pid}}else {$pid=eval {system 1,@_}}if($@){push@errs,"IO::Pipe: Can't spawn-NOWAIT: $@"}elsif(!$pid || $pid < 0){push@errs,"IO::Pipe: Can't spawn-NOWAIT: $!"}}for$fd (reverse @$fds){$fd->{handle}->fdopen($fd->{tmp_copy},$fd->{mode})}for (values%saved){$_->close or croak "Can't close: $!"}croak join "\n",@errs if@errs;return$pid}1;

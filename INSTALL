@@ -85,7 +85,6 @@ Shift Installation and Configuration
         o {get,set}fattr - get and set file extended attributes
         o lfs - get and set Lustre striping
         o lspci - find 10GE adapters
-        o mmlsmgr - get GPFS server information
         o mount - get file system information
         o ping - determine network latency
         o ps - find clients and PBS processes, and determine client CPU load

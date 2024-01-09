@@ -66,8 +66,8 @@ Shift includes the following features, among others:
 
 Shift is in active production at the NASA Advanced Supercomputing Facility
 (https://www.nas.nasa.gov/hecc/support/kb/entry/300) and has facilitated
-approximately 2.0M transfers over 3.0B files totalling 170 PB (as of Dec.
-2020) since deployment in March 2012.
+approximately 3.4M transfers over 11B files totalling 420 PB (as of Jan.
+2024) since deployment in March 2012.
 
 For full details of the Shift architecture, see
 https://pkolano.github.io/papers/resilience12.pdf and

@@ -66,7 +66,7 @@ use Symbol qw(gensym);
 use Sys::Hostname;
 use Text::ParseWords;
 
-our $VERSION = 8.0;
+our $VERSION = 8.1;
 
 # do not die when receiving sigpipe
 $SIG{PIPE} = 'IGNORE';
@@ -991,9 +991,11 @@ sub fish {
                 require IO::Socket::SSL::Utils;
                 ($scert, my $skey) = IO::Socket::SSL::Utils::CERT_create(
                     CA => 1,
+                    purpose => 'server,client',
                     subject => {CN => $key},
                 );
-                $scert = PEM_cert2string($scert) . PEM_key2string($skey);
+                $scert = IO::Socket::SSL::Utils::PEM_cert2string($scert) .
+                    IO::Socket::SSL::Utils::PEM_key2string($skey);
                 (my $fh, $cert) = tempfile();
                 print $fh $scert;
                 close $fh;
@@ -1221,12 +1223,25 @@ sub fqdn {
     my $host = shift;
     if ($host =~ /^\d+\.\d+\.\d+\.\d+$/) {
         my $name = gethostbyaddr(inet_aton($host), AF_INET);
-        return $name if ($name);
+        $host = $name if ($name);
+    } elsif (wantarray) {
+        # resolve from name to ip back to name to normalize multiple aliases
+        my %names;
+        my ($n, $a, $t, $l, @addrs) = gethostbyname($host);
+        foreach my $addr (@addrs) {
+            my $name = gethostbyaddr($addr, AF_INET);
+            $names{$name} = 1 if ($name);
+        }
+        return keys(%names);
     } else {
-        my @cols = gethostbyname($host);
-        return $cols[0] if ($cols[0]);
+        # resolve from name to ip back to name to normalize multiple aliases
+        my $ip = gethostbyname($host);
+        if ($ip) {
+            my $name = gethostbyaddr($ip, AF_INET);
+            $host = $name if ($name);
+        }
     }
-    return $host;
+    return wantarray ? ($host) : $host;
 }
 
 ###############
@@ -1280,7 +1295,7 @@ sub mount {
         }
         if (/server_list=\(([^\)]+)\)/) {
             # cxfs appears as xfs but with server_list set
-            $mnt{servers} = join("|", map {$_ = fqdn($_)} split(/,/, $1));
+            $mnt{servers} = join("|", map {fqdn($_)} split(/,/, $1));
             $mnt{remote} = $mnt{local};
             $type = "cxfs";
         } elsif ($dev =~ /^(\S+):([^:]+)$/) {
@@ -1289,7 +1304,8 @@ sub mount {
             $mnt{servers} = $1;
             # lustre may have extra @id and multiple colon-separated servers
             $mnt{servers} =~ s/@\w*//g;
-            $mnt{servers} = join("|", map {$_ = fqdn($_)} split(/:/, $mnt{servers}));
+            # lustre may have both commas and colons in @kfi forms
+            $mnt{servers} = join("|", map {fqdn($_)} split(/[:,]/, $mnt{servers}));
         } elsif ($type eq 'gpfs') {
             # gpfs servers do not appear in mount output so read config
             if (open(FILE, "/var/mmfs/gen/mmfs.cfg")) {
@@ -1297,7 +1313,7 @@ sub mount {
                     s/^\s+|\s+$//g;
                     if (/^clustername\s+(\S+)/i) {
                         $mnt{servers} = $1;
-                        $mnt{remote} = "/" . $mnt{servers};
+                        $mnt{remote} = "/$dev";
                         last;
                     }
                 }

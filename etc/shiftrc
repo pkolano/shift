@@ -22,30 +22,32 @@
 #   (parent dir must be world writable with sticky bit for multi-user installs)
 #   (multi-user example: user_dir /var/lib/shift/%u)
 #   (single-user example: user_dir /home/%u/.shift)
-#user_dir nodefault
 user_dir /home/%u/.shift
 
 # time (seconds) to store transfer metadata after last activity
 #data_expire 604800
 
-# location of file system information database
-#   (must be world readable for multi-user installs)
-#   (example: mount_db /var/lib/shift/mounts)
-#mount_db nodefault
+# use cron to automatically restart transfers after host or process failures
+#default_cron 1
 
 # log debugging information for user X in user_dir/X.debug
 #   (may be specified multiple times for different users)
 #   (example: debug_alice 1)
 #debug_X 1
 
-# use cron to automatically restart transfers after host or process failures
-#default_cron 1
-
 # domain to which user accounts belong for email notifications
 #   (assumes user X can receive email at X@email_domain)
 #   (assumes localhost:25 SMTP server running on manager host)
 #   (example: email_domain example.com)
 #email_domain nodefault
+
+# location of file system information database
+#   (must be world readable for multi-user installs)
+#   (example: mount_db /var/lib/shift/mounts)
+#mount_db nodefault
+
+# use hardlink-based locking (mainly for NFSv3 and below)
+#nfs_lock 0
 
 # command to invoke to make host selection decisions
 #   (must be world readable/executable for multi-user installs)
@@ -173,7 +175,7 @@ user_dir /home/%u/.shift
 # expressions by which to select lustre stripe count/size/pool
 #   (format is same as --stripe: [CEXP][::[SEXP][::PEXP]])
 #   (EXP may be NUM, SIZE, or full perl expression)
-#   (EXP may use const {NM,SZ,SC,SS} for src {name,size,scnt,ssz})
+#   (EXP may use const {DR,NM,SZ,SC,SS} for src {is_dir,name,size,scnt,ssz})
 #   (set to 0 to use system default striping)
 #   (note that transports using temporary files are not supported)
 #   (use suffix {k,m,g,t} for {KB,MB,GB,TB})
@@ -393,4 +395,3 @@ user_dir /home/%u/.shift
 # global avg. network writes (MB/s) at which to throttle transfers on host X
 #   (example: throttle_netw_host_host1.example.com 10000)
 #throttle_netw_host_X nodefault
-

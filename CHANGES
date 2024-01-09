@@ -360,3 +360,22 @@ CHANGES
     - Fixed unnecessary metadata traversal when showing detailed status
     - Fixed application of lustre striping expression to directories
     - Removed bbcp and gridftp support since reported fatal bugs never fixed
+
+* Shift 8.1 (01/08/24)
+    - Added silent corruption database search using --search with --last-sum 
+    - Added custom lustre striping of directories using DR in expressions
+    - Added alternative metadata locking for broken NFSv3 locks
+    - Added debugging output when manager unable to map local/remote files
+    - Changed embedded mesh handling to latest mesh version
+    - Fixed fish-tcp --secure SSL handling with more recent IO::Socket::SSL
+    - Fixed mount collection when file server is an alias to many IPs
+    - Fixed handling of @kfi forms in lustre mount collection
+    - Fixed remote mount point in GPFS mount collection
+    - Fixed mcp default stripe handling overriding --stripe=0
+    - Fixed handling of --mgr so no longer always overrides with default
+    - Fixed inherited retry count of operations in run state during restart
+    - Fixed clean of files associated with old monitoring processes
+    - Fixed exception during silent corruption processing of some tar operations
+    - Fixed escape of commas in email command line
+    - Fixed synchronization of monitor files between managers
+    - Fixed error handling of manager invocations

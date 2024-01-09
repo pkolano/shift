@@ -123,7 +123,7 @@ given in following sections.
 \fBMonitoring and management options:\fP
 \-\-history[=csv]      show command line/origin of transfers [in CSV form]
 \-\-id=NUM             use transfer identifier NUM for other commands
-\-\-last-sum           show last stored sum for SOURCE(s)
+\-\-last-sum           show last stored sum for SOURCE(s) or matching \-\-search
 \-\-mgr=HOST           set host of shift manager to HOST
 \-\-mgr\-identity=FILE  access manager host with ssh identity in FILE
 \-\-mgr\-user=USER      access manager host as USER
@@ -135,7 +135,7 @@ given in following sections.
                                         io,ln,mcp,meta, mkdir,msum,rsync,shift-cp,
                                         shift-sum,sum,tool})
 \-\-restart[=ignore]   restart transfer with given \-\-id [ignoring errors]
-\-\-search=REGEX       show only status/history matching REGEX
+\-\-search=REGEX       show only status/history/last-sum matching REGEX
 \-\-state=STATE        show status of only those operations in STATE
                        (STATE one of {done,error,none,queue,run,warn})
 \-\-stats[=csv]        show stats across all transfers [in CSV form]
@@ -167,7 +167,7 @@ given in following sections.
 \-\-streams=NUM        use NUM streams in remote transports [4]
 \-\-stripe=[CEXP]      choose stripe {count,size,pool} via expr {C,S,P}EXP
     [::[SEXP][::PEXP]] (EXP may be NUM, SIZE, or full perl expression w/
-                        const {NM,SZ,SC,SS} for src {name,size,scnt,ssz})
+                        const {DR,NM,SZ,SC,SS} for src {is_dirname,size,scnt,ssz})
                        (use suffix {k,m,g,t} for {KiB,MiB,GiB,TiB})
 \-\-threads=NUM        use NUM threads in local transports [4]
 \-\-verify\-fast        verify faster but less safely by reusing src buffer
@@ -471,13 +471,15 @@ the origin host/directory and the original command.  When
 Specify the transfer identifier to be used with management and status
 commands.
 .IP "\fB\-\-last\-sum\fP"
-Queries the silent corruption database for all files given on the
-command line and prints (one file per line) the last known checksum, the
-file modification time associated with this checksum, and the file name.
-When \fB\-\-index\-tar\fP is given, the first file argument is assumed
-to be a tar file and the remaining arguments names of files within the
-tar for which checksum information will be printed.  A checksum of "-"
-means that no information is stored for the file.
+When \fB\-\-search\fP is given, queries the silent corruption database for all
+files whose name or file system matches the given regular expression and prints
+(one file per line) the last known checksum, the file modification time
+associated with this checksum, and the file name.  Otherwise, queries the silent
+corruption database for all files given on the command line.  When
+\fB\-\-index\-tar\fP is given, the first file argument is assumed to be a tar
+file and the remaining arguments names of files within the tar for which
+checksum information will be printed.  A checksum of "-" means that no
+information is stored for the file.
 .IP "\fB\-\-mgr=HOST\fP"
 Set the host that will be used to manage transfers.  By default, this
 host will be accessed as the current user with hostbased authentication
@@ -578,6 +580,10 @@ source or destination file name match the given regular expression.
 When \fB\-\-history\fP is specified, this option will show a brief
 history of the transfers whose origin host or original command match the
 given regular expression.
+.IP
+When \fB\-\-last-sum\fP is specified, this option will query the silent
+corruption database for files whose name or file system match the given
+regular expression.
 .IP
 Note that regular expressions must be given in Perl syntax (see
 perlre(1) for details).
@@ -770,15 +776,15 @@ directories.  A greater number or size defined with the suffixes k, m,
 g, and t for KiB, MiB, GiB, and TiB, respectively, specifies that files
 will be allocated one stripe per given size while directories will be
 striped according to the default policy.  Finally, an arbitrary Perl
-expression (see perlsyn(1) for details) involving the constants NM,
-SZ, SC, and SS for source name, size, stripe count, and stripe size,
-respectively, may be specified to dynamically define the stripe count
-differently for every file and directory in the transfer.  For example,
-the expression "NM =~ /foo/ ? 4 : (SZ < 10g ? 2g : 10g)" would set the
-stripe count of files whose name contains "foo" to 4, and the stripe
-count of files whose name does not contain "foo" to either one stripe
-per 2 GiB when the file size is less than 10 GiB or one stripe per 10
-GiB otherwise.
+expression (see perlsyn(1) for details) involving the constants DR, NM,
+SZ, SC, and SS for is a directory, source name, size, stripe count, and
+stripe size, respectively, may be specified to dynamically define the
+stripe count differently for every file and directory in the transfer.
+For example, the expression "NM =~ /foo/ ? 4 : (SZ < 10g ? 2g : 10g)"
+would set the stripe count of files whose name contains "foo" to 4, and
+the stripe count of files whose name does not contain "foo" to either one
+stripe per 2 GiB when the file size is less than 10 GiB or one stripe per
+10 GiB otherwise.
 .IP
 Striping behavior may be further refined by specifying a stripe size
 expression and/or Lustre pool name expression with similar conventions.
