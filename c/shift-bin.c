@@ -1,5 +1,5 @@
 //
-// Copyright (C) 2012-2021 United States Government as represented by the
+// Copyright (C) 2012-2019 United States Government as represented by the
 // Administrator of the National Aeronautics and Space Administration
 // (NASA).  All Rights Reserved.
 //
@@ -35,15 +35,18 @@
 //
 
 #define _GNU_SOURCE
+#include <ctype.h>
 #include <fcntl.h>
 #include <grp.h>
 #include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #ifndef _NO_LUSTRE
 # include <lustre/lustreapi.h>
 #endif
+#include <acl/libacl.h>
 #include <sys/acl.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -58,6 +61,7 @@ char *escape(char *str) {
     static char hex[] = "0123456789ABCDEF";
     char *pstr = str;
     char *buf = malloc(strlen(str) * 3 + 1);
+    if (buf == NULL) return buf;
     char *pbuf = buf;
     while (*pstr) {
         if (isalnum(*pstr) || *pstr == '-' || *pstr == '_' ||
@@ -82,6 +86,7 @@ char *unescape(char *str) {
     if (str == NULL) return str;
     char *pstr = str;
     char *buf = malloc(strlen(str) + 1);
+    if (buf == NULL) return buf;
     char *pbuf = buf;
     while (*pstr) {
         if (*pstr == '%') {
@@ -138,25 +143,80 @@ int do_fallocate(char *file, off_t len) {
 //// do_getfacl ////
 ////////////////////
 int do_getfacl(char *file) {
+    int rc = -1;
     acl_t acl = acl_get_file(file, ACL_TYPE_ACCESS);
-    if (acl == NULL || acl_equiv_mode(acl, NULL) == 0) return -1;
-    char *s = acl_to_text(acl, NULL);
-    if (s == NULL) return -1;
-    char *es = escape(s);
-    printf(" %s", es);
-    free(es);
-    acl_free(s);
-    return 0;
+    if (acl != NULL && acl_equiv_mode(acl, NULL) != 0) {
+        char *s = acl_to_text(acl, NULL);
+        if (s != NULL) {
+            char *es = escape(s);
+            printf(" %s", es);
+            free(es);
+            acl_free(s);
+            rc = 0;
+        }
+    }
+    acl = acl_get_file(file, ACL_TYPE_DEFAULT);
+    if (acl != NULL && acl_equiv_mode(acl, NULL) != 0) {
+        char *s = acl_to_any_text(acl, "default:", '\n', 0);
+        if (s != NULL) {
+            char *es = escape(s);
+            if (rc) printf(" ");
+            printf("%s", es);
+            free(es);
+            acl_free(s);
+            rc = 0;
+        }
+    }
+    return rc;
 }
 
 ////////////////////
 //// do_setfacl ////
 ////////////////////
 int do_setfacl(char *file, char *s_acl) {
-    acl_t acl = acl_from_text(s_acl);
-    if (acl == NULL) return -1;
-    int rc = acl_set_file(file, ACL_TYPE_ACCESS, acl);
-    acl_free(acl);
+    if (s_acl == NULL) return -1;
+    char *def = strstr(s_acl, "default:");
+    if (def != NULL && def != s_acl) {
+        // default is not the first acl so make sure it is not a user name
+        def = strstr(s_acl, "\ndefault:");
+        if (def != NULL) def++;
+    }
+    if (def == NULL || def != s_acl) {
+        // process non-default acls
+        if (def != NULL) def[0] = '\0';
+        acl_t acl = acl_from_text(s_acl);
+        if (def != NULL) def[0] = 'd';
+        if (acl == NULL) return -1;
+        int rc = acl_set_file(file, ACL_TYPE_ACCESS, acl);
+        acl_free(acl);
+        if (def == NULL || rc != 0) return rc;
+    }
+    int rc = -1;
+    if (def != NULL) {
+        // process default acls
+        // the leading default: part must be removed from each acl
+        char *new_acl = malloc(strlen(def) + 1);
+        if (new_acl == NULL) return -1;
+        new_acl[0] = '\0';
+        while (def != NULL) {
+            def += 8;
+            char *nextdef = strstr(def, "\ndefault:");
+            if (nextdef != NULL) {
+                nextdef++;
+                nextdef[0] = '\0';
+                strcat(new_acl, def);
+                nextdef[0] = 'd';
+            } else {
+                strcat(new_acl, def);
+            }
+            def = nextdef;
+        }
+        acl_t acl = acl_from_text(new_acl);
+        free(new_acl);
+        if (acl == NULL) return -1;
+        rc = acl_set_file(file, ACL_TYPE_DEFAULT, acl);
+        acl_free(acl);
+    }
     return rc;
 }
 
@@ -206,6 +266,7 @@ int do_getfattr(char *file) {
 //// do_setfattr ////
 /////////////////////
 int do_setfattr(char *file, char *s_xattr) {
+    if (s_xattr == NULL) return -1;
     int rc = 0;
     char *keyval = strtok(s_xattr, ",");
     while (keyval != NULL) {

@@ -76,6 +76,7 @@ Shift Installation and Configuration
 
     2.3. Invoked (standard on most systems or when specific file systems in use)
 
+        o beegfs-ctl - get beegfs server information
         o chown - change symlink ownership
         o crontab - install cron jobs to recover from host/process failures
         o df - get file system utilization
@@ -99,6 +100,7 @@ Shift Installation and Configuration
     linux systems to significantly improve the efficiency of some file
     operations.  These operations include equivalents to those provided
     by posix_fadvise, fallocate, {get,set}facl, {get,set}fattr, and lfs.
+    Development headers for acls and xattrs are required on the system.
     This utility must be built differently depending on whether the
     system mounts lustre (and has access to the corresponding liblustreapi
     library) or not.

@@ -42,6 +42,150 @@
 # and "=cut mesh" lines.  The name of this program must start with
 # "shift" when used without Mesh and must not start with "shift" when
 # used with Mesh.
+#
+#
+# Code Assumptions
+# 
+# * A transfer may run as any user, including root
+#     * Never trust file names and pass them through a shell command line
+#     * Never leave permissions open to anyone other than the user until done
+# * A transfer's metadata is writable by users and may be accessed as root
+#     * Never use insecure perl modules like Storable with user-writable data
+# * A transfer may run locally, over the LAN, or over the WAN
+#     * All cases must be supported equally
+# * A transfer may run on any operating system of any version
+#     * Never assume the same OS primitives exist everywhere
+# * A transfer may run with any software installed of any version
+#     * Never assume the existence of anything beyond perl core and ssh
+# * A transfer may have any number of files
+#     * Never assume the list of files can fit in memory
+# * A transfer may take any amount of time to complete
+#     * Must periodically reassess things like systems and mount points
+# * A transfer may be interrupted at any time at any point in its processing
+#     * Must be resilient against failures at every point in file processing
+# * A transfer may run on a resource that may be taken away at any time
+#     * Must be able to recover and utilize alternative resources
+# 
+# 
+# Code flow
+# 
+# * shift_() (shiftc)
+#     * Begin all transfer processing
+#     * Parse options
+#     * Forward transfer monitoring and management options to a manager invocation
+#         * --history, --last-sum, --monitor (when not with --wait),
+#           --plot, --stats, --status, --stop
+#     * Check basic sanity of options
+#     * Process command-line or piped in arguments via shift_args()
+# 
+# * shift_args() (shiftc)
+#     * Check sanity of src/dst files/directories
+#         * Existence or non-existence of files/directories, writability
+#           of dst
+#     * Normalize src/dst files/directories
+#         * Dereference links, expand wildcards, resolve hostnames
+#     * Create parent directories when specified or when --extract-tar
+#     * Record initial set of operations to file and return
+# * shift_() again (shiftc)
+#     * Initialize transfer by invocation of "shift-mgr --put"
+#     * Pass options and arguments over stdout
+# * put() (shift-mgr)
+#     * Find next available transfer id for the user
+#     * Initialize metadata for transfer (options and initial operations)
+#     * Return id over stdout back to client
+# * shift_() again (shiftc)
+#     * Print id to stdout for user to reference
+#     * Spawn child process that enters shift_loop()
+#     * When --wait specified, wait for child to exit (while monitoring when
+#       --monitor specified)
+# * shift_loop() (shiftc)
+#     * Detach completely from parent
+#     * Collect network parameters (shift_networks()) and mounts (shift_mounts())
+#     * Loop until told to stop
+#         * Collect induced load (shift_load()) and network latency
+#           (shift_latency())
+#         * Request new batch of operations to process while reporting results
+#           of last batch by invocation of "shift-mgr --get --put"
+#         * There will be nothing to report on the first invocation
+#         * All interaction is over local or remote stdin/stdout pipes
+#           from/to manager
+# * put() (shift-mgr)
+#     * Record results of batch of operations
+#     * On success, operations enter the next stage of processing
+#         * find to mkdir/cp/ln, cp to sum, sum to cksum, cksum/mkdir/ln
+#           to chattr, chattr to done
+#     * On error, operations reenter same state with retry count incremented
+#       or error when retries exhausted
+#         * Partial checksum mismatch will become cp with smaller subset of file
+#     * Update metadata counts and other items such as silent corruption
+#       db and cache tracking
+# * get() (shift-mgr)
+#     * Direct client to sleep for some purposes
+#         * Exponential backoff on previous warnings
+#         * Throttling to get resource utilization down to specified average
+#         * File likely still in cache on host (optional when configured and
+#           no fadvise available)
+#     * Gather transfer options that may be global or changed from
+#       initialization
+#     * Traverse operation logs to find next set of operations for client
+#         * May include previously sent operations when a host/process
+#           failure detected
+#     * Map local src/dst files or remote src/dst files from previous stage
+#       location to client location via map_local() and/or map_remote()
+# * map_local() (shift-mgr)
+#     * 3 mount db files used to allow file system equivalence to be
+#       detected efficiently
+#         * A global database containing if mount_db is configured
+#         * A persistent per user database with mount information gathered
+#           and sent during transfer initialization
+#             * Used to make automatic parallelization decisions in remote
+#               cluster environments
+#         * A per transfer database that stores mount information that should
+#           not be used for other transfers
+#             * PBS-controlled hosts where the user only has temporary access
+#     * Equivalence requires the type, server, and remote mount point be
+#       identical
+#     * Paths are mapped from original host/path to mount point to local host/path
+# * map_remote() (shift-mgr)
+#     * Operates mostly like map_local()
+#     * Maps remote file represented by host1:path1 to host2:path2
+#         * The original path1 is mapped to a server mount point
+#         * The set of hosts that have access to that mount point are determined
+#         * The new host2 is chosen by a callout to an external selection
+#           hook from among the derived set of hosts
+#             * A host will not be selected n times as a remote src/dst until
+#               every other host has been selected n-1 times
+#         * The server mount point is used to map path1 to path2 on host2
+# * get() again (shift-mgr)
+#     * Direct client to stop if transfer done or cannot map operations
+#     * Determine if additional parallelization is needed to satisfy --clients
+#       or --hosts
+#         * For hosts, use another callout to external selection hook to
+#           find least loaded
+#         * Direct client to spawn itself either locally or on chosen system(s)
+#     * Return to client
+# * shift_loop() (shiftc)
+#     * Continue loop
+#         * Spawn/stop/sleep as directed
+#             * On stop, remove crontab and exit
+#         * Sort file operations into buckets via tranport()
+#             * Each type of operation put into separate bucket for fewest
+#               local invocations
+#             * Each operation involving remote host put into host bucket for
+#               fewest remote invocations
+#         * On first iteration, install crontab to respawn itself on
+#           host/process failure
+#         * Call transport(`end')
+# * transport() (shiftc)
+#     * transport(`end') begins actual processing of a batch of files
+#     * Individual transport_*() functions invoked for different operations
+#       and different hosts
+#         * find, chattr, tar, dmf, fadvise, and individual transports
+#           (built-in, mcp, rsync, bbftp)
+#         * These may invoke shift-aux during remote operations and/or shift-bin
+#           locally
+#     * Similar verify_*() functions for sums and checksums via built-in or msum
+#     * Results stored in file with control back to next iteration of shift_loop()
 
 # need perl 5.8.5 as glob is broken in earlier versions
 require 5.008_005;

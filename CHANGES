@@ -379,3 +379,8 @@ CHANGES
     - Fixed escape of commas in email command line
     - Fixed synchronization of monitor files between managers
     - Fixed error handling of manager invocations
+
+* Shift 8.2 (03/15/24)
+    - Fixed collection and application of default acls in shift-bin
+    - Added additional documentation in shiftc
+
